@@ -1,4 +1,4 @@
-import { cloneState } from '../domain/guards'
+import { cloneState, DomainError } from '../domain/guards'
 import type { DemoState } from '../domain/types'
 import { createDemoState } from './fixtures'
 import { isDemoState, validateDemoState } from './StateValidator'
@@ -14,32 +14,75 @@ export interface StorageLike {
 export class MockRepository {
   private state: DemoState
   private listeners = new Set<() => void>()
-  readonly recoveryNotice: string | null
+  private activeStorage?: StorageLike
+  recoveryNotice: string | null = null
 
-  constructor(private readonly storage?: StorageLike) {
+  constructor(storage?: StorageLike) {
+    this.activeStorage = storage
     const loaded = this.load()
     this.state = loaded.state
     this.recoveryNotice = loaded.notice
-    this.persist()
-  }
-
-  private load(): { state: DemoState; notice: string | null } {
-    if (!this.storage) return { state: createDemoState(), notice: null }
-    try {
-      const raw = this.storage.getItem(STORAGE_KEY)
-      if (!raw) return { state: createDemoState(), notice: 'Demo data was missing, so a fresh safe copy was loaded.' }
-      const parsed: unknown = JSON.parse(raw)
-      if (!isDemoState(parsed)) {
-        return { state: createDemoState(), notice: 'Old or incomplete demo data was replaced with the current safe version.' }
+    if (loaded.needsPersist && this.activeStorage) {
+      try {
+        this.persistCandidate(this.state)
+      } catch {
+        this.activeStorage = undefined
+        this.recoveryNotice = `${loaded.notice ?? 'Safe demo data was loaded.'} Browser storage could not save it, so this tab is continuing in memory only.`
       }
-      return { state: parsed, notice: null }
-    } catch {
-      return { state: createDemoState(), notice: 'Damaged demo data was recovered automatically.' }
     }
   }
 
-  private persist() {
-    this.storage?.setItem(STORAGE_KEY, JSON.stringify(this.state))
+  private load(): { state: DemoState; notice: string | null; needsPersist: boolean } {
+    if (!this.activeStorage) return { state: createDemoState(), notice: null, needsPersist: false }
+    let raw: string | null
+    try {
+      raw = this.activeStorage.getItem(STORAGE_KEY)
+    } catch {
+      this.activeStorage = undefined
+      return {
+        state: createDemoState(),
+        notice: 'Browser storage could not be read. Safe demo data was recovered and this tab is continuing in memory only.',
+        needsPersist: false,
+      }
+    }
+    if (!raw) {
+      return {
+        state: createDemoState(),
+        notice: 'Demo data was missing, so a fresh safe copy was loaded.',
+        needsPersist: true,
+      }
+    }
+    try {
+      const parsed: unknown = JSON.parse(raw)
+      if (!isDemoState(parsed)) {
+        return {
+          state: createDemoState(),
+          notice: 'Old or incomplete demo data was replaced with the current safe version.',
+          needsPersist: true,
+        }
+      }
+      return { state: parsed, notice: null, needsPersist: false }
+    } catch {
+      return {
+        state: createDemoState(),
+        notice: 'Damaged demo data was recovered automatically.',
+        needsPersist: true,
+      }
+    }
+  }
+
+  private persistCandidate(candidate: DemoState) {
+    if (!this.activeStorage) return
+    try {
+      const serialized = JSON.stringify(candidate)
+      if (typeof serialized !== 'string') throw new Error('Demo state did not serialize.')
+      this.activeStorage.setItem(STORAGE_KEY, serialized)
+    } catch {
+      throw new DomainError(
+        'Browser storage could not save this change. Nothing changed; please try again.',
+        'STORAGE_WRITE_FAILED',
+      )
+    }
   }
 
   getSnapshot = () => this.state
@@ -56,15 +99,17 @@ export class MockRepository {
     const result = mutator(draft)
     draft.revision += 1
     validateDemoState(draft)
+    this.persistCandidate(draft)
     this.state = draft
-    this.persist()
     this.listeners.forEach((listener) => listener())
     return result
   }
 
   reset() {
-    this.state = createDemoState()
-    this.persist()
+    const candidate = createDemoState()
+    validateDemoState(candidate)
+    this.persistCandidate(candidate)
+    this.state = candidate
     this.listeners.forEach((listener) => listener())
   }
 

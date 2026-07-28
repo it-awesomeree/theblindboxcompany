@@ -17,7 +17,7 @@ function luminance(hex: string) {
 }
 
 describe('release and responsive safety configuration', () => {
-  it('deploys Pages only from a push to main with elevated rights isolated to deploy', () => {
+  it('builds Pages once, browser-tests that exact dist, then uploads and deploys the same artifact', () => {
     const workflow = read('.github/workflows/pages.yml')
     expect(workflow).not.toContain('workflow_dispatch')
     expect(workflow).toMatch(/push:\s*\n\s+branches:\s*\n\s+- main/)
@@ -27,8 +27,50 @@ describe('release and responsive safety configuration', () => {
     expect(beforeDeploy).not.toContain('id-token: write')
     expect(deployJob).toContain('pages: write')
     expect(deployJob).toContain('id-token: write')
-    expect(workflow).toContain('chrome-e2e:')
-    expect(deployJob).toContain('- chrome-e2e')
+    expect(workflow).toContain('build-test-upload:')
+    expect(workflow).not.toContain('chrome-e2e:')
+    expect(workflow.match(/npm run verify/g)).toHaveLength(1)
+    expect(workflow).not.toContain('npm run build')
+    expect(workflow).toContain('npm run e2e:dist')
+    expect(workflow.indexOf('npm run verify')).toBeLessThan(workflow.indexOf('npm run e2e:dist'))
+    expect(workflow.indexOf('npm run e2e:dist')).toBeLessThan(workflow.indexOf('actions/upload-pages-artifact'))
+    expect(workflow).toMatch(/upload-pages-artifact@[^\n]+[\s\S]*?path: dist/)
+    expect(deployJob).toContain('needs: build-test-upload')
+  })
+
+  it('pins the runner, Node and Playwright package while keeping local Chrome separate from CI Chromium', () => {
+    const workflows = readdirSync(resolve(process.cwd(), '.github/workflows'))
+      .filter((name) => /\.ya?ml$/.test(name))
+      .map((name) => read(`.github/workflows/${name}`))
+      .join('\n')
+    const packageJson = JSON.parse(read('package.json')) as {
+      scripts: Record<string, string>
+      devDependencies: Record<string, string>
+    }
+    const packageLock = JSON.parse(read('package-lock.json')) as {
+      packages: Record<string, { devDependencies?: Record<string, string> }>
+    }
+    const config = read('playwright.config.ts')
+    const runners = [...workflows.matchAll(/runs-on:\s*([^\s]+)/g)]
+    const nodeVersions = [...workflows.matchAll(/node-version:\s*([^\s]+)/g)]
+
+    expect(workflows).not.toContain('ubuntu-latest')
+    expect(runners.length).toBeGreaterThan(0)
+    expect(runners.every((match) => match[1] === 'ubuntu-24.04')).toBe(true)
+    expect(nodeVersions.length).toBeGreaterThan(0)
+    expect(nodeVersions.every((match) => match[1] === '22.22.3')).toBe(true)
+    expect(workflows).not.toMatch(/\bnpx playwright\b/)
+    expect(workflows).not.toContain('install --with-deps chrome')
+    expect(workflows).toContain('./node_modules/.bin/playwright install --with-deps chromium')
+    expect(packageJson.devDependencies['@playwright/test']).toBe('1.62.0')
+    expect(packageLock.packages[''].devDependencies?.['@playwright/test']).toBe('1.62.0')
+    expect(packageJson.scripts.e2e).toBe('playwright test')
+    expect(packageJson.scripts['e2e:ci']).toContain('PLAYWRIGHT_BROWSER=chromium')
+    expect(packageJson.scripts['e2e:dist']).toContain('PLAYWRIGHT_EXISTING_DIST=1')
+    expect(config).toContain("process.env.PLAYWRIGHT_EXISTING_DIST === '1'")
+    expect(config).toContain("process.env.PLAYWRIGHT_BROWSER === 'chromium'")
+    expect(config).toContain("channel: 'chrome'")
+    expect(config).toContain('reuseExistingServer: false')
   })
 
   it('pins every official GitHub Action and rejects mutable major-version tags', () => {

@@ -144,6 +144,24 @@ export function validateDemoAddress(input: Address): Address {
   return clean
 }
 
+export function validateDemoClaimNote(value: string) {
+  const note = sanitizeText(value, 500)
+  assert(note.length >= 8, 'Add a short fictional note (at least 8 characters).', 'INVALID_NOTE')
+  assert(/\bDEMO\b/i.test(note), 'Customer claim notes must include the separate word DEMO.', 'DEMO_DATA_ONLY')
+  assert(
+    !/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i.test(note),
+    'Do not enter an email address in a demo claim note.',
+    'DEMO_DATA_ONLY',
+  )
+  const phoneLike = note.match(/\+?\d[\d\s().-]{6,}\d/g) ?? []
+  assert(
+    phoneLike.every((candidate) => candidate.replace(/\D/g, '').length < 8),
+    'Do not enter a realistic phone number in a demo claim note.',
+    'DEMO_DATA_ONLY',
+  )
+  return note
+}
+
 export function getSessionUser(state: DemoState) {
   return state.users.find((user) => user.id === state.sessionUserId)
 }

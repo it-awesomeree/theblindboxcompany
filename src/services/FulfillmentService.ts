@@ -9,6 +9,7 @@ import {
   transitionShipment,
 } from '../domain/guards'
 import { prizeForBox } from '../domain/selectors'
+import { deriveOrderStatusFromShipments } from '../domain/orderStatus'
 import type { DemoState, FulfilmentKind, Order, Shipment, ShipmentStatus } from '../domain/types'
 import type { MockRepository } from '../data/MockRepository'
 import { AuditService } from './AuditService'
@@ -100,15 +101,7 @@ export class FulfillmentService {
         box.status = transitionBoxForShipment(box.status, next)
       }
       const related = state.shipments.filter((entry) => entry.orderId === order.id)
-      const delivered = related.filter((entry) => entry.status === 'delivered').length
-      const advanced = related.some((entry) => entry.status !== 'unfulfilled')
-      const derived = delivered === related.length && related.length > 0
-        ? 'fulfilled'
-        : delivered > 0
-          ? 'partially_fulfilled'
-          : advanced
-            ? 'processing'
-            : 'confirmed'
+      const derived = deriveOrderStatusFromShipments(related.map((entry) => entry.status))
       if (order.status !== derived) {
         order.status = transitionOrder(order.status, derived)
       }

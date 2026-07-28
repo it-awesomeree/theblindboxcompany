@@ -69,6 +69,32 @@ test('responsive shell preserves navigation, legal text, input sizing and import
   await accountLink.click()
   await expect(page.getByRole('heading', { name: 'Aina Demo' })).toBeVisible()
   await expectNoRootOverflow(page)
+
+  await page.getByRole('button', { name: 'Reset demo data' }).click()
+  const resetDialog = page.getByRole('dialog', { name: 'Reset all demo data?' })
+  const goBackButton = resetDialog.getByRole('button', { name: 'Go back' })
+  const confirmResetButton = resetDialog.getByRole('button', { name: 'Confirm demo reset' })
+  await expect(resetDialog).toBeVisible()
+  await expect(goBackButton).toBeVisible()
+  await expect(confirmResetButton).toBeVisible()
+  await expectInsideViewport(resetDialog, page)
+  await expectInsideViewport(goBackButton, page)
+  await expectInsideViewport(confirmResetButton, page)
+  await expectNoRootOverflow(page)
+
+  await page.evaluate(() => {
+    Storage.prototype.setItem = () => {
+      throw new Error('Deterministic reset storage failure.')
+    }
+  })
+  await confirmResetButton.click()
+  const resetAlert = resetDialog.getByRole('alert')
+  await expect(resetAlert).toBeVisible()
+  await expect(resetAlert).toContainText(/browser storage could not save this change.+nothing changed.+try again/i)
+  await expectInsideViewport(resetAlert, page)
+  await expect(resetDialog).toBeVisible()
+  await expect(resetDialog).toHaveAttribute('open', '')
+  await expectNoRootOverflow(page)
 })
 
 test('WebGL-disabled fallback is the single keyboard opener and visibly opens', async ({ page }) => {
@@ -97,8 +123,8 @@ test('admin mobile keeps fulfilment actions', async ({ page, isMobile }) => {
   await expectNoRootOverflow(page)
 })
 
-test('390px phone completes checkout, payment, order, reveal, account and admin flows', async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name !== 'mobile-390', 'One representative phone runs the complete critical journey.')
+test('every mobile viewport completes checkout, payment, order, reveal, account and admin flows', async ({ page, isMobile }) => {
+  test.skip(!isMobile, 'The complete mobile journey runs at 360, 390, 430 and 768 widths.')
   await page.addInitScript(() => localStorage.clear())
   await page.goto('')
   await page.getByRole('button', { name: /get a demo box/i }).first().click()
@@ -133,7 +159,29 @@ test('390px phone completes checkout, payment, order, reveal, account and admin 
   await page.getByRole('button', { name: /log out/i }).click()
   await page.getByRole('link', { name: /demo sign in/i }).click()
   await page.getByRole('button', { name: /one-click vault admin/i }).click()
+  await expect(page.getByRole('heading', { name: /vault overview/i })).toBeVisible()
+  await expectNoRootOverflow(page)
+
+  await page.getByRole('link', { name: 'Users' }).click()
+  await expect(page.getByRole('heading', { name: 'Users' })).toBeVisible()
+  await expect(page.getByRole('row').filter({ hasText: 'Aina Demo' })).toBeVisible()
+  await expectNoRootOverflow(page)
+
+  await page.getByRole('link', { name: 'Orders', exact: true }).click()
+  await page.locator('.admin-record summary').first().click()
+  await expect(page.getByRole('heading', { name: 'Snapshot' })).toBeVisible()
+  await expectNoRootOverflow(page)
+
+  await page.getByRole('link', { name: 'Payments' }).click()
+  await expect(page.getByRole('heading', { name: 'Payments' })).toBeVisible()
+  await expect(page.locator('.payment-record').first()).toBeVisible()
+  await expectNoRootOverflow(page)
+
   await page.getByRole('link', { name: 'Fulfilment' }).click()
-  await expect(page.getByRole('button', { name: /mark picking/i }).first()).toBeVisible()
+  const markPicking = page.getByRole('button', { name: /mark picking/i }).first()
+  await expect(markPicking).toBeVisible()
+  await markPicking.click()
+  await page.getByRole('button', { name: /confirm scan & audit/i }).click()
+  await expect(page.getByText(/shipment moved to picking/i)).toBeVisible()
   await expectNoRootOverflow(page)
 })

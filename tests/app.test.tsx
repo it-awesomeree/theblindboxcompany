@@ -8,9 +8,9 @@ import { MemoryStorage, FIXED_NOW } from './helpers'
 import { VaultCanvas } from '../src/components/VaultCanvas'
 import { DEMO_ADDRESS } from '../src/data/fixtures'
 
-function renderApp() {
+function renderApp(storage = new MemoryStorage()) {
   window.history.replaceState({}, '', '#/')
-  const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+  const services = new AppServices(storage, () => FIXED_NOW)
   render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
   return services
 }
@@ -31,6 +31,86 @@ describe('app components', () => {
     await user.click(screen.getByRole('button', { name: /one-click aina demo/i }))
     expect(services.auth.currentUser()?.role).toBe('customer')
     expect(await screen.findByRole('heading', { name: 'Aina Demo' })).toBeVisible()
+  })
+
+  it('shows constructor storage fallback while keeping its memory-only demo session usable', async () => {
+    const user = userEvent.setup()
+    const storage = new MemoryStorage()
+    storage.setItem = (key, value) => {
+      void key
+      void value
+      throw new Error('browser quota failure')
+    }
+    const services = new AppServices(storage, () => FIXED_NOW)
+    window.history.replaceState({}, '', '#/auth')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+
+    await user.click(screen.getByRole('button', { name: /one-click aina demo/i }))
+
+    expect(services.auth.currentUser()?.role).toBe('customer')
+    expect(await screen.findByText(/could not save it.+continuing in memory only/i)).toBeVisible()
+    expect(await screen.findByRole('heading', { name: 'Aina Demo' })).toBeVisible()
+  })
+
+  it('requires styled confirmation before resetting demo data', async () => {
+    const user = userEvent.setup()
+    const services = renderApp()
+    services.auth.oneClick('customer')
+    services.orders.setCartQuantity(3)
+
+    await user.click(screen.getByRole('button', { name: /reset demo data/i }))
+    const dialog = screen.getByRole('dialog', { name: /reset all demo data/i })
+    expect(dialog).toBeVisible()
+    expect(dialog).toHaveTextContent(/restores the safe starting fixtures/i)
+    expect(services.repository.getSnapshot().sessionUserId).toBe('usr-demo-customer')
+
+    await user.click(within(dialog).getByRole('button', { name: /go back/i }))
+    expect(screen.queryByRole('dialog', { name: /reset all demo data/i })).not.toBeInTheDocument()
+    expect(services.repository.getSnapshot().cart[0].quantity).toBe(3)
+
+    await user.click(screen.getByRole('button', { name: /reset demo data/i }))
+    await user.click(screen.getByRole('button', { name: /confirm demo reset/i }))
+    expect(services.repository.getSnapshot()).toEqual(expect.objectContaining({
+      sessionUserId: null,
+      cart: [expect.objectContaining({ quantity: 1 })],
+    }))
+  })
+
+  it('keeps reset confirmation open and reports an atomic storage failure before retrying', async () => {
+    const user = userEvent.setup()
+    const storage = new MemoryStorage()
+    const services = renderApp(storage)
+    services.auth.oneClick('customer')
+    services.orders.setCartQuantity(3)
+    const before = services.repository.exportForTest()
+    const storedBefore = storage.getItem('tbbc:demo:repository:v5')
+    const originalSetItem = storage.setItem.bind(storage)
+    let failNextWrite = true
+    storage.setItem = (key, value) => {
+      if (failNextWrite) {
+        failNextWrite = false
+        throw new Error('browser quota failure')
+      }
+      originalSetItem(key, value)
+    }
+
+    await user.click(screen.getByRole('button', { name: /reset demo data/i }))
+    const dialog = screen.getByRole('dialog', { name: /reset all demo data/i })
+    await user.click(within(dialog).getByRole('button', { name: /confirm demo reset/i }))
+
+    expect(dialog).toBeVisible()
+    expect(within(dialog).getByRole('alert')).toHaveTextContent(/nothing changed.+try again/i)
+    expect(services.repository.getSnapshot()).toEqual(before)
+    expect(storage.getItem('tbbc:demo:repository:v5')).toBe(storedBefore)
+
+    await user.click(within(dialog).getByRole('button', { name: /confirm demo reset/i }))
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog', { name: /reset all demo data/i })).not.toBeInTheDocument()
+    })
+    expect(services.repository.getSnapshot()).toEqual(expect.objectContaining({
+      sessionUserId: null,
+      cart: [expect.objectContaining({ quantity: 1 })],
+    }))
   })
 
   it('service-protects direct admin navigation for a customer', async () => {
@@ -74,19 +154,19 @@ describe('app components', () => {
       orderId: 'ord-shipped',
       kind: 'non_delivery',
       shipmentId: 'shp-shipped',
-      note: 'Active priority queue claim',
+      note: 'DEMO active priority queue claim',
     }).data
     const rejectedClaim = services.claims.submit({
       orderId: 'ord-failed',
       kind: 'non_delivery',
       shipmentId: 'shp-failed',
-      note: 'Rejected priority queue claim',
+      note: 'DEMO rejected priority queue claim',
     }).data
     const resolvedClaim = services.claims.submit({
       orderId: 'ord-delivered',
       kind: 'damage',
       shipmentId: 'shp-delivered',
-      note: 'Resolved priority queue claim',
+      note: 'DEMO resolved priority queue claim',
     }).data
     services.auth.oneClick('admin')
     services.claims.review(rejectedClaim.id, 'reject', 'Confirmed rejected queue regression')
@@ -388,7 +468,7 @@ describe('app components', () => {
     expect(screen.getByLabelText('Revealed box')).toBeVisible()
     expect(screen.getByRole('option', { name: /box-processing-01 · opened/i })).toBeVisible()
     expect(screen.queryByRole('option', { name: /box-processing-02/i })).not.toBeInTheDocument()
-    expect(screen.getByLabelText('Fictional note')).toBeVisible()
+    expect(screen.getByLabelText(/fictional note/i)).toBeVisible()
     expect(screen.getByRole('button', { name: /submit demo claim/i })).toBeEnabled()
   })
 

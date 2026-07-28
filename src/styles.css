@@ -2928,6 +2928,11 @@ legend {
     display: none;
   }
 
+  .page-heading > .huge-code {
+    flex: 0 0 auto;
+    font-size: clamp(2.75rem, 7vw, 3.5rem);
+  }
+
   .nav-links {
     margin-left: 0;
   }

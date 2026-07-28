@@ -10,18 +10,24 @@
 
 ## Automated verification
 
-- [x] `npm test` — 5 files, 108 tests passed
+- [x] `npm test` — 5 files, 160 tests passed
 - [x] `npm run typecheck`
 - [x] `npm run lint`
 - [x] `npm run build`
-- [x] `npm run check:secrets` — 83 publishable text files scanned
-- [x] Playwright — 26 selected tests passed with 49 intentional project skips across 1440x900, 360x800, 390x844, 430x932 and 768x1024
+- [x] `npm run secrets:test` — secret-scanner self-test passed
+- [x] `npm run check:secrets` — 84 publishable text files scanned
+- [x] `npm run audit:release` — both npm audits found 0 vulnerabilities
+- [x] `git diff --check`
+- [x] `npm run verify` — passed end-to-end in the approved parent environment
+- [x] Playwright current remediation — all 75 project cases ran across 1440x900, 360x800, 390x844, 430x932 and 768x1024; 29 intended tests passed, 46 intentional desktop/mobile skips, 0 failed
 
 ## Outside this run
 
-- [x] Run the selected Playwright browser checks from the approved parent environment
-- [x] Complete the final manual personal-Chrome desktop/mobile commerce, admin and privacy checks
+- [x] Previous draft baseline: 26 selected Playwright checks passed with 49 intentional skips
+- [x] Rerun the amended browser selection in the approved parent environment, including reset-dialog storage-failure containment in every viewport and full customer checkout/mock payment/order/immutable reveal/account/admin journeys at all four mobile/tablet widths
+- [ ] Repeat the final personal-Chrome desktop/mobile commerce, admin, storage-failure notice and privacy checks for this remediation
 - [x] Create or update the GitHub draft pull request (PR #1)
+- [ ] Transfer these uncommitted remediation changes to draft PR #1 only after owner review
 - [ ] GitHub reviewer KeninMY must first be added as a repository collaborator because GitHub rejected the review request
 - [ ] Review the draft pull request and approve publishing
 - [ ] Publish/deploy only after the external browser and manual checks pass

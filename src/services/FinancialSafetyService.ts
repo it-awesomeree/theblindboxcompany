@@ -6,6 +6,7 @@ import {
   transitionShipment,
 } from '../domain/guards'
 import type { DemoState, Order, OrderStatus, Role, ShipmentStatus } from '../domain/types'
+import { deriveOrderStatusFromShipments } from '../domain/orderStatus'
 import { AuditService } from './AuditService'
 
 const UNSHIPPED: ShipmentStatus[] = ['unfulfilled', 'picking', 'packed', 'label_created']
@@ -119,16 +120,8 @@ export class FinancialSafetyService {
       box.status = transitionBox(box.status, target)
     }
     const previous = order.timeline.at(-1)?.financialHoldPreviousStatus
-    const delivered = related.filter((shipment) => shipment.status === 'delivered').length
-    const advanced = related.some((shipment) => shipment.status !== 'unfulfilled')
-    const derived: OrderStatus = related.length > 0 && delivered === related.length
-      ? 'fulfilled'
-      : delivered > 0
-        ? 'partially_fulfilled'
-        : advanced
-          ? 'processing'
-          : 'confirmed'
-    const restored: OrderStatus = previous === 'closed' && delivered === related.length && related.length > 0
+    const derived = deriveOrderStatusFromShipments(related.map((shipment) => shipment.status))
+    const restored: OrderStatus = previous === 'closed' && derived === 'fulfilled'
       ? 'closed'
       : derived
     order.status = transitionOrder(order.status, restored)

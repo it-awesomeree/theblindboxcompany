@@ -14,6 +14,7 @@ import {
 } from '../src/domain/guards'
 import { formatMYR } from '../src/lib/format'
 import { DEMO_ADDRESS } from '../src/data/fixtures'
+import { deriveOrderStatusFromShipments } from '../src/domain/orderStatus'
 
 describe('Series 001 and domain guards', () => {
   it('has exactly 10,000 fixed allocations and every value clears RM100', () => {
@@ -54,6 +55,16 @@ describe('Series 001 and domain guards', () => {
     expect(() => transitionBoxForReveal('reserved')).toThrow(/cannot be revealed/i)
     expect(() => transitionBoxForReveal('on_hold')).toThrow(/cannot be revealed/i)
     expect(() => transitionBox('fulfilled', 'paid_unopened')).toThrow(/cannot move/i)
+  })
+
+  it('derives one exact ordinary order status from all related shipments', () => {
+    expect(deriveOrderStatusFromShipments(['unfulfilled', 'unfulfilled'])).toBe('confirmed')
+    expect(deriveOrderStatusFromShipments(['picking', 'unfulfilled'])).toBe('processing')
+    expect(deriveOrderStatusFromShipments(['failed_delivery'])).toBe('processing')
+    expect(deriveOrderStatusFromShipments(['returned'])).toBe('processing')
+    expect(deriveOrderStatusFromShipments(['delivered', 'unfulfilled'])).toBe('partially_fulfilled')
+    expect(deriveOrderStatusFromShipments(['delivered', 'returned'])).toBe('partially_fulfilled')
+    expect(deriveOrderStatusFromShipments(['delivered', 'delivered'])).toBe('fulfilled')
   })
 
   it('accepts fictional input and blocks likely real data', () => {

@@ -307,6 +307,7 @@ describe('customer, payment, allocation and admin services', () => {
     expect(result.changed).toBe(false)
     expect(services.repository.getSnapshot().boxes.find((box) => order.boxIds.includes(box.id))?.prizeId).toBeUndefined()
     expect(services.repository.getSnapshot().payments.find((entry) => entry.id === payment.id)?.events.at(-1)?.ignoredReason).toMatch(/out-of-order/i)
+    expect(() => validateDemoState(services.repository.getSnapshot())).not.toThrow()
   })
 
   it('shares the active-attempt guard between customer retry and admin retry', () => {
@@ -416,6 +417,22 @@ describe('customer, payment, allocation and admin services', () => {
     expect(new Set(shipment.timeline.map((entry) => entry.id)).size).toBe(shipment.timeline.length)
     expect(new Set(order.timeline.map((entry) => entry.id)).size).toBe(order.timeline.length)
     expect(snapshot.nextSequence).toBe(1003)
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+  })
+
+  it('accepts failed_delivery to shipped to delivered and derives fulfilment exactly', () => {
+    services.auth.oneClick('admin')
+    services.fulfilment.advance('shp-failed', 'shipped', 'Confirmed redelivery after failed delivery')
+    services.fulfilment.advance('shp-failed', 'delivered', 'Confirmed successful redelivery completion')
+
+    const snapshot = services.repository.getSnapshot()
+    expect(snapshot.shipments.find((entry) => entry.id === 'shp-failed')?.timeline.slice(-3).map((entry) => entry.status)).toEqual([
+      'failed_delivery',
+      'shipped',
+      'delivered',
+    ])
+    expect(snapshot.orders.find((entry) => entry.id === 'ord-failed')?.status).toBe('fulfilled')
+    expect(snapshot.boxes.find((entry) => entry.id === 'box-failed-01')?.status).toBe('fulfilled')
     expect(() => validateDemoState(snapshot)).not.toThrow()
   })
 
@@ -610,6 +627,52 @@ describe('customer, payment, allocation and admin services', () => {
     expect(snapshot.shipments.find((entry) => entry.id === 'shp-unopened')?.status).toBe('unfulfilled')
   })
 
+  it('keeps a partial refund valid while fulfilment advances to shipped', () => {
+    services.auth.oneClick('admin')
+    services.payments.refund(
+      'pay-unopened',
+      1000,
+      'Confirmed partial refund before shipping',
+      'req-partial-before-shipping',
+    )
+    for (const status of ['picking', 'packed', 'label_created', 'shipped'] as const) {
+      services.fulfilment.advance('shp-unopened', status, `Confirmed partial-refund ${status}`)
+    }
+
+    const snapshot = services.repository.getSnapshot()
+    expect(snapshot.payments.find((entry) => entry.id === 'pay-unopened')).toMatchObject({
+      status: 'partially_refunded',
+      refundedSen: 1000,
+    })
+    expect(snapshot.orders.find((entry) => entry.id === 'ord-unopened')?.status).toBe('processing')
+    expect(snapshot.shipments.find((entry) => entry.id === 'shp-unopened')?.status).toBe('shipped')
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+  })
+
+  it('continues fulfilment after an explicit dispute merchant win', () => {
+    services.auth.oneClick('admin')
+    services.payments.dispute(
+      'pay-unopened',
+      'Confirmed dispute before later merchant win',
+      'evt-dispute-before-fulfilment',
+    )
+    services.payments.resolveDispute(
+      'pay-unopened',
+      'merchant_won',
+      'Confirmed merchant win before fulfilment',
+      'evt-dispute-win-before-fulfilment',
+    )
+    for (const status of ['picking', 'packed', 'label_created', 'shipped', 'delivered'] as const) {
+      services.fulfilment.advance('shp-unopened', status, `Confirmed post-dispute ${status}`)
+    }
+
+    const snapshot = services.repository.getSnapshot()
+    expect(snapshot.payments.find((entry) => entry.id === 'pay-unopened')?.status).toBe('succeeded')
+    expect(snapshot.orders.find((entry) => entry.id === 'ord-unopened')?.status).toBe('fulfilled')
+    expect(snapshot.shipments.find((entry) => entry.id === 'shp-unopened')?.status).toBe('delivered')
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+  })
+
   it('allows guarded post-close dispute and refund while preserving delivered history', () => {
     services.auth.oneClick('admin')
     services.admin.changeOrderStatus('ord-delivered', 'closed', 'Confirmed completion before late finance event')
@@ -684,6 +747,28 @@ describe('customer, payment, allocation and admin services', () => {
     expect(new Set([damage.data.id, valueFloor.data.id, nonDelivery.data.id]).size).toBe(3)
     expect(damage.data.id).toMatch(/^clm-[a-z0-9]{8}-[a-z0-9]{7}$/)
     expect(damage.data.requestId).toMatch(/^req-claim-/)
+  })
+
+  it('requires explicit DEMO customer notes and rejects likely contact details without changing state', () => {
+    services.auth.oneClick('customer')
+    const submit = (note: string) => services.claims.submit({
+      orderId: 'ord-shipped',
+      kind: 'non_delivery',
+      shipmentId: 'shp-shipped',
+      note,
+    })
+    for (const [note, message] of [
+      ['Fictional shipment is missing', /separate word DEMO/i],
+      ['DEMONSTRATION shipment is missing', /separate word DEMO/i],
+      ['DEMO contact me at person@example.test', /email address/i],
+      ['DEMO call me on +60 12-345 6789', /phone number/i],
+    ] as const) {
+      const before = structuredClone(services.repository.getSnapshot())
+      expect(() => submit(note)).toThrow(message)
+      expect(services.repository.getSnapshot()).toEqual(before)
+    }
+
+    expect(submit('DEMO shipment is still missing after 3 demo days').changed).toBe(true)
   })
 
   it('runs protected claim review from acknowledge through resolve without an implicit refund', () => {

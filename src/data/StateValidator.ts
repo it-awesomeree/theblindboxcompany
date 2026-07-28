@@ -5,10 +5,12 @@ import {
   MAX_CART_QUANTITY,
   ORDER_TRANSITIONS,
   PAYMENT_TRANSITIONS,
+  POLICY_ACKNOWLEDGEMENT,
   SCHEMA_VERSION,
   SHIPMENT_TRANSITIONS,
 } from '../domain/constants'
 import { assert, CHECKOUT_REQUEST_ID_PATTERN } from '../domain/guards'
+import { deriveOrderStatusFromShipments } from '../domain/orderStatus'
 import type {
   Box,
   BoxStatus,
@@ -18,9 +20,12 @@ import type {
   FulfilmentKind,
   OrderStatus,
   Payment,
+  PaymentMethod,
   PaymentStatus,
   Role,
   SeriesStatus,
+  Shipment,
+  ShippingMethod,
   ShipmentStatus,
 } from '../domain/types'
 
@@ -36,6 +41,17 @@ const CLAIM_STATUSES = new Set<ClaimStatus>(['submitted', 'reviewing', 'approved
 const CLAIM_KINDS = new Set<ClaimKind>(['damage', 'non_delivery', 'value_floor'])
 const SERIES_STATUSES = new Set<SeriesStatus>(['draft', 'published'])
 const FULFILMENT_KINDS = new Set<FulfilmentKind>(['PARCEL', 'BULKY', 'DIGITAL', 'SELF_COLLECT'])
+const SHIPPING_METHODS = new Set<ShippingMethod>(['standard', 'priority', 'self_collect'])
+const PAYMENT_METHODS = new Set<PaymentMethod>(['FPX', 'DUITNOW', 'CARD', 'GRABPAY', 'TNG'])
+const NORMAL_PAID_ORDER_STATUSES = new Set<OrderStatus>([
+  'confirmed',
+  'processing',
+  'partially_fulfilled',
+  'fulfilled',
+  'closed',
+])
+const NORMAL_CAPTURE_STATUSES = new Set<PaymentStatus>(['succeeded', 'partially_refunded'])
+const SHIPPED_OVERDUE_MS = 3 * 24 * 60 * 60 * 1000
 const CLAIM_TRANSITIONS: Record<ClaimStatus, ClaimStatus[]> = {
   submitted: ['reviewing', 'rejected'],
   reviewing: ['approved', 'rejected'],
@@ -46,6 +62,14 @@ const CLAIM_TRANSITIONS: Record<ClaimStatus, ClaimStatus[]> = {
 
 function integer(value: unknown, minimum = 0) {
   return Number.isInteger(value) && Number(value) >= minimum
+}
+
+function record(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+function nonEmptyString(value: unknown) {
+  return typeof value === 'string' && value.trim().length > 0
 }
 
 function validIso(value: unknown) {
@@ -88,6 +112,35 @@ function capturedAt(payment: Payment) {
   return event?.processedAt
 }
 
+function replayPaymentStatus(payment: Payment) {
+  const first = payment.events[0]
+  assert(
+    first && !first.ignoredReason && (first.type === 'created' || first.type === 'succeeded'),
+    `Payment ${payment.id} history must begin with an accepted created or seeded succeeded event.`,
+  )
+  let effective: PaymentStatus = first.type === 'created' ? 'pending' : 'succeeded'
+  for (const event of payment.events.slice(1)) {
+    if (event.ignoredReason) continue
+    assert(
+      PAYMENT_TRANSITIONS[effective].includes(event.type),
+      `Payment ${payment.id} history has an illegal accepted ${effective} to ${event.type} jump.`,
+    )
+    effective = event.type
+  }
+  return effective
+}
+
+function historicalShipmentStatus(shipment: Shipment, at: string) {
+  return shipment.timeline.filter((entry) => timestamp(entry.at) <= timestamp(at)).at(-1)?.status
+}
+
+function customerClaimNoteIsSafe(value: unknown) {
+  if (typeof value !== 'string' || value.length < 8 || value.length > 500 || !/\bDEMO\b/i.test(value)) return false
+  if (/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i.test(value)) return false
+  const phoneLike = value.match(/\+?\d[\d\s().-]{6,}\d/g) ?? []
+  return phoneLike.every((candidate) => candidate.replace(/\D/g, '').length < 8)
+}
+
 function validateOrderFulfilment(state: DemoState, orderId: string) {
   const order = state.orders.find((entry) => entry.id === orderId)!
   const shipments = state.shipments.filter((entry) => entry.orderId === order.id)
@@ -103,17 +156,15 @@ function validateOrderFulfilment(state: DemoState, orderId: string) {
     return
   }
   assert(shipments.length > 0, 'A paid order must have coherent fulfilment records.')
-  const delivered = shipments.filter((shipment) => shipment.status === 'delivered').length
-  const advanced = shipments.some((shipment) => shipment.status !== 'unfulfilled')
-  if (order.status === 'confirmed') {
-    assert(shipments.every((shipment) => shipment.status === 'unfulfilled'), 'A confirmed order cannot contain advanced fulfilment.')
-  } else if (order.status === 'processing') {
-    assert(advanced && delivered < shipments.length, 'A processing order needs an active, incomplete shipment.')
-  } else if (order.status === 'partially_fulfilled') {
-    assert(delivered > 0 && delivered < shipments.length, 'A partially fulfilled order needs both delivered and incomplete shipments.')
-  } else if (order.status === 'fulfilled' || order.status === 'closed') {
-    assert(delivered === shipments.length, 'A fulfilled order requires every shipment to be delivered.')
+  const derived = deriveOrderStatusFromShipments(shipments.map((shipment) => shipment.status))
+  if (order.status === 'closed') {
+    assert(derived === 'fulfilled', 'A closed order requires every shipment to be delivered.')
+    return
   }
+  assert(
+    order.status === derived,
+    `Order ${order.id} status must be ${derived} for its shipment progress.`,
+  )
 }
 
 function validateBoxShipment(state: DemoState, box: Box) {
@@ -155,6 +206,10 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
   unique(state.shipments.map((entry) => entry.id), 'Shipment')
   unique(state.claims.map((entry) => entry.id), 'Claim')
   unique(state.audits.map((entry) => entry.id), 'Audit')
+  assert(state.payments.every((entry) => Array.isArray(entry.events)), 'Payment events must be collections.')
+  assert(state.orders.every((entry) => Array.isArray(entry.timeline)), 'Order timelines must be collections.')
+  assert(state.shipments.every((entry) => Array.isArray(entry.timeline)), 'Shipment timelines must be collections.')
+  assert(state.claims.every((entry) => Array.isArray(entry.history)), 'Claim histories must be collections.')
   unique(state.payments.flatMap((entry) => entry.events.map((event) => event.id)), 'Payment event')
   unique(state.orders.flatMap((entry) => entry.timeline.map((event) => event.id)), 'Order timeline')
   unique(state.shipments.flatMap((entry) => entry.timeline.map((event) => event.id)), 'Shipment timeline')
@@ -221,6 +276,35 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
     assert(ORDER_STATUSES.has(order.status), 'Order status is invalid.')
     assert(CHECKOUT_REQUEST_ID_PATTERN.test(order.checkoutRequestId), 'Checkout request identity is invalid.')
     assert(state.users.some((user) => user.id === order.userId && user.role === 'customer'), 'Order user reference is invalid.')
+    assert(record(order.snapshot), 'Order snapshot is invalid.')
+    assert(record(order.snapshot.totals), 'Order totals snapshot is invalid.')
+    assert(record(order.snapshot.address), 'Order address snapshot is invalid.')
+    assert(
+      nonEmptyString(order.snapshot.itemName) &&
+        nonEmptyString(order.snapshot.seriesId) &&
+        nonEmptyString(order.snapshot.oddsVersion) &&
+        nonEmptyString(order.snapshot.policyVersion) &&
+        order.snapshot.acknowledgement === POLICY_ACKNOWLEDGEMENT,
+      'Order snapshot text or acknowledgement is invalid.',
+    )
+    assert(SHIPPING_METHODS.has(order.snapshot.shippingMethod), 'Order shipping method is invalid.')
+    const address = order.snapshot.address
+    assert(
+      [
+        address.recipient,
+        address.line1,
+        address.line2,
+        address.postcode,
+        address.city,
+        address.state,
+        address.phone,
+      ].every(nonEmptyString) &&
+        address.country === 'MY' &&
+        /^\d{5}$/.test(address.postcode) &&
+        address.line1.toUpperCase().includes('DEMO') &&
+        address.phone.toLowerCase().includes('demo'),
+      'Order address must remain complete and visibly fictional.',
+    )
     assert(state.series.some((series) => series.id === order.snapshot.seriesId && series.status === 'published'), 'Order series reference is invalid.')
     assert(integer(order.snapshot.quantity, 1), 'Order quantity is invalid.')
     assert(
@@ -236,6 +320,8 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
       order.snapshot.unitPriceSen * order.snapshot.quantity === order.snapshot.totals.itemSubtotalSen,
       'Order subtotal is inconsistent.',
     )
+    assert(Array.isArray(order.paymentIds) && Array.isArray(order.boxIds) && Array.isArray(order.claimIds), 'Order links must be collections.')
+    assert(Array.isArray(order.timeline), 'Order timeline must be a collection.')
     unique(order.paymentIds, `Order ${order.id} payment`)
     unique(order.boxIds, `Order ${order.id} box`)
     unique(order.claimIds, `Order ${order.id} claim`)
@@ -266,19 +352,21 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
 
   for (const payment of state.payments) {
     assert(PAYMENT_STATUSES.has(payment.status), 'Payment status is invalid.')
+    assert(PAYMENT_METHODS.has(payment.method as PaymentMethod), 'Payment method is invalid.')
     const order = state.orders.find((entry) => entry.id === payment.orderId)
     assert(order && order.userId === payment.userId && order.paymentIds.includes(payment.id), 'Payment cross-reference is invalid.')
     assert(integer(payment.attempt, 1) && integer(payment.amountSen, 1) && integer(payment.refundedSen), 'Payment counters are invalid.')
     assert(payment.amountSen === order.snapshot.totals.totalSen && payment.refundedSen <= payment.amountSen, 'Payment amount is inconsistent.')
     assert(validIso(payment.createdAt) && validIso(payment.updatedAt), 'Payment time is invalid.')
     assert(timestamp(payment.updatedAt) >= timestamp(payment.createdAt), 'Payment updated time cannot precede creation.')
-    assert(payment.events.length > 0, 'Payment event history is required.')
+    assert(Array.isArray(payment.events) && payment.events.length > 0, 'Payment event history is required.')
     assert(
       payment.events.every((event) =>
         PAYMENT_STATUSES.has(event.type) &&
         ['mock_webhook', 'admin_reconcile', 'reservation_clock'].includes(event.source) &&
         typeof event.requestId === 'string' &&
         event.requestId.length > 0 &&
+        (event.ignoredReason === undefined || nonEmptyString(event.ignoredReason)) &&
         validIso(event.createdAt) &&
         validIso(event.processedAt)),
       'Payment event is invalid.',
@@ -289,22 +377,69 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
     }
     chronological(payment.events.map((event) => event.processedAt), `Payment ${payment.id} events`)
     assert(timestamp(payment.events.at(-1)!.processedAt) <= timestamp(payment.updatedAt), 'Payment events cannot end after its updated time.')
-    const successfulState = ['succeeded', 'partially_refunded', 'refunded', 'disputed'].includes(payment.status)
-    assert(!successfulState || captured(payment), 'Captured payment state requires a successful event.')
-    if (payment.status === 'refunded') assert(payment.refundedSen === payment.amountSen, 'A refunded payment must be fully refunded.')
-    if (payment.status === 'partially_refunded') {
+    assert(
+      replayPaymentStatus(payment) === payment.status,
+      `Payment ${payment.id} current status does not match its accepted event history.`,
+    )
+    const hasAcceptedPartialRefund = payment.events.some((event) =>
+      event.type === 'partially_refunded' && !event.ignoredReason,
+    )
+    if (payment.status === 'refunded') {
+      assert(payment.refundedSen === payment.amountSen, 'A refunded payment must be fully refunded.')
+    } else if (payment.status === 'partially_refunded') {
       assert(payment.refundedSen > 0 && payment.refundedSen < payment.amountSen, 'A partial refund amount is invalid.')
+    } else if (payment.status === 'disputed') {
+      if (hasAcceptedPartialRefund) {
+        assert(
+          payment.refundedSen > 0 && payment.refundedSen < payment.amountSen,
+          'A disputed payment must preserve its prior partial refund amount.',
+        )
+      } else {
+        assert(payment.refundedSen === 0, 'A disputed payment cannot invent a refund without accepted history.')
+      }
+    } else {
+      assert(payment.refundedSen === 0, 'A non-refund payment status must have a zero refunded amount.')
     }
   }
   for (const order of state.orders) {
     const payments = state.payments.filter((payment) => payment.orderId === order.id)
     unique(payments.map((payment) => String(payment.attempt)), `Order ${order.id} payment attempt`)
-    assert(payments.filter((payment) => ACTIVE_PAYMENT.has(payment.status)).length <= 1, 'An order has more than one active payment.')
-    const captureCount = payments.filter(captured).length
-    assert(captureCount <= 1, 'An order has more than one captured payment.')
-    if (order.status === 'pending_payment') assert(captureCount === 0, 'A pending order cannot have a captured payment.')
-    if (!['pending_payment', 'cancelled'].includes(order.status)) {
-      assert(captureCount === 1, 'A paid order needs exactly one captured payment.')
+    const activePayments = payments.filter((payment) => ACTIVE_PAYMENT.has(payment.status))
+    const capturedPayments = payments.filter(captured)
+    assert(activePayments.length <= 1, 'An order has more than one active payment.')
+    assert(capturedPayments.length <= 1, 'An order has more than one captured payment.')
+    assert(
+      activePayments.length === 0 || capturedPayments.length === 0,
+      'An active payment attempt cannot coexist with a captured payment.',
+    )
+    if (order.status === 'pending_payment') {
+      assert(capturedPayments.length === 0, 'A pending order cannot have a captured payment.')
+    } else if (order.status === 'cancelled') {
+      assert(
+        capturedPayments.length === 0 && activePayments.length === 0,
+        'A cancelled order cannot have a captured or active payment.',
+      )
+    } else if (NORMAL_PAID_ORDER_STATUSES.has(order.status)) {
+      assert(
+        capturedPayments.length === 1 &&
+          NORMAL_CAPTURE_STATUSES.has(capturedPayments[0].status) &&
+          activePayments.length === 0,
+        'A normal paid order needs one settled captured payment and no active attempt.',
+      )
+    } else if (order.status === 'disputed') {
+      assert(
+        capturedPayments.length === 1 &&
+          capturedPayments[0].status === 'disputed' &&
+          activePayments.length === 0,
+        'A disputed order must match one disputed captured payment.',
+      )
+    } else if (order.status === 'refunded') {
+      assert(
+        capturedPayments.length === 1 &&
+          capturedPayments[0].status === 'refunded' &&
+          activePayments.length === 0,
+        'A refunded order must match one fully refunded captured payment.',
+      )
     }
   }
 
@@ -336,11 +471,13 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
     validateBoxShipment(state, box)
   }
 
+  unique(state.boxes.map((box) => box.manifestId), 'Box manifest')
   unique(state.shipments.map((shipment) => shipment.trackingNumber), 'Shipment tracking')
   for (const shipment of state.shipments) {
     assert(SHIPMENT_STATUSES.has(shipment.status) && FULFILMENT_KINDS.has(shipment.kind), 'Shipment status or kind is invalid.')
     const order = state.orders.find((entry) => entry.id === shipment.orderId)
     assert(order, 'Shipment order reference is invalid.')
+    assert(Array.isArray(shipment.boxIds) && Array.isArray(shipment.timeline), 'Shipment links and timeline must be collections.')
     unique(shipment.boxIds, `Shipment ${shipment.id} box`)
     assert(shipment.boxIds.length > 0, 'Shipment must contain a box.')
     assert(shipment.boxIds.every((id) => state.boxes.some((box) => box.id === id && box.shipmentId === shipment.id && box.orderId === order.id)), 'Shipment box reference is invalid.')
@@ -374,9 +511,11 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
     assert(CLAIM_KINDS.has(claim.kind) && CLAIM_STATUSES.has(claim.status), 'Claim kind or status is invalid.')
     const order = state.orders.find((entry) => entry.id === claim.orderId)
     assert(order?.userId === claim.userId && order.claimIds.includes(claim.id), 'Claim order reference is invalid.')
+    assert(customerClaimNoteIsSafe(claim.note), 'Customer claim note must be fictional and include DEMO without email or phone data.')
     assert(validIso(claim.createdAt) && validIso(claim.updatedAt), 'Claim time is invalid.')
+    assert(timestamp(claim.createdAt) >= timestamp(order.createdAt), 'Claim cannot precede its order.')
     assert(timestamp(claim.updatedAt) >= timestamp(claim.createdAt), 'Claim updated time cannot precede creation.')
-    assert(claim.history.length > 0 && claim.history[0].status === 'submitted' && claim.history.at(-1)?.status === claim.status, 'Claim history must start submitted and end at current status.')
+    assert(Array.isArray(claim.history) && claim.history.length > 0 && claim.history[0].status === 'submitted' && claim.history.at(-1)?.status === claim.status, 'Claim history must start submitted and end at current status.')
     assert(
       claim.history.every((entry) =>
         CLAIM_STATUSES.has(entry.status) &&
@@ -388,12 +527,58 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
     )
     chronological(claim.history.map((entry) => entry.at), `Claim ${claim.id} history`)
     assert(claim.history[0].at === claim.createdAt, 'Claim history must begin at claim creation.')
+    assert(
+      claim.history[0].actorId === claim.userId &&
+        claim.history[0].actorRole === 'customer' &&
+        claim.history[0].note === claim.note,
+      'Claim submission history must preserve the customer note.',
+    )
     assert(timestamp(claim.history.at(-1)!.at) <= timestamp(claim.updatedAt), 'Claim history cannot end after its updated time.')
     changedStatusesAreLegal(claim.history.map((entry) => entry.status), CLAIM_TRANSITIONS, `Claim ${claim.id}`)
     if (claim.kind === 'value_floor') {
       assert(!claim.shipmentId && claim.boxId, 'Value-floor claim link is invalid.')
+      const box = state.boxes.find((entry) => entry.id === claim.boxId && entry.orderId === claim.orderId && entry.ownerId === claim.userId)
+      assert(
+        box?.prizeId &&
+          validIso(box.assignedAt) &&
+          validIso(box.revealedAt) &&
+          timestamp(box.assignedAt!) <= timestamp(claim.createdAt) &&
+          timestamp(box.revealedAt!) <= timestamp(claim.createdAt),
+        'Value-floor claim requires an assigned box revealed by claim creation.',
+      )
     } else {
       assert(claim.shipmentId && !claim.boxId, 'Shipment claim link is invalid.')
+      assert(
+        order.boxIds.length > 0 &&
+          order.boxIds.every((boxId) => {
+            const box = state.boxes.find((entry) => entry.id === boxId)
+            return Boolean(box?.revealedAt && timestamp(box.revealedAt) <= timestamp(claim.createdAt))
+          }),
+        'Shipment-linked claim requires every order box revealed by claim creation.',
+      )
+      const shipment = state.shipments.find((entry) => entry.id === claim.shipmentId && entry.orderId === claim.orderId)
+      assert(shipment, 'Claim shipment reference is invalid.')
+      const historicalEvents = shipment.timeline.filter((entry) => timestamp(entry.at) <= timestamp(claim.createdAt))
+      const historicalStatus = historicalShipmentStatus(shipment, claim.createdAt)
+      if (claim.kind === 'damage') {
+        assert(
+          shipment.kind !== 'DIGITAL' && historicalEvents.some((entry) => entry.status === 'delivered'),
+          'Damage claim requires physical delivery by claim creation.',
+        )
+      } else {
+        assert(
+          historicalStatus && ['shipped', 'failed_delivery', 'lost'].includes(historicalStatus),
+          'Non-delivery claim requires shipped, failed-delivery, or lost evidence at claim creation.',
+        )
+        const hasExceptionEvidence = historicalEvents.some((entry) => ['failed_delivery', 'lost'].includes(entry.status))
+        if (!hasExceptionEvidence) {
+          const shippedAt = historicalEvents.filter((entry) => entry.status === 'shipped').at(-1)?.at
+          assert(
+            Boolean(shippedAt) && timestamp(claim.createdAt) - timestamp(shippedAt!) >= SHIPPED_OVERDUE_MS,
+            'Shipped-only non-delivery evidence must be three demo days overdue at claim creation.',
+          )
+        }
+      }
     }
     if (claim.shipmentId) assert(state.shipments.some((shipment) => shipment.id === claim.shipmentId && shipment.orderId === claim.orderId), 'Claim shipment reference is invalid.')
     if (claim.boxId) assert(state.boxes.some((box) => box.id === claim.boxId && box.orderId === claim.orderId && box.ownerId === claim.userId), 'Claim box reference is invalid.')

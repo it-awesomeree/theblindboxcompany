@@ -1,10 +1,11 @@
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import type { PropsWithChildren } from 'react'
 import { NavLink } from '../lib/router'
 import { useLocation, useNavigate } from '../lib/router-core'
 import { ADMIN_ROLES } from '../domain/constants'
 import { useAppState } from '../state/AppStateContext'
 import { Brand } from './Brand'
+import { ConfirmDialog } from './ConfirmDialog'
 import { DemoBanner } from './DemoBanner'
 
 export function Layout({ children }: PropsWithChildren) {
@@ -13,6 +14,8 @@ export function Layout({ children }: PropsWithChildren) {
   const cartCount = state.cart.reduce((sum, item) => sum + item.quantity, 0)
   const navigate = useNavigate()
   const { pathname } = useLocation()
+  const [resetPending, setResetPending] = useState(false)
+  const [resetError, setResetError] = useState('')
 
   const focusMain = () => {
     const main = document.getElementById('main-content')
@@ -31,6 +34,22 @@ export function Layout({ children }: PropsWithChildren) {
   const logout = () => {
     services.auth.logout()
     navigate('/')
+  }
+
+  const reset = () => {
+    setResetError('')
+    try {
+      services.reset()
+      setResetPending(false)
+      navigate('/')
+    } catch (caught) {
+      setResetError(caught instanceof Error ? caught.message : 'Demo data could not be reset. Nothing changed; please try again.')
+    }
+  }
+
+  const closeReset = () => {
+    setResetError('')
+    setResetPending(false)
   }
 
   return (
@@ -79,9 +98,23 @@ export function Layout({ children }: PropsWithChildren) {
         </div>
         <div className="content footer-legal">
           <span>© 2026 The Blind Box Company — concept prototype; trademark status not claimed.</span>
-          <button type="button" onClick={() => services.reset()}>Reset demo data</button>
+          <button type="button" onClick={() => {
+            setResetError('')
+            setResetPending(true)
+          }}>Reset demo data</button>
         </div>
       </footer>
+      <ConfirmDialog
+        open={resetPending}
+        title="Reset all demo data?"
+        confirmLabel="Confirm demo reset"
+        danger
+        onConfirm={reset}
+        onCancel={closeReset}
+      >
+        <p>This removes this tab’s fictional session changes and restores the safe starting fixtures. No real account, order, payment, or shipment is affected.</p>
+        {resetError && <div className="notice notice-danger" role="alert">{resetError}</div>}
+      </ConfirmDialog>
     </div>
   )
 }

@@ -11,7 +11,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "e2e": "playwright test",
-    "e2e:ci": "playwright test",
+    "e2e:ci": "PLAYWRIGHT_BROWSER=chromium playwright test",
+    "e2e:dist": "PLAYWRIGHT_BROWSER=chromium PLAYWRIGHT_EXISTING_DIST=1 playwright test",
     "check:secrets": "node scripts/check-secrets.mjs",
     "secrets:check": "node scripts/check-secrets.mjs",
     "secrets:test": "node scripts/check-secrets.selftest.mjs",
@@ -25,7 +26,7 @@
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
-    "@playwright/test": "^1.55.0",
+    "@playwright/test": "1.62.0",
     "@testing-library/jest-dom": "^6.8.0",
     "@testing-library/react": "^16.3.0",
     "@testing-library/user-event": "^14.6.1",

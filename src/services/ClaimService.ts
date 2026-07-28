@@ -2,8 +2,9 @@ import {
   assert,
   assertRole,
   getSessionUser,
-  sanitizeText,
   stableHash,
+  sanitizeText,
+  validateDemoClaimNote,
 } from '../domain/guards'
 import type {
   Claim,
@@ -55,8 +56,7 @@ export class ClaimService {
       assertRole(user, ['customer'], 'submit a demo claim')
       const order = state.orders.find((entry) => entry.id === input.orderId && entry.userId === user.id)
       assert(order, 'Order not found for this fictional account.', 'ORDER_MISSING')
-      const note = sanitizeText(input.note, 500)
-      assert(note.length >= 8, 'Add a short fictional note (at least 8 characters).', 'INVALID_NOTE')
+      const note = validateDemoClaimNote(input.note)
       const now = this.now()
       const selectedShipment = input.shipmentId
         ? state.shipments.find((shipment) => shipment.id === input.shipmentId && shipment.orderId === order.id)
@@ -64,6 +64,18 @@ export class ClaimService {
       const selectedBox = input.boxId
         ? state.boxes.find((box) => box.id === input.boxId && box.orderId === order.id && box.ownerId === user.id)
         : undefined
+
+      if (input.kind !== 'value_floor') {
+        assert(
+          order.boxIds.length > 0 &&
+            order.boxIds.every((boxId) => {
+              const box = state.boxes.find((entry) => entry.id === boxId)
+              return Boolean(box?.revealedAt && Date.parse(box.revealedAt) <= Date.parse(now))
+            }),
+          'Shipment-linked claims require every box in the order to be revealed first.',
+          'CLAIM_REVEAL_REQUIRED',
+        )
+      }
 
       if (input.kind === 'damage') {
         assert(input.shipmentId && selectedShipment, 'Choose the delivered shipment with the damage.', 'CLAIM_LINK_REQUIRED')
@@ -77,9 +89,13 @@ export class ClaimService {
           'CLAIM_INELIGIBLE',
         )
         if (selectedShipment.status === 'shipped') {
+          const hasExceptionEvidence = selectedShipment.timeline.some((entry) =>
+            ['failed_delivery', 'lost'].includes(entry.status) && Date.parse(entry.at) <= Date.parse(now),
+          )
           const shippedAt = [...selectedShipment.timeline].reverse().find((entry) => entry.status === 'shipped')?.at
           assert(
-            Boolean(shippedAt) && Date.parse(now) - Date.parse(shippedAt!) >= SHIPPED_OVERDUE_MS,
+            hasExceptionEvidence ||
+              (Boolean(shippedAt) && Date.parse(now) - Date.parse(shippedAt!) >= SHIPPED_OVERDUE_MS),
             'A shipped parcel must be at least three demo days overdue.',
             'CLAIM_NOT_OVERDUE',
           )

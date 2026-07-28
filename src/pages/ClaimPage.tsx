@@ -55,7 +55,10 @@ export function ClaimPage() {
       <div className="content narrow">
         <span className="eyebrow">CUSTOMER / CLAIM ENTRY</span>
         <h1>Start a fake claim.</h1>
-        <Notice>This creates a local workflow record only. Do not enter a real address, phone, incident, photo, or delivery detail.</Notice>
+        <Notice>
+          This creates a local workflow record only. The note must include the separate word <b>DEMO</b>.
+          Do not enter a real email, phone, address, incident, photo, or delivery detail.
+        </Notice>
         {error && <Notice tone="danger">{error}</Notice>}
         <form className="panel form-grid" onSubmit={(event) => { event.preventDefault(); submit() }}>
           <label>Claim type
@@ -81,7 +84,7 @@ export function ClaimPage() {
                   ))}
                 </select>
               </label>
-              <label>Fictional note
+              <label>Fictional note (must include DEMO; no email or phone)
                 <textarea rows={5} value={note} onChange={(event) => setNote(event.target.value)} />
               </label>
               <button className="button" type="submit" disabled={!selectedId}>Submit demo claim</button>

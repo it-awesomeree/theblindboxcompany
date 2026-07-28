@@ -21,6 +21,7 @@
 
 - [x] Run the selected Playwright browser checks from the approved parent environment
 - [x] Complete the final manual personal-Chrome desktop/mobile commerce, admin and privacy checks
-- [ ] Create or update the GitHub draft pull request
+- [x] Create or update the GitHub draft pull request (PR #1)
+- [ ] GitHub reviewer KeninMY must first be added as a repository collaborator because GitHub rejected the review request
 - [ ] Review the draft pull request and approve publishing
 - [ ] Publish/deploy only after the external browser and manual checks pass

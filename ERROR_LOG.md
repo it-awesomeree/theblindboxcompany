@@ -32,8 +32,16 @@
   regressions executed and passed.
 - Manual personal Chrome comparison at 360, 390, 430, 768 and 1440 confirmed
   black/gold/cyan parity, and the work tab was closed.
-- Local `npm audit` remains blocked by the restricted-network approval
-  boundary. The changes are uncommitted and remote GitHub CI remains pending.
+- Code-candidate commit `59c04c3315c11cb154a714c186fd25dc46d4746e`
+  passed GitHub Actions CI run #10, run ID `30387581184`: verify job
+  `90370635371` and e2e job `90370837958` both succeeded.
+- Verify logs prove `npm ci` audited 254 packages with 0 vulnerabilities and
+  `npm run verify` passed the 90-file secret scan, two audit commands with 0
+  vulnerabilities, lint, typecheck, 283/283 tests and build. The e2e job passed.
+- Local `npm audit` remained blocked by the restricted-network approval
+  boundary. The code candidate is committed and pushed on the draft branch;
+  the PR remains draft and unmerged, and no Pages deployment occurred. This
+  later documentation-only change is not claimed to have passed CI.
 
 ## 2026-07-28 — Current local release candidate verification
 

@@ -44,11 +44,17 @@
 - [x] All newly added desktop regressions executed and passed
 - [x] Manual personal Chrome visual comparison at 360, 390, 430, 768 and 1440
   confirmed black/gold/cyan parity; the work tab was closed
-- [ ] Run remote GitHub CI
+- [x] Code-candidate commit `59c04c3315c11cb154a714c186fd25dc46d4746e`
+  passed GitHub Actions CI run #10 (`30387581184`): verify job `90370635371`
+  and e2e job `90370837958` both succeeded
+- [x] Remote verify proved `npm ci` audited 254 packages with 0 vulnerabilities
+  and `npm run verify` passed the 90-file scan, two 0-vulnerability audits,
+  lint, typecheck, 283/283 tests and build
 
-Local `npm audit` remains blocked by the restricted-network approval boundary.
-The follow-up is not committed, pushed, merged or deployed, and remote GitHub
-CI remains pending.
+Local `npm audit` remained blocked by the restricted-network approval boundary.
+The code candidate is committed and pushed on the draft branch. The PR remains
+draft and unmerged, and no Pages deployment occurred. This later
+documentation-only change is not claimed to have passed CI.
 
 ## Current local release candidate verification
 

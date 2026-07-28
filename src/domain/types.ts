@@ -162,6 +162,11 @@ export interface PaymentEvent {
   createdAt: string
   processedAt: string
   ignoredReason?: string
+  refundIntent?: {
+    paymentId: string
+    amountSen: number
+    reason: string
+  }
 }
 
 export interface Payment {
@@ -216,6 +221,11 @@ export interface Shipment {
 
 export type ClaimKind = 'damage' | 'non_delivery' | 'value_floor'
 export type ClaimStatus = 'submitted' | 'reviewing' | 'approved' | 'rejected' | 'resolved'
+export type ClaimResolutionOutcome =
+  | 'replacement_authorized'
+  | 'return_rma_created'
+  | 'refund_recorded'
+  | 'no_remedy'
 
 export interface ClaimHistoryEntry {
   id: string
@@ -234,11 +244,14 @@ export interface Claim {
   kind: ClaimKind
   note: string
   shipmentId?: string
+  shipmentCandidateIds?: string[]
   boxId?: string
   status: ClaimStatus
   createdAt: string
   updatedAt: string
   resolutionNote?: string
+  resolutionOutcome?: ClaimResolutionOutcome
+  resolutionReference?: string
   history: ClaimHistoryEntry[]
 }
 

@@ -1,12 +1,18 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 import { App } from '../src/App'
 import { AppServices } from '../src/services/AppServices'
 import { AppStateProvider } from '../src/state/AppState'
-import { MemoryStorage, FIXED_NOW } from './helpers'
+import {
+  MemoryStorage,
+  FIXED_NOW,
+  makeProcessingOrderTwoPhysicalShipments,
+} from './helpers'
 import { VaultCanvas } from '../src/components/VaultCanvas'
+import { Notice } from '../src/components/Notice'
 import { DEMO_ADDRESS } from '../src/data/fixtures'
+import { STORAGE_KEY } from '../src/data/MockRepository'
 
 function renderApp(storage = new MemoryStorage()) {
   window.history.replaceState({}, '', '#/')
@@ -24,10 +30,24 @@ describe('app components', () => {
     expect(screen.getByText(/boosted demo opener/i)).toBeVisible()
   })
 
+  it('announces danger notices assertively while info and success stay polite', () => {
+    render(
+      <>
+        <Notice tone="danger">Urgent demo problem</Notice>
+        <Notice>Helpful demo information</Notice>
+        <Notice tone="success">Demo action saved</Notice>
+      </>,
+    )
+    expect(screen.getByRole('alert')).toHaveAttribute('aria-live', 'assertive')
+    const statuses = screen.getAllByRole('status')
+    expect(statuses).toHaveLength(2)
+    expect(statuses.every((status) => status.getAttribute('aria-live') === 'polite')).toBe(true)
+  })
+
   it('one-click customer access persists in app state', async () => {
     const user = userEvent.setup()
     const services = renderApp()
-    await user.click(screen.getByRole('link', { name: /demo sign in/i }))
+    await user.click(document.querySelector<HTMLAnchorElement>('.nav-session-desktop .nav-action')!)
     await user.click(screen.getByRole('button', { name: /one-click aina demo/i }))
     expect(services.auth.currentUser()?.role).toBe('customer')
     expect(await screen.findByRole('heading', { name: 'Aina Demo' })).toBeVisible()
@@ -172,7 +192,12 @@ describe('app components', () => {
     services.claims.review(rejectedClaim.id, 'reject', 'Confirmed rejected queue regression')
     services.claims.review(resolvedClaim.id, 'acknowledge', 'Confirmed resolved queue acknowledgement')
     services.claims.review(resolvedClaim.id, 'approve', 'Confirmed resolved queue approval')
-    services.claims.review(resolvedClaim.id, 'resolve', 'Confirmed resolved queue regression')
+    services.claims.review(
+      resolvedClaim.id,
+      'resolve',
+      'Confirmed resolved queue replacement regression',
+      { outcome: 'replacement_authorized', reference: `DEMO-${resolvedClaim.id.toUpperCase()}` },
+    )
     window.history.replaceState({}, '', '#/admin')
     render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
 
@@ -197,6 +222,166 @@ describe('app components', () => {
     view.rerender(<VaultCanvas onActivate={activate} label="Activate fallback vault" openSignal={1} holdOpen />)
     expect(fallback).toHaveClass('is-open')
     expect(fallback).toHaveAttribute('aria-pressed', 'true')
+  })
+
+  it('focuses and announces the homepage demo result after the opener changes state', async () => {
+    const user = userEvent.setup()
+    renderApp()
+    await user.click(screen.getByRole('button', { name: /open boosted demo/i }))
+
+    const result = screen.getByRole('region', { name: /maggi mee/i })
+    const heading = within(result).getByRole('heading', { name: /maggi mee/i })
+    expect(document.activeElement).toBe(heading)
+    expect(screen.getByText(/boosted demo result 1: maggi mee/i)).toHaveAttribute('role', 'status')
+  })
+
+  it('focuses and announces a paid box result after the reveal animation', () => {
+    vi.useFakeTimers()
+    try {
+      const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+      services.auth.oneClick('customer')
+      window.history.replaceState({}, '', '#/open/box-unopened-01')
+      render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+      fireEvent.click(screen.getByRole('button', { name: /break demo seal/i }))
+      act(() => {
+        vi.advanceTimersByTime(1700)
+      })
+
+      const result = screen.getByRole('region', { name: /air fryer 5l/i })
+      expect(document.activeElement).toBe(within(result).getByRole('heading', { name: /air fryer 5l/i }))
+      expect(screen.getByText(/box revealed. result: air fryer 5l/i)).toHaveAttribute('role', 'status')
+      expect(screen.queryByRole('button', { name: /break demo seal/i })).not.toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('switches a running WebGL canvas to the visible fallback after context loss', () => {
+    window.history.replaceState({}, '', '/#/')
+    const gl = {
+      VERTEX_SHADER: 1,
+      FRAGMENT_SHADER: 2,
+      COMPILE_STATUS: 3,
+      LINK_STATUS: 4,
+      ARRAY_BUFFER: 5,
+      STATIC_DRAW: 6,
+      FLOAT: 7,
+      TRIANGLES: 8,
+      createShader: () => ({}),
+      shaderSource: () => {},
+      compileShader: () => {},
+      getShaderParameter: () => true,
+      createProgram: () => ({}),
+      attachShader: () => {},
+      linkProgram: () => {},
+      getProgramParameter: () => true,
+      useProgram: () => {},
+      createBuffer: () => ({}),
+      bindBuffer: () => {},
+      bufferData: () => {},
+      getAttribLocation: () => 0,
+      enableVertexAttribArray: () => {},
+      vertexAttribPointer: () => {},
+      getUniformLocation: () => ({}),
+      viewport: () => {},
+      uniform2f: () => {},
+      uniform1f: () => {},
+      drawArrays: () => {},
+    }
+    const context = vi.spyOn(HTMLCanvasElement.prototype, 'getContext')
+      .mockReturnValue(gl as unknown as WebGLRenderingContext)
+    render(<VaultCanvas onActivate={() => {}} label="Live demo vault" />)
+    const canvas = screen.getByRole('button', { name: 'Live demo vault' })
+    const fallback = screen.getByTestId('webgl-fallback')
+    expect(canvas).toBeVisible()
+    expect(fallback).not.toBeVisible()
+
+    const lost = new Event('webglcontextlost', { cancelable: true })
+    fireEvent(canvas, lost)
+    expect(lost.defaultPrevented).toBe(true)
+    expect(canvas).not.toBeVisible()
+    expect(fallback).toBeVisible()
+    expect(fallback).toHaveAttribute('role', 'button')
+    expect(fallback).toHaveAttribute('aria-label', 'Live demo vault')
+    context.mockRestore()
+  })
+
+  it('shows failed startup cleanup recovery in the rendered shell', () => {
+    const preparedStorage = new MemoryStorage()
+    const prepared = new AppServices(preparedStorage, () => '2026-07-28T03:00:00.000Z')
+    prepared.auth.oneClick('customer')
+    prepared.orders.setCartQuantity(1)
+    prepared.orders.create({
+      requestId: 'checkout_0000000000000000000000000000e001',
+      quantity: 1,
+      shippingMethod: 'standard',
+      address: DEMO_ADDRESS,
+      acknowledged: true,
+      displayedTotalSen: 11_200,
+    })
+    class FailOnceStorage extends MemoryStorage {
+      fail = true
+      setItem(key: string, value: string) {
+        if (this.fail) {
+          this.fail = false
+          throw new Error('startup cleanup write failed')
+        }
+        super.setItem(key, value)
+      }
+    }
+    const storage = new FailOnceStorage()
+    storage.seed(STORAGE_KEY, preparedStorage.getItem(STORAGE_KEY)!)
+    const services = new AppServices(storage, () => FIXED_NOW)
+    window.history.replaceState({}, '', '#/')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+    expect(screen.getByText(/automatic cleanup was not saved.+nothing changed.+safe to retry or refresh/i)).toBeVisible()
+  })
+
+  it('shows friendly errors for guarded home, cart, logout, and draft-copy handlers', async () => {
+    const user = userEvent.setup()
+
+    const homeServices = renderApp()
+    vi.spyOn(homeServices.orders, 'setCartQuantity').mockImplementation(() => {
+      throw new Error('Home cart save failed safely.')
+    })
+    await user.click(screen.getAllByRole('button', { name: /get a demo box/i })[0])
+    expect(screen.getByText('Home cart save failed safely.')).toBeVisible()
+    cleanup()
+
+    const cartServices = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    vi.spyOn(cartServices.orders, 'setCartQuantity').mockImplementation(() => {
+      throw new Error('Cart quantity save failed safely.')
+    })
+    window.history.replaceState({}, '', '#/cart')
+    render(<AppStateProvider providedServices={cartServices}><App /></AppStateProvider>)
+    await user.click(screen.getByRole('button', { name: /increase quantity/i }))
+    expect(screen.getByText('Cart quantity save failed safely.')).toBeVisible()
+    fireEvent.change(screen.getByRole('spinbutton', { name: /quantity/i }), { target: { value: '2' } })
+    await user.click(screen.getByRole('button', { name: /remove from cart/i }))
+    expect(cartServices.orders.setCartQuantity).toHaveBeenCalledTimes(3)
+    cleanup()
+
+    const logoutServices = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    logoutServices.auth.oneClick('customer')
+    vi.spyOn(logoutServices.auth, 'logout').mockImplementation(() => {
+      throw new Error('Logout save failed safely.')
+    })
+    window.history.replaceState({}, '', '#/account')
+    render(<AppStateProvider providedServices={logoutServices}><App /></AppStateProvider>)
+    await user.click(document.querySelector<HTMLButtonElement>('.nav-session-desktop .nav-action')!)
+    expect(screen.getByRole('alert')).toHaveTextContent('Logout save failed safely.')
+    expect(logoutServices.auth.currentUser()?.role).toBe('customer')
+    cleanup()
+
+    const inventoryServices = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    inventoryServices.auth.oneClick('admin')
+    vi.spyOn(inventoryServices.admin, 'copyPublishedToDraft').mockImplementation(() => {
+      throw new Error('Draft copy save failed safely.')
+    })
+    window.history.replaceState({}, '', '#/admin/inventory')
+    render(<AppStateProvider providedServices={inventoryServices}><App /></AppStateProvider>)
+    await user.click(screen.getByRole('button', { name: /copy published series to draft/i }))
+    expect(screen.getByText('Draft copy save failed safely.')).toBeVisible()
   })
 
   it('hides opening controls after a full refund while keeping an honest hold explanation', async () => {
@@ -256,7 +441,7 @@ describe('app components', () => {
     services.repository.update((state) => {
       state.users.push({
         id: 'usr-route-other',
-        name: 'Route Other',
+        name: 'Route Other Demo',
         email: 'route.other@example.test',
         role: 'customer',
         status: 'active',
@@ -269,7 +454,7 @@ describe('app components', () => {
       requestId: 'checkout_0000000000000000000000000000a002',
       quantity: 1,
       shippingMethod: 'standard',
-      address: { ...DEMO_ADDRESS, recipient: 'Route Other' },
+      address: { ...DEMO_ADDRESS, recipient: 'Route Other Demo' },
       acknowledged: true,
       displayedTotalSen: 11_200,
     })
@@ -289,8 +474,67 @@ describe('app components', () => {
     render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
     const record = screen.getByText('ORD-UNOPENED').closest('article')!
     expect(within(record).getAllByText('Disputed')).toHaveLength(2)
+    expect(record.querySelectorAll('.sealed-delivery-summary .status')).toHaveLength(1)
     expect(within(record).getByText(/captured · under dispute/i)).toBeVisible()
     expect(within(record).queryByText('Not confirmed')).not.toBeInTheDocument()
+  })
+
+  it('keeps mixed Account fulfilment order-level until every box is revealed and counts in-transit orders', () => {
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    services.auth.oneClick('admin')
+    for (const [shipmentId, path] of [
+      ['shp-processing', ['packed', 'label_created', 'shipped']],
+      ['shp-digital', ['picking', 'packed', 'label_created', 'shipped']],
+    ] as const) {
+      for (const status of path) {
+        services.fulfilment.advance(shipmentId, status, `Confirmed Account privacy ${status}`)
+      }
+    }
+    services.auth.oneClick('customer')
+    window.history.replaceState({}, '', '#/account')
+    let view = render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+    const transitMetric = screen.getByText('IN TRANSIT').closest('article')!
+    expect(within(transitMetric).getByText('2')).toBeVisible()
+    const record = screen.getByText('ORD-PROCESSING').closest('article')!
+    const sealedSummary = record.querySelector<HTMLElement>('.sealed-delivery-summary')!
+    expect(within(sealedSummary).getByText('DEMO-DELIVERY-ORD-PROCESSING')).toBeVisible()
+    expect(within(sealedSummary).getAllByText('Delivery In Progress')).toHaveLength(1)
+    expect(within(record).queryByText(/record 1:|record 2:/i)).not.toBeInTheDocument()
+    expect(within(record).queryByText(/maggi|tng reload/i)).not.toBeInTheDocument()
+    expect(record.querySelectorAll('.sealed-delivery-summary')).toHaveLength(1)
+
+    view.unmount()
+    services.auth.oneClick('admin')
+    services.fulfilment.advance(
+      'shp-processing',
+      'delivered',
+      'Digital and bulky split delivery clue must stay private',
+    )
+    services.auth.oneClick('customer')
+    window.history.replaceState({}, '', '#/order/ord-processing')
+    view = render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+    const privateFulfilment = screen.getByRole('heading', { name: /private-prize tracking/i }).closest('section')!
+    expect(within(privateFulfilment).getByText('Delivery In Progress')).toBeVisible()
+    expect(screen.queryByText('Partially Fulfilled')).not.toBeInTheDocument()
+    expect(screen.queryByText(/digital and bulky split delivery clue/i)).not.toBeInTheDocument()
+    expect(screen.queryByText('Fulfillment Pending')).not.toBeInTheDocument()
+    expect(screen.queryByText('Fulfilled')).not.toBeInTheDocument()
+    expect(screen.getByText(/detailed delivery events stay combined/i)).toBeVisible()
+    expect(privateFulfilment.querySelectorAll('.sealed-delivery-summary .status')).toHaveLength(1)
+
+    view.unmount()
+    services.repository.update((state) => {
+      state.boxes.find((box) => box.id === 'box-processing-02')!.revealedAt = FIXED_NOW
+    })
+    window.history.replaceState({}, '', '#/account')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+    const revealedRecord = screen.getByText('ORD-PROCESSING').closest('article')!
+    expect(within(revealedRecord).getByText(/record 1:/i)).toBeVisible()
+    expect(within(revealedRecord).getByText(/record 2:/i)).toBeVisible()
+    expect(within(revealedRecord).getByText('Delivered')).toBeVisible()
+    expect(within(revealedRecord).getByText('Shipped')).toBeVisible()
+    expect(within(revealedRecord).getByText(/maggi/i)).toBeVisible()
+    expect(within(revealedRecord).getByText(/tng reload/i)).toBeVisible()
   })
 
   it('separates a captured dispute from pending payment on the return page', () => {
@@ -304,6 +548,55 @@ describe('app components', () => {
     expect(screen.getByText(/was captured and is now under dispute and review/i)).toBeVisible()
     expect(screen.getByText(/browser redirect is never proof/i)).toBeVisible()
     expect(screen.queryByRole('button', { name: /delayed valid webhook/i })).not.toBeInTheDocument()
+  })
+
+  it.each([
+    ['failed', /payment failed/i],
+    ['cancelled', /payment cancelled/i],
+    ['expired', /payment expired/i],
+    ['partially_refunded', /payment partially refunded/i],
+    ['refunded', /payment refunded/i],
+    ['disputed', /captured payment under dispute/i],
+  ] as const)('uses a truthful %s payment-return heading', (status, heading) => {
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    services.auth.oneClick('customer')
+    let paymentId = 'pay-unopened'
+    if (['failed', 'cancelled', 'expired'].includes(status)) {
+      const order = services.orders.create({
+        requestId: `checkout_0000000000000000000000000000f00${status === 'failed' ? 1 : status === 'cancelled' ? 2 : 3}`,
+        quantity: 1,
+        shippingMethod: 'standard',
+        address: DEMO_ADDRESS,
+        acknowledged: true,
+        displayedTotalSen: 11_200,
+      })
+      const payment = services.payments.createAttempt(order.id)
+      services.payments.act(payment.id, status === 'failed' ? 'decline' : status === 'cancelled' ? 'cancel' : 'expire')
+      paymentId = payment.id
+    } else if (status === 'partially_refunded') {
+      services.auth.oneClick('admin')
+      services.payments.refund('pay-unopened', 1000, 'Confirmed return heading partial refund', 'req-return-heading-partial')
+      services.auth.oneClick('customer')
+    } else if (status === 'refunded') {
+      paymentId = 'pay-refunded'
+    } else {
+      services.auth.oneClick('admin')
+      services.payments.dispute('pay-unopened', 'Confirmed return heading dispute', 'evt-return-heading-dispute')
+      services.auth.oneClick('customer')
+    }
+    window.history.replaceState({}, '', `#/payment-return/${paymentId}`)
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+    expect(screen.getByRole('heading', { name: heading })).toBeVisible()
+  })
+
+  it('never offers a guaranteed-failing retry for refunded or disputed payment records', () => {
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    services.auth.oneClick('customer')
+    window.history.replaceState({}, '', '#/pay/ord-refunded/pay-refunded')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+    expect(screen.getByText(/fully refunded.+terminal.+cannot be retried/i)).toBeVisible()
+    expect(screen.queryByRole('button', { name: /retry attempt/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('link', { name: /view order/i })).toBeVisible()
   })
 
   it('shows guarded order cancellation and closure controls and completes a valid closure', async () => {
@@ -395,6 +688,37 @@ describe('app components', () => {
     expect(await screen.findByText('pay-unopened')).toBeVisible()
   })
 
+  it('shows structured claim resolution evidence to admin and customer', () => {
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    services.auth.oneClick('customer')
+    const claim = services.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'damage',
+      shipmentId: 'shp-delivered',
+      note: 'DEMO structured resolution display claim',
+    }).data
+    services.auth.oneClick('admin')
+    services.claims.review(claim.id, 'acknowledge', 'Confirmed display claim acknowledgement')
+    services.claims.review(claim.id, 'approve', 'Confirmed display claim approval')
+    services.claims.review(
+      claim.id,
+      'resolve',
+      'Confirmed fictional RMA record for component display',
+      { outcome: 'return_rma_created', reference: `DEMO-RMA-${claim.id.toUpperCase()}` },
+    )
+    window.history.replaceState({}, '', '#/admin/claims')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+    expect(screen.getByText(/structured resolution recorded/i)).toBeVisible()
+    expect(screen.getByText(`DEMO-RMA-${claim.id.toUpperCase()}`, { exact: false })).toBeVisible()
+
+    cleanup()
+    services.auth.oneClick('customer')
+    window.history.replaceState({}, '', '#/order/ord-delivered')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+    expect(screen.getByText(/recorded resolution/i)).toBeVisible()
+    expect(screen.getByText(/return rma created/i)).toBeVisible()
+  })
+
   it('guards checkout double-submit in flight and creates only one order', async () => {
     const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
     services.auth.oneClick('customer')
@@ -413,16 +737,22 @@ describe('app components', () => {
     expect(services.repository.getSnapshot().orders).toHaveLength(before + 1)
   })
 
-  it('keeps sealed-order fulfilment private and reveals it only after every box opens', () => {
+  it('shows neutral sealed-order tracking and reveals prize-derived details only after every box opens', () => {
     const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
     services.auth.oneClick('customer')
     window.history.replaceState({}, '', '#/order/ord-unopened')
     const view = render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
-    expect(screen.getByText(/fulfilment details stay private until every box/i)).toBeVisible()
+    expect(screen.getByText(/useful delivery progress stays visible/i)).toBeVisible()
+    expect(screen.getByText('DEMO-DELIVERY-ORD-UNOPENED')).toBeVisible()
     expect(screen.queryByText('DEMO-P-UNOPENED')).not.toBeInTheDocument()
+    expect(screen.queryByText(/delivery record 01/i)).not.toBeInTheDocument()
     expect(screen.queryByText('Demo Express')).not.toBeInTheDocument()
-    expect(screen.queryByText('PARCEL')).not.toBeInTheDocument()
+    expect(screen.queryByText('PARCEL', { exact: true })).not.toBeInTheDocument()
     expect(screen.queryByText(/signature required/i)).not.toBeInTheDocument()
+    expect(screen.queryByText('shp-unopened', { exact: false })).not.toBeInTheDocument()
+    const fulfilment = screen.getByRole('heading', { name: /private-prize tracking/i }).closest('section')!
+    expect(fulfilment.querySelectorAll('.shipment-card')).toHaveLength(1)
+    expect(fulfilment.querySelectorAll('.sealed-delivery-summary .status')).toHaveLength(1)
 
     view.unmount()
     window.history.replaceState({}, '', '#/order/ord-shipped')
@@ -439,37 +769,109 @@ describe('app components', () => {
     window.history.replaceState({}, '', '#/claim/new?order=ord-processing')
     render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
 
-    expect(screen.getByText(/shipment-linked claim details unlock after all boxes in this order are opened/i)).toBeVisible()
-    expect(screen.queryByLabelText('Relevant shipment')).not.toBeInTheDocument()
-    expect(screen.queryByLabelText('Fictional note')).not.toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /submit demo claim/i })).not.toBeInTheDocument()
+    expect(screen.getByText(/sealed prizes stay private/i)).toBeVisible()
+    expect(screen.getByLabelText('Order delivery')).toBeVisible()
+    expect(screen.getByLabelText('Order delivery')).toHaveValue('')
+    expect(screen.getByLabelText(/fictional note/i)).toBeVisible()
+    expect(screen.getByRole('button', { name: /submit demo claim/i })).toBeDisabled()
     for (const shipmentClue of [
       'shp-processing',
       'shp-digital',
-      'picking',
-      'unfulfilled',
       'BULKY',
       'DIGITAL',
       'Demo Bulky Freight',
       'Digital Vault',
       'DEMO-P-PROCESSING',
       'DEMO-P-DIGITAL',
-      'delivered physical goods',
-      'shipped/failed/lost',
+      'box-processing-02',
     ]) {
       expect(screen.queryByText(shipmentClue, { exact: false })).not.toBeInTheDocument()
     }
 
     await user.selectOptions(screen.getByLabelText('Claim type'), 'non_delivery')
-    expect(screen.queryByLabelText('Relevant shipment')).not.toBeInTheDocument()
-    expect(screen.getByText(/shipment-linked claim details unlock after all boxes/i)).toBeVisible()
+    expect(screen.getByLabelText('Order delivery')).toHaveValue('')
+    expect(screen.getByText(/sealed prizes stay private/i)).toBeVisible()
 
     await user.selectOptions(screen.getByLabelText('Claim type'), 'value_floor')
     expect(screen.getByLabelText('Revealed box')).toBeVisible()
-    expect(screen.getByRole('option', { name: /box-processing-01 · opened/i })).toBeVisible()
+    expect(screen.getByRole('option', { name: /box 01 · revealed/i })).toHaveTextContent(/box 01 · revealed/i)
     expect(screen.queryByRole('option', { name: /box-processing-02/i })).not.toBeInTheDocument()
     expect(screen.getByLabelText(/fictional note/i)).toBeVisible()
     expect(screen.getByRole('button', { name: /submit demo claim/i })).toBeEnabled()
+  })
+
+  it('maps a sealed eligible delivery record through a neutral claim option', async () => {
+    const user = userEvent.setup()
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    services.repository.update((state) => {
+      state.boxes.find((box) => box.id === 'box-shipped-01')!.revealedAt = undefined
+    })
+    services.auth.oneClick('customer')
+    window.history.replaceState({}, '', '#/claim/new?order=ord-shipped')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+    await user.selectOptions(screen.getByLabelText('Claim type'), 'non_delivery')
+    const delivery = screen.getByLabelText('Order delivery')
+    expect(delivery).toHaveValue('order-delivery')
+    expect(screen.getByRole('option', { name: /order delivery · eligible neutral record/i })).toBeVisible()
+    expect(screen.queryByText('shp-shipped', { exact: false })).not.toBeInTheDocument()
+    expect(screen.queryByText('Demo Express')).not.toBeInTheDocument()
+    expect(screen.queryByText('PARCEL', { exact: true })).not.toBeInTheDocument()
+    expect(screen.queryByText(/signature required/i)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /submit demo claim/i })).toBeEnabled()
+  })
+
+  it('shows one sealed option for two eligible physical shipments without leaking or mistargeting either split', async () => {
+    const user = userEvent.setup()
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    makeProcessingOrderTwoPhysicalShipments(services)
+    services.auth.oneClick('admin')
+    for (const [shipmentId, path] of [
+      ['shp-processing', ['packed', 'label_created', 'shipped', 'failed_delivery']],
+      ['shp-digital', ['picking', 'packed', 'label_created', 'shipped', 'failed_delivery']],
+    ] as const) {
+      for (const status of path) {
+        services.fulfilment.advance(shipmentId, status, `Confirmed multi-link privacy ${status}`)
+      }
+    }
+    services.repository.update((state) => {
+      state.boxes.find((box) => box.id === 'box-processing-01')!.revealedAt = undefined
+    })
+    services.auth.oneClick('customer')
+    window.history.replaceState({}, '', '#/claim/new?order=ord-processing')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+
+    await user.selectOptions(screen.getByLabelText('Claim type'), 'non_delivery')
+    const delivery = screen.getByLabelText('Order delivery')
+    expect(within(delivery).getAllByRole('option')).toHaveLength(1)
+    expect(delivery).toHaveValue('order-delivery')
+    expect(screen.queryByText(/shp-processing|shp-digital/i)).not.toBeInTheDocument()
+    await user.clear(screen.getByLabelText(/fictional note/i))
+    await user.type(screen.getByLabelText(/fictional note/i), 'DEMO: One neutral order delivery option is missing.')
+    const refundedBefore = services.repository.getSnapshot().payments.reduce(
+      (sum, payment) => sum + payment.refundedSen,
+      0,
+    )
+    await user.click(screen.getByRole('button', { name: /submit demo claim/i }))
+
+    const submitted = services.repository.getSnapshot().claims.at(-1)!
+    expect(submitted.orderId).toBe('ord-processing')
+    expect(submitted.shipmentId).toBeUndefined()
+    expect(submitted.shipmentCandidateIds).toEqual(['shp-digital', 'shp-processing'])
+    expect(services.claims.listMine().at(-1)).not.toHaveProperty('shipmentCandidateIds')
+    expect(screen.queryByText(/shp-processing|shp-digital|demo bulky freight|demo express/i)).not.toBeInTheDocument()
+    expect(services.repository.getSnapshot().payments.reduce(
+      (sum, payment) => sum + payment.refundedSen,
+      0,
+    )).toBe(refundedBefore)
+
+    cleanup()
+    services.auth.oneClick('admin')
+    window.history.replaceState({}, '', '#/admin/claims')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+    expect(screen.getByText(
+      'Order-level candidates: shp-digital, shp-processing',
+      { exact: true },
+    )).toBeVisible()
   })
 
   it('shows duplicate and out-of-order reconciliation results instead of a false completion', async () => {

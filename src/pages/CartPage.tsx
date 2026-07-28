@@ -3,12 +3,23 @@ import { useNavigate } from '../lib/router-core'
 import { BOX_PRICE_SEN, MAX_CART_QUANTITY } from '../domain/constants'
 import { formatMYR } from '../lib/format'
 import { useAppState } from '../state/AppStateContext'
+import { Notice } from '../components/Notice'
+import { useState } from 'react'
 
 export function CartPage() {
   const { state, services } = useAppState()
   const navigate = useNavigate()
   const item = state.cart[0]
   const quantity = item?.quantity ?? 0
+  const [error, setError] = useState('')
+  const changeQuantity = (next: number) => {
+    setError('')
+    try {
+      services.orders.setCartQuantity(next)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'The cart change was blocked. Nothing changed; please try again.')
+    }
+  }
 
   return (
     <section className="route-page">
@@ -17,6 +28,7 @@ export function CartPage() {
           <div><span className="eyebrow">CUSTOMER / CART</span><h1>Demo cargo list.</h1><p>RM100 per Series 001 box. Maximum 10 per demo order.</p></div>
           <span className="huge-code">CART</span>
         </div>
+        {error && <Notice tone="danger">{error}</Notice>}
         {!item ? (
           <div className="empty-state"><span>00</span><h2>Your demo cart is empty.</h2><Link className="button" to="/">Return to the vault</Link></div>
         ) : (
@@ -28,11 +40,11 @@ export function CartPage() {
                 <h2>Series 001 Blind Box</h2>
                 <p>One immutable paid prize after a valid mock webhook. Every declared value is at least RM100.</p>
                 <div className="quantity-control" aria-label="Cart quantity">
-                  <button type="button" aria-label="Decrease quantity" onClick={() => services.orders.setCartQuantity(Math.max(0, quantity - 1))}>−</button>
-                  <label><span>Quantity</span><input type="number" min="1" max={MAX_CART_QUANTITY} value={quantity} onChange={(event) => services.orders.setCartQuantity(Number(event.target.value))} /></label>
-                  <button type="button" aria-label="Increase quantity" onClick={() => services.orders.setCartQuantity(Math.min(MAX_CART_QUANTITY, quantity + 1))}>+</button>
+                  <button type="button" aria-label="Decrease quantity" onClick={() => changeQuantity(Math.max(0, quantity - 1))}>−</button>
+                  <label><span>Quantity</span><input type="number" min="1" max={MAX_CART_QUANTITY} value={quantity} onChange={(event) => changeQuantity(Number(event.target.value))} /></label>
+                  <button type="button" aria-label="Increase quantity" onClick={() => changeQuantity(Math.min(MAX_CART_QUANTITY, quantity + 1))}>+</button>
                 </div>
-                <button className="text-button" type="button" onClick={() => services.orders.setCartQuantity(0)}>Remove from cart</button>
+                <button className="text-button" type="button" onClick={() => changeQuantity(0)}>Remove from cart</button>
               </div>
               <strong>{formatMYR(BOX_PRICE_SEN * quantity)}</strong>
             </article>

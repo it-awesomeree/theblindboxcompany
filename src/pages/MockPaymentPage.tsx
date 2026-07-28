@@ -68,6 +68,28 @@ export function MockPaymentPage() {
     { action: 'cancel' as const, status: 'cancelled' as const, label: 'Cancel' },
     { action: 'expire' as const, status: 'expired' as const, label: 'Expire' },
   ].filter((item) => canTransitionPayment(payment.status, item.status)) : []
+  const orderPayments = order.paymentIds
+    .map((id) => state.payments.find((entry) => entry.id === id))
+    .filter(Boolean)
+  const canRetry = Boolean(
+    payment &&
+    ['failed', 'cancelled', 'expired'].includes(payment.status) &&
+    order.status === 'pending_payment' &&
+    !orderPayments.some((entry) =>
+      entry && (
+        ['created', 'pending', 'processing'].includes(entry.status) ||
+        entry.events.some((event) => event.type === 'succeeded' && !event.ignoredReason)
+      ),
+    ),
+  )
+  const terminalMessage = payment && ({
+    failed: 'This demo attempt failed. The order may retry only while it remains unpaid and has no active or captured attempt.',
+    cancelled: 'This demo attempt was cancelled. The order may retry only while it remains unpaid and has no active or captured attempt.',
+    expired: 'This demo attempt expired. The order may retry only while it remains unpaid and has no active or captured attempt.',
+    partially_refunded: 'This captured payment is partially refunded. Payment retry is not legal; review the held financial record on the order.',
+    refunded: 'This captured payment was fully refunded. It is terminal and cannot be retried.',
+    disputed: 'This captured payment is under dispute. It is held for protected finance review and cannot be retried.',
+  } as Partial<Record<typeof payment.status, string>>)[payment.status]
 
   return (
     <section className="route-page payment-page">
@@ -102,10 +124,13 @@ export function MockPaymentPage() {
             ) : payment.status === 'succeeded' ? (
               <Link className="button button-full" to={`/payment-return/${payment.id}`}>Continue to return page</Link>
             ) : (
-              <div className="payment-actions">
-                <button className="button" type="button" onClick={retry}>Create idempotent retry attempt</button>
-                <Link className="button button-ghost" to={`/order/${order.id}`}>View order</Link>
-              </div>
+              <>
+                {terminalMessage && <Notice>{terminalMessage}</Notice>}
+                <div className="payment-actions">
+                  {canRetry && <button className="button" type="button" onClick={retry}>Create idempotent retry attempt</button>}
+                  <Link className="button button-ghost" to={`/order/${order.id}`}>View order</Link>
+                </div>
+              </>
             )}
             <p className="fine-print">Only legal actions are shown for this state. A processing attempt cannot be cancelled here. Repeating an event ID or sending a late success cannot allocate twice.</p>
           </div>

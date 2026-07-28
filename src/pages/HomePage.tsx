@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from '../lib/router-core'
 import { PRIZES } from '../domain/constants'
 import type { PrizeDefinition } from '../domain/types'
@@ -7,6 +7,7 @@ import { useAppState } from '../state/AppStateContext'
 import { PrizePoolTable } from '../components/PrizePoolTable'
 import { SectionHeader } from '../components/SectionHeader'
 import { VaultCanvas } from '../components/VaultCanvas'
+import { Notice } from '../components/Notice'
 
 const DEMO_WEIGHTS = [14, 12, 10, 10, 9, 9, 14, 10, 6, 4, 2]
 const DEMO_TOTAL = DEMO_WEIGHTS.reduce((sum, weight) => sum + weight, 0)
@@ -34,30 +35,46 @@ export function HomePage() {
   const navigate = useNavigate()
   const [pull, setPull] = useState(0)
   const [prize, setPrize] = useState<PrizeDefinition | null>(null)
+  const [cartError, setCartError] = useState('')
+  const [announcement, setAnnouncement] = useState('')
+  const resultHeadingRef = useRef<HTMLHeadingElement>(null)
+
+  useEffect(() => {
+    if (!prize || pull === 0) return
+    resultHeadingRef.current?.focus({ preventScroll: true })
+  }, [prize, pull])
 
   const openDemo = () => {
     const next = pull + 1
+    const nextPrize = boostedPrize(next)
     setPull(next)
-    setPrize(boostedPrize(next))
+    setPrize(nextPrize)
+    setAnnouncement(`Boosted demo result ${next}: ${nextPrize.name}.`)
   }
 
   const buy = () => {
-    services.orders.setCartQuantity(1)
-    navigate('/cart')
+    setCartError('')
+    try {
+      services.orders.setCartQuantity(1)
+      navigate('/cart')
+    } catch (caught) {
+      setCartError(caught instanceof Error ? caught.message : 'The demo box could not be added. Nothing changed; please try again.')
+    }
   }
 
   return (
     <>
       <section className="vault-hero" aria-labelledby="hero-title">
+        <p className="sr-only" role="status" aria-live="polite" aria-atomic="true">{announcement}</p>
         <VaultCanvas openSignal={pull} onActivate={openDemo} />
         <div className="vault-grain" aria-hidden="true" />
         <div className="vault-hud" aria-hidden="true">
           <span>CASE 001 / 10,000</span><span>SEAL · INTACT</span><span>DECLARED ≥ RM100</span>
         </div>
         {prize && (
-          <div className="hologram" aria-live="polite">
+          <div className="hologram" role="region" aria-labelledby="demo-result-title">
             <div><span>BOOSTED DEMO PULL {String(pull).padStart(2, '0')}</span><span>{prize.tier}</span></div>
-            <h2>{prize.name}</h2>
+            <h2 id="demo-result-title" ref={resultHeadingRef} tabIndex={-1}>{prize.name}</h2>
             <p><span>Fixture value</span><b>{formatMYR(prize.valueSen)}</b></p>
             <footer><span>Demo floor ≥ RM100</span><strong>Sample ✓</strong></footer>
           </div>
@@ -71,6 +88,7 @@ export function HomePage() {
             <button className="button button-ghost" type="button" onClick={openDemo}>Open boosted demo</button>
           </div>
           <small>Proposed demo tagline · unverified fixture values · no charge or goods · mock-purchased boxes allocate only after a confirmed local event</small>
+          {cartError && <Notice tone="danger">{cartError}</Notice>}
         </div>
       </section>
 

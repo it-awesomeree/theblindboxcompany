@@ -97,6 +97,20 @@ export function sanitizeText(value: string, max = 180) {
 }
 
 export const CHECKOUT_REQUEST_ID_PATTERN = /^checkout_[a-f0-9]{32}$/
+export const DEMO_TRACKING_PATTERN = /^DEMO-[A-Z0-9][A-Z0-9-]{2,42}$/
+
+export function isClearlyFictionalCarrier(value: unknown) {
+  return typeof value === 'string' &&
+    value === sanitizeText(value, 70) &&
+    value.length >= 3 &&
+    /demo|digital vault|vault counter/i.test(value)
+}
+
+export function isValidDemoTracking(value: unknown) {
+  return typeof value === 'string' &&
+    value === sanitizeText(value, 48).toUpperCase() &&
+    DEMO_TRACKING_PATTERN.test(value)
+}
 
 export function validateCheckoutRequestId(value: unknown) {
   assert(
@@ -123,7 +137,30 @@ export function validateDemoEmail(value: string) {
   return email
 }
 
+export function validateDemoUserName(value: string) {
+  const name = sanitizeText(value, 70)
+  assert(name.length >= 2, 'A fictional display name is required.', 'INVALID_NAME')
+  assert(
+    /\b(demo|admin|support|fulfilment|finance|catalog)\b/i.test(name),
+    'Use an obviously fictional display name containing Demo or a demo staff role.',
+    'DEMO_DATA_ONLY',
+  )
+  assert(
+    !/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i.test(name),
+    'Do not use an email address as a fictional display name.',
+    'DEMO_DATA_ONLY',
+  )
+  const phoneLike = name.match(/\+?\d[\d\s().-]{6,}\d/g) ?? []
+  assert(
+    phoneLike.every((candidate) => candidate.replace(/\D/g, '').length < 8),
+    'Do not use a realistic phone number as a fictional display name.',
+    'DEMO_DATA_ONLY',
+  )
+  return name
+}
+
 export function validateDemoAddress(input: Address): Address {
+  assert(input?.country === 'MY', 'Demo addresses must use Malaysia.', 'INVALID_ADDRESS')
   const clean: Address = {
     recipient: sanitizeText(input.recipient, 70),
     line1: sanitizeText(input.line1, 100),
@@ -139,8 +176,18 @@ export function validateDemoAddress(input: Address): Address {
     'For safety, the fake street must contain DEMO and the fake phone must contain demo.',
     'DEMO_DATA_ONLY',
   )
+  assert(
+    validateDemoUserName(clean.recipient) === clean.recipient,
+    'Address recipient must remain an obviously fictional display name.',
+    'DEMO_DATA_ONLY',
+  )
   assert(/^\d{5}$/.test(clean.postcode), 'Postcode must use five demo digits.', 'INVALID_ADDRESS')
   Object.entries(clean).forEach(([key, value]) => assert(value, `${key} is required.`, 'INVALID_ADDRESS'))
+  assert(
+    !Object.values(clean).some((value) => /[<>]/.test(value)),
+    'Demo address text contains unsafe characters.',
+    'INVALID_ADDRESS',
+  )
   return clean
 }
 

@@ -24,7 +24,26 @@ export function PaymentReturnPage() {
     }
   }
 
-  const disputed = payment.status === 'disputed'
+  const headings: Record<typeof payment.status, string> = {
+    created: 'Payment attempt created.',
+    pending: 'Confirming payment…',
+    processing: 'Confirming payment…',
+    succeeded: 'Payment confirmed by event.',
+    failed: 'Payment failed.',
+    cancelled: 'Payment cancelled.',
+    expired: 'Payment expired.',
+    partially_refunded: 'Payment partially refunded.',
+    refunded: 'Payment refunded.',
+    disputed: 'Captured payment under dispute.',
+  }
+  const explanations: Partial<Record<typeof payment.status, string>> = {
+    failed: 'The provider-style attempt failed and did not confirm this order.',
+    cancelled: 'The provider-style attempt was cancelled and did not confirm this order.',
+    expired: 'The provider-style attempt expired and did not confirm this order.',
+    partially_refunded: 'This payment was captured and now has a recorded partial demo refund.',
+    refunded: 'This payment was captured and then fully refunded in the demo ledger.',
+    disputed: 'This payment was captured and is now under dispute and review.',
+  }
   const captured = ['succeeded', 'partially_refunded', 'refunded', 'disputed'].includes(payment.status)
   return (
     <section className="route-page return-page">
@@ -32,8 +51,8 @@ export function PaymentReturnPage() {
         <div className={`confirmation-core ${captured ? 'confirmed' : ''}`} aria-live="polite">
           <span className="signal-ring" aria-hidden="true" />
           <span className="eyebrow">PAYMENT RETURN / NOT PROOF</span>
-          <h1>{disputed ? 'Captured payment under dispute.' : captured ? 'Payment confirmed by event.' : 'Confirming payment…'}</h1>
-          {disputed && <p>This payment was captured and is now under dispute and review.</p>}
+          <h1>{headings[payment.status]}</h1>
+          {explanations[payment.status] && <p>{explanations[payment.status]}</p>}
           <p>A browser redirect is never proof of payment. This screen trusts only the idempotent mock webhook/event record.</p>
           <StatusBadge value={payment.status} />
         </div>

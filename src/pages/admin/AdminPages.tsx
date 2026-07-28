@@ -7,7 +7,7 @@ import { Notice } from '../../components/Notice'
 import { StatusBadge } from '../../components/StatusBadge'
 import { ADMIN_SECTION_PERMISSIONS, type AdminSection } from '../../domain/constants'
 import { prizeForBox, publishedPrizesFor } from '../../domain/selectors'
-import type { ShipmentStatus } from '../../domain/types'
+import type { ClaimResolutionOutcome, ShipmentStatus } from '../../domain/types'
 import type { ClaimReviewAction } from '../../services/ClaimService'
 import { formatDateTime, formatMYR, titleCase } from '../../lib/format'
 import { useAppState } from '../../state/AppStateContext'
@@ -440,9 +440,13 @@ export function AdminInventoryPage() {
   const assigned = published.inventory.reduce((sum, entry) => sum + entry.assigned, 0)
 
   const copy = () => {
-    const result = services.admin.copyPublishedToDraft()
-    setDraftName(result.draftPrizes?.[0]?.name ?? publishedPrizes[0].name)
-    setMessage('Editable draft copied. Published Series 001 stayed unchanged.')
+    try {
+      const result = services.admin.copyPublishedToDraft()
+      setDraftName(result.draftPrizes?.[0]?.name ?? publishedPrizes[0].name)
+      setMessage('Editable draft copied. Published Series 001 stayed unchanged.')
+    } catch (caught) {
+      setMessage(caught instanceof Error ? caught.message : 'The draft copy was blocked. Nothing changed; please try again.')
+    }
   }
   const saveDraft = () => {
     try {
@@ -609,11 +613,28 @@ function AdminClaimsContent() {
   const canOpenPayments = Boolean(actor && ADMIN_SECTION_PERMISSIONS.payments.includes(actor.role))
   const [pending, setPending] = useState<{ id: string; action: ClaimReviewAction } | null>(null)
   const [note, setNote] = useState('Confirmed fictional claim review with no automatic refund.')
+  const [resolutionOutcome, setResolutionOutcome] = useState<ClaimResolutionOutcome>('replacement_authorized')
+  const [resolutionReference, setResolutionReference] = useState('DEMO-REPLACEMENT-001')
   const [message, setMessage] = useState('')
+  const openReview = (id: string, action: ClaimReviewAction) => {
+    setPending({ id, action })
+    if (action === 'resolve') {
+      setResolutionOutcome('replacement_authorized')
+      setResolutionReference(`DEMO-${id.toUpperCase()}`)
+      setNote('Confirmed fictional replacement handoff with documented demo evidence.')
+    }
+  }
   const perform = () => {
     if (!pending) return
     try {
-      const result = services.claims.review(pending.id, pending.action, note)
+      const result = services.claims.review(
+        pending.id,
+        pending.action,
+        note,
+        pending.action === 'resolve'
+          ? { outcome: resolutionOutcome, reference: resolutionReference }
+          : undefined,
+      )
       setMessage(result.message)
     } catch (caught) {
       setMessage(caught instanceof Error ? caught.message : 'Claim action was blocked.')
@@ -626,21 +647,36 @@ function AdminClaimsContent() {
     <div className="admin-record-list claims-queue">
       {claims.map((claim) => (
         <details className="admin-record claim-record" open key={claim.id}>
-          <summary><span><b>{claim.id}</b><small>{titleCase(claim.kind)} · {claim.orderId}</small></span><span>{claim.shipmentId ?? claim.boxId}</span><StatusBadge value={claim.status} /></summary>
+          <summary>
+            <span><b>{claim.id}</b><small>{titleCase(claim.kind)} · {claim.orderId}</small></span>
+            <span>
+              {claim.shipmentCandidateIds
+                ? `Order-level candidates: ${claim.shipmentCandidateIds.join(', ')}`
+                : claim.shipmentId ?? claim.boxId}
+            </span>
+            <StatusBadge value={claim.status} />
+          </summary>
           <p>{claim.note}</p>
           <div className="record-actions">
-            {claim.status === 'submitted' && <button className="button" type="button" onClick={() => setPending({ id: claim.id, action: 'acknowledge' })}>Acknowledge</button>}
-            {claim.status === 'reviewing' && <button className="button" type="button" onClick={() => setPending({ id: claim.id, action: 'approve' })}>Approve</button>}
-            {['submitted', 'reviewing'].includes(claim.status) && <button className="button button-danger" type="button" onClick={() => setPending({ id: claim.id, action: 'reject' })}>Reject</button>}
-            {claim.status === 'approved' && <button className="button" type="button" onClick={() => setPending({ id: claim.id, action: 'resolve' })}>Resolve</button>}
+            {claim.status === 'submitted' && <button className="button" type="button" onClick={() => openReview(claim.id, 'acknowledge')}>Acknowledge</button>}
+            {claim.status === 'reviewing' && <button className="button" type="button" onClick={() => openReview(claim.id, 'approve')}>Approve</button>}
+            {['submitted', 'reviewing'].includes(claim.status) && <button className="button button-danger" type="button" onClick={() => openReview(claim.id, 'reject')}>Reject</button>}
+            {claim.status === 'approved' && <button className="button" type="button" onClick={() => openReview(claim.id, 'resolve')}>Resolve</button>}
           </div>
           {claim.status === 'approved' && (
             <div className="notice notice-info">
-              <b>Approved claim finance handoff</b>
-              <p>This approval does not refund automatically. Finance must review the exact order and use a separate audited payment action.</p>
+              <b>Approved claim finance / RMA handoff</b>
+              <p>This stays open until structured remedy evidence is recorded. Approval does not refund automatically; finance must use a separate audited payment action.</p>
               {canOpenPayments
                 ? <Link className="table-action table-link" to={`/admin/payments?order=${encodeURIComponent(claim.orderId)}`}>Open Payments for {claim.orderId}</Link>
                 : <span className="table-readonly">Read only · finance or an admin must complete the payment review.</span>}
+            </div>
+          )}
+          {claim.status === 'resolved' && (
+            <div className="notice notice-info">
+              <b>Structured resolution recorded</b>
+              <p>{titleCase(claim.resolutionOutcome ?? '')} · {claim.resolutionReference}</p>
+              <small>{claim.resolutionNote}</small>
             </div>
           )}
           <ol className="mini-timeline">{claim.history.map((entry) => <li key={entry.id}><b>{entry.note}</b><small>{formatDateTime(entry.at)} · {entry.actorRole} · {entry.status}</small></li>)}</ol>
@@ -660,6 +696,22 @@ function AdminClaimsContent() {
       <label className="dialog-note">Required review note
         <textarea rows={3} value={note} onChange={(event) => setNote(event.target.value)} />
       </label>
+      {pending?.action === 'resolve' && (
+        <>
+          <label className="dialog-note">Structured outcome
+            <select value={resolutionOutcome} onChange={(event) => setResolutionOutcome(event.target.value as ClaimResolutionOutcome)}>
+              <option value="replacement_authorized">Replacement authorized</option>
+              <option value="return_rma_created">Return / RMA created</option>
+              <option value="refund_recorded">Refund already recorded</option>
+              <option value="no_remedy">No remedy</option>
+            </select>
+          </label>
+          <label className="dialog-note">
+            {resolutionOutcome === 'refund_recorded' ? 'Audited refund event ID' : 'Fictional DEMO- reference'}
+            <input value={resolutionReference} onChange={(event) => setResolutionReference(event.target.value)} />
+          </label>
+        </>
+      )}
       <p>This appends claim history and audit evidence. It does not issue a refund.</p>
     </ConfirmDialog>
   </>

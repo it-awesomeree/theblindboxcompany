@@ -193,6 +193,11 @@ const payment = (order: Order): Payment => {
             source: 'admin_reconcile' as const,
             createdAt: updatedAt,
             processedAt: updatedAt,
+            refundIntent: {
+              paymentId: order.paymentIds[0],
+              amountSen: order.snapshot.totals.totalSen,
+              reason: 'Seeded fictional full refund record',
+            },
           }]
         : []),
     ],

@@ -4,6 +4,8 @@ const useExistingDist = process.env.PLAYWRIGHT_EXISTING_DIST === '1'
 const useBundledChromium = process.env.PLAYWRIGHT_BROWSER === 'chromium'
 const localChrome = useBundledChromium ? {} : { channel: 'chrome' as const }
 const desktopChrome = { ...devices['Desktop Chrome'], ...localChrome }
+const previewURL = 'http://127.0.0.1:4173/theblindboxcompany/'
+const browserBaseURL = useBundledChromium ? `${previewURL}?nogl=1` : previewURL
 
 export default defineConfig({
   testDir: './e2e',
@@ -13,14 +15,14 @@ export default defineConfig({
   workers: process.env.CI ? 2 : undefined,
   reporter: [['list'], ['html', { open: 'never' }]],
   use: {
-    baseURL: 'http://127.0.0.1:4173/theblindboxcompany/',
+    baseURL: browserBaseURL,
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
     video: 'retain-on-failure',
   },
   webServer: {
-    command: `${useExistingDist ? '' : 'npm run build && '}npm exec vite preview -- --host 127.0.0.1 --port 4173`,
-    url: 'http://127.0.0.1:4173/theblindboxcompany/',
+    command: `${useExistingDist ? '' : 'npm run build && '}./node_modules/.bin/vite preview --host 127.0.0.1 --port 4173`,
+    url: previewURL,
     reuseExistingServer: false,
     timeout: 120_000,
   },

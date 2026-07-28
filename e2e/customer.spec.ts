@@ -25,8 +25,11 @@ test.describe('desktop customer journeys', () => {
     await page.getByRole('button', { name: /approve \+ valid mock webhook/i }).click()
     await expect(page.getByRole('heading', { name: /payment confirmed by event/i })).toBeVisible()
     await page.getByRole('link', { name: /view order and boxes/i }).click()
-    await expect(page.getByText(/idempotent mock webhook confirmed payment/i)).toBeVisible()
-    await page.getByRole('link', { name: /open now/i }).first().click()
+    await expect(page.getByText(/detailed delivery events stay combined until every box is revealed/i)).toBeVisible()
+    await expect(page.getByText(/idempotent mock webhook confirmed payment/i)).toHaveCount(0)
+    const openNow = page.getByRole('link', { name: /open now/i }).first()
+    await expect(openNow).toBeVisible()
+    await openNow.click()
     await page.getByRole('button', { name: /break demo seal/i }).click()
     await expect(page.getByRole('link', { name: /continue to fulfilment/i })).toBeVisible({ timeout: 5000 })
     await expect(page.getByText(/value manifest \/ immutable record/i)).toBeVisible()
@@ -74,11 +77,130 @@ test.describe('desktop customer journeys', () => {
     await page.getByRole('link', { name: /demo sign in/i }).click()
     await page.getByRole('button', { name: /one-click aina demo/i }).click()
     await page.goto('#/order/ord-unopened')
-    await expect(page.getByText(/fulfilment details stay private until every box/i)).toBeVisible()
+    await expect(page.getByText(/useful delivery progress stays visible/i)).toBeVisible()
+    const fulfilment = page.getByRole('heading', { name: /private-prize tracking/i }).locator('xpath=ancestor::section[1]')
+    await expect(fulfilment.locator('.shipment-card')).toHaveCount(1)
+    await expect(fulfilment.locator('.sealed-delivery-summary .status')).toHaveCount(1)
+    await expect(page.getByText('DEMO-DELIVERY-ORD-UNOPENED')).toBeVisible()
+    await expect(page.getByText(/delivery record 01/i)).toHaveCount(0)
     await expect(page.getByText('DEMO-P-UNOPENED')).toHaveCount(0)
     await expect(page.getByText('Demo Express')).toHaveCount(0)
     await expect(page.getByText('PARCEL', { exact: true })).toHaveCount(0)
     await expect(page.getByText(/signature required/i)).toHaveCount(0)
+    await expect(page.getByText('shp-unopened', { exact: false })).toHaveCount(0)
+  })
+
+  test('sealed shipped and delivered orders create eligible neutral claims that survive reload', async ({ page }) => {
+    await clearAndOpen(page)
+    await page.getByRole('link', { name: /demo sign in/i }).click()
+    await page.getByRole('button', { name: /one-click aina demo/i }).click()
+    await page.evaluate(() => {
+      const key = 'tbbc:demo:repository:v5'
+      const state = JSON.parse(localStorage.getItem(key)!)
+      delete state.boxes.find((box: { id: string }) => box.id === 'box-shipped-01').revealedAt
+      delete state.boxes.find((box: { id: string }) => box.id === 'box-delivered-01').revealedAt
+      localStorage.setItem(key, JSON.stringify(state))
+    })
+    await page.reload()
+
+    await page.goto('#/order/ord-shipped')
+    await expect(page.getByText('DEMO-DELIVERY-ORD-SHIPPED')).toBeVisible()
+    await expect(page.getByText(/delivery record 01/i)).toHaveCount(0)
+    await expect(page.getByText('DEMO-P-SHIPPED')).toHaveCount(0)
+    await expect(page.getByText('Demo Express')).toHaveCount(0)
+    await expect(page.getByText('PARCEL', { exact: true })).toHaveCount(0)
+    await expect(page.getByText(/signature required/i)).toHaveCount(0)
+    await expect(page.getByText('box-shipped-01', { exact: false })).toHaveCount(0)
+    await expect(page.getByText(/airpods/i)).toHaveCount(0)
+    await page.getByRole('link', { name: /start a demo claim/i }).click()
+    await page.getByLabel('Claim type').selectOption('non_delivery')
+    const shippedDelivery = page.getByLabel('Order delivery')
+    await expect(shippedDelivery.locator('option', { hasText: /order delivery · eligible neutral record/i })).toHaveCount(1)
+    await expect(shippedDelivery).toHaveValue('order-delivery')
+    await expect(page.getByText('shp-shipped', { exact: false })).toHaveCount(0)
+    await page.getByLabel(/fictional note/i).fill('DEMO: Sealed shipped record is overdue and missing.')
+    await page.getByRole('button', { name: /submit demo claim/i }).click()
+    await page.reload()
+    await expect(page.getByRole('paragraph').filter({ hasText: /sealed shipped record is overdue and missing/i })).toBeVisible()
+    await expect(page.getByText('DEMO-DELIVERY-ORD-SHIPPED')).toBeVisible()
+
+    await page.goto('#/claim/new?order=ord-delivered')
+    const deliveredDelivery = page.getByLabel('Order delivery')
+    await expect(deliveredDelivery.locator('option', { hasText: /order delivery · eligible neutral record/i })).toHaveCount(1)
+    await expect(deliveredDelivery).toHaveValue('order-delivery')
+    await page.getByLabel(/fictional note/i).fill('DEMO: Sealed delivered carton has physical damage.')
+    await page.getByRole('button', { name: /submit demo claim/i }).click()
+    await page.reload()
+    await expect(page.getByRole('paragraph').filter({ hasText: /sealed delivered carton has physical damage/i })).toBeVisible()
+    await expect(page.getByText(/paid prize sealed/i)).toBeVisible()
+  })
+
+  test('mixed split order keeps sealed prize-derived shipment clues private', async ({ page }) => {
+    await clearAndOpen(page)
+    await page.getByRole('link', { name: /demo sign in/i }).click()
+    await page.getByRole('button', { name: /one-click aina demo/i }).click()
+    await page.evaluate(() => {
+      const key = 'tbbc:demo:repository:v5'
+      const state = JSON.parse(localStorage.getItem(key)!)
+      const shipment = state.shipments.find((entry: { id: string }) => entry.id === 'shp-processing')
+      for (const [index, status] of ['packed', 'label_created', 'shipped', 'delivered'].entries()) {
+        shipment.timeline.push({
+          id: `privacy-partial-${index}`,
+          status,
+          label: `Digital and bulky split clue ${status}`,
+          at: `2026-07-22T0${index + 4}:00:00.000Z`,
+        })
+      }
+      shipment.status = 'delivered'
+      state.boxes.find((entry: { id: string }) => entry.id === 'box-processing-01').status = 'fulfilled'
+      const order = state.orders.find((entry: { id: string }) => entry.id === 'ord-processing')
+      order.status = 'partially_fulfilled'
+      order.updatedAt = '2026-07-22T07:00:00.000Z'
+      order.timeline.push({
+        id: 'privacy-partial-order',
+        status: 'partially_fulfilled',
+        label: 'Digital and bulky split delivery clue must stay private',
+        at: order.updatedAt,
+      })
+      localStorage.setItem(key, JSON.stringify(state))
+    })
+    await page.reload()
+    await page.goto('#/order/ord-processing')
+    const fulfilment = page.getByRole('heading', { name: /private-prize tracking/i }).locator('xpath=ancestor::section[1]')
+    await expect(fulfilment.locator('.shipment-card')).toHaveCount(1)
+    await expect(fulfilment.locator('.sealed-delivery-summary .status')).toHaveCount(1)
+    await expect(page.getByText('DEMO-DELIVERY-ORD-PROCESSING')).toBeVisible()
+    await expect(fulfilment.getByText('Delivery In Progress')).toBeVisible()
+    await expect(page.getByText('Partially Fulfilled')).toHaveCount(0)
+    await expect(page.getByText(/digital and bulky split delivery clue/i)).toHaveCount(0)
+    await expect(page.getByText('Fulfillment Pending')).toHaveCount(0)
+    await expect(page.getByText('Fulfilled')).toHaveCount(0)
+    await expect(page.getByText(/delivery record 01|delivery record 02/i)).toHaveCount(0)
+    for (const clue of [
+      'shp-processing',
+      'shp-digital',
+      'Demo Bulky Freight',
+      'Digital Vault',
+      'BULKY',
+      'DIGITAL',
+      'box-processing-01',
+      'box-processing-02',
+      'TNG reload RM100',
+      'DEMO-P-DIGITAL',
+      'DEMO-P-PROCESSING',
+    ]) {
+      await expect(page.getByText(clue, { exact: false })).toHaveCount(0)
+    }
+    await expect(page.getByText(/signature required/i)).toHaveCount(0)
+
+    await page.getByRole('link', { name: 'Account', exact: true }).click()
+    const accountOrder = page.getByText('ORD-PROCESSING').locator('xpath=ancestor::article[1]')
+    await expect(accountOrder.locator('.sealed-delivery-summary')).toHaveCount(1)
+    await expect(accountOrder.getByText('DEMO-DELIVERY-ORD-PROCESSING')).toBeVisible()
+    await expect(accountOrder.getByText('Delivery In Progress')).toBeVisible()
+    await expect(accountOrder.getByText('Partially Fulfilled')).toHaveCount(0)
+    await expect(accountOrder.getByText(/record 1:|record 2:/i)).toHaveCount(0)
+    await expect(accountOrder.getByText(/maggi|tng reload/i)).toHaveCount(0)
   })
 
   test('eligible claim moves through protected admin review without an automatic refund', async ({ page }) => {
@@ -88,7 +210,7 @@ test.describe('desktop customer journeys', () => {
     await page.goto('#/order/ord-shipped')
     await page.getByRole('link', { name: /start a demo claim/i }).click()
     await page.getByLabel('Claim type').selectOption('non_delivery')
-    await expect(page.getByLabel(/relevant shipment/i)).toHaveValue('shp-shipped')
+    await expect(page.getByLabel(/delivery record/i)).toHaveValue('delivery-record-1')
     await page.getByLabel(/fictional note/i).fill('DEMO: Shipment is overdue and missing.')
     await page.getByRole('button', { name: /submit demo claim/i }).click()
     await expect(page.getByRole('heading', { name: /claim status & history/i })).toBeVisible()
@@ -106,8 +228,19 @@ test.describe('desktop customer journeys', () => {
     await page.getByRole('button', { name: /confirm note & audit/i }).click()
     await expect(claim.getByText('Approved', { exact: true })).toBeVisible()
     await claim.getByRole('button', { name: 'Resolve' }).click()
+    await expect(page.getByLabel(/structured outcome/i)).toHaveValue('replacement_authorized')
+    await expect(page.getByLabel(/fictional demo- reference/i)).toHaveValue(/DEMO-CLM-/)
     await page.getByRole('button', { name: /confirm note & audit/i }).click()
     await expect(claim.getByText('Resolved', { exact: true })).toBeVisible()
+    await expect(claim.getByText(/structured resolution recorded/i)).toBeVisible()
+    await expect(claim.getByText(/replacement authorized/i)).toBeVisible()
     await expect(claim.getByText(/no refund is created here/i)).toBeVisible()
+
+    await page.getByRole('button', { name: /log out/i }).click()
+    await page.getByRole('link', { name: /demo sign in/i }).click()
+    await page.getByRole('button', { name: /one-click aina demo/i }).click()
+    await page.goto('#/order/ord-shipped')
+    await expect(page.getByText(/recorded resolution/i)).toBeVisible()
+    await expect(page.getByText(/replacement authorized/i)).toBeVisible()
   })
 })

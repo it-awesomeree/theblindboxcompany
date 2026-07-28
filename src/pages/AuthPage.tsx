@@ -44,7 +44,7 @@ export function AuthPage() {
             <div><span>04 / FAKE EMAIL</span><h2>Password-free demo access</h2></div>
             <small>Nothing is sent</small>
           </div>
-          <label>Fictional display name<input value={name} onChange={(event) => setName(event.target.value)} autoComplete="off" /></label>
+          <label>Fictional display name (include Demo)<input value={name} onChange={(event) => setName(event.target.value)} autoComplete="off" /></label>
           <label>Fictional email<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="off" aria-describedby="email-help" /></label>
           <small id="email-help">Allowed: example.com, example.test or demo.local only.</small>
           <button className="button" type="submit">Create / sign in — no password</button>

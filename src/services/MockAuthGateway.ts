@@ -1,5 +1,5 @@
 import { DEMO_ADMIN_ID, DEMO_CUSTOMER_ID } from '../domain/constants'
-import { assert, assertRole, isoNow, makeId, sanitizeText, validateDemoEmail } from '../domain/guards'
+import { assert, assertRole, isoNow, makeId, validateDemoEmail, validateDemoUserName } from '../domain/guards'
 import type { User } from '../domain/types'
 import type { MockRepository } from '../data/MockRepository'
 import { AuditService } from './AuditService'
@@ -29,13 +29,12 @@ export class MockAuthGateway {
         const now = isoNow()
         user = {
           id: makeId('usr', email),
-          name: sanitizeText(rawName || 'Demo Customer', 70),
+          name: validateDemoUserName(rawName || 'Demo Customer'),
           email,
           role: 'customer',
           status: 'active',
           createdAt: now,
         }
-        assert(user.name, 'A fictional display name is required.', 'INVALID_NAME')
         state.users.push(user)
         this.audit.append(state, {
           actorId: user.id,

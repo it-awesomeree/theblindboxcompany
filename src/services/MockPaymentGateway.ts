@@ -9,7 +9,7 @@ import {
   sanitizeText,
 } from '../domain/guards'
 import { prizeForBox } from '../domain/selectors'
-import type { DemoState, Order, Payment, PaymentMethod, PaymentStatus } from '../domain/types'
+import type { DemoState, Order, Payment, PaymentEvent, PaymentMethod, PaymentStatus } from '../domain/types'
 import type { MockRepository } from '../data/MockRepository'
 import { AuditService } from './AuditService'
 import { FulfillmentService } from './FulfillmentService'
@@ -29,6 +29,29 @@ class DuplicatePaymentEvent extends Error {
   constructor(readonly payment: Payment) {
     super('Duplicate payment event')
   }
+}
+
+function storedPaymentEvent(state: DemoState, eventId: string) {
+  for (const payment of state.payments) {
+    const event = payment.events.find((entry) => entry.id === eventId)
+    if (event) return { payment, event }
+  }
+  return undefined
+}
+
+function assertExactEventReplay(
+  stored: { payment: Payment; event: PaymentEvent },
+  paymentId: string,
+  next: PaymentStatus,
+  source: 'mock_webhook' | 'admin_reconcile',
+) {
+  assert(
+    stored.payment.id === paymentId &&
+      stored.event.type === next &&
+      stored.event.source === source,
+    'Payment event identity was already used for a different payment, type, or source.',
+    'IDEMPOTENCY_CONFLICT',
+  )
 }
 
 export class MockPaymentGateway {
@@ -144,10 +167,9 @@ export class MockPaymentGateway {
     const existingPayment = snapshot.payments.find((entry) => entry.id === paymentId)
     assert(existingPayment, 'Payment attempt was not found.', 'PAYMENT_MISSING')
     this.authorizeEventCaller(snapshot, existingPayment, source)
-    const existingDuplicate = snapshot.payments.some((entry) =>
-      entry.events.some((event) => event.id === eventId),
-    )
-    if (existingDuplicate) {
+    const existingEvent = storedPaymentEvent(snapshot, eventId)
+    if (existingEvent) {
+      assertExactEventReplay(existingEvent, paymentId, next, source)
       return { payment: existingPayment, changed: false, message: 'Duplicate event ignored safely.' }
     }
 
@@ -156,10 +178,11 @@ export class MockPaymentGateway {
         const payment = state.payments.find((entry) => entry.id === paymentId)
         assert(payment, 'Payment attempt was not found.', 'PAYMENT_MISSING')
         const caller = this.authorizeEventCaller(state, payment, source)
-        const duplicate = state.payments.some((entry) =>
-          entry.events.some((event) => event.id === eventId),
-        )
-        if (duplicate) throw new DuplicatePaymentEvent(payment)
+        const concurrentEvent = storedPaymentEvent(state, eventId)
+        if (concurrentEvent) {
+          assertExactEventReplay(concurrentEvent, paymentId, next, source)
+          throw new DuplicatePaymentEvent(payment)
+        }
         const now = this.now()
         this.reservations.expireDue(state, now)
         const requestId = makeId('req', eventId)
@@ -216,10 +239,30 @@ export class MockPaymentGateway {
           assert(payment.amountSen === order.snapshot.totals.totalSen, 'Payment amount failed the server-like total check.', 'AMOUNT_MISMATCH')
         }
         const before = payment.status
+        const disputeRefundAmount =
+          before === 'disputed' && next === 'refunded'
+            ? payment.amountSen - payment.refundedSen
+            : 0
         payment.status = transitionPayment(payment.status, next)
         if (before === 'disputed' && next === 'refunded') payment.refundedSen = payment.amountSen
         payment.updatedAt = now
-        payment.events.push({ id: eventId, requestId, type: next, source, createdAt: now, processedAt: now })
+        payment.events.push({
+          id: eventId,
+          requestId,
+          type: next,
+          source,
+          createdAt: now,
+          processedAt: now,
+          ...(disputeRefundAmount > 0
+            ? {
+                refundIntent: {
+                  paymentId: payment.id,
+                  amountSen: disputeRefundAmount,
+                  reason,
+                },
+              }
+            : {}),
+        })
         if (next === 'succeeded') {
           if (before === 'disputed') {
             this.financialSafety.resumeDispute(
@@ -404,17 +447,52 @@ export class MockPaymentGateway {
   }
 
   refund(paymentId: string, amountSen: number, reason: string, requestId: string) {
+    const snapshot = this.repository.getSnapshot()
+    const currentActor = getSessionUser(snapshot)
+    assertRole(currentActor, ['finance', 'admin', 'super_admin'], 'refund demo payments')
+    const cleanRequestId = sanitizeText(requestId, 120)
+    const cleanReason = sanitizeText(reason, 240)
+    assert(
+      cleanRequestId.length >= 4 && cleanRequestId === requestId,
+      'Refund request identity is invalid.',
+      'INVALID_REFUND_REQUEST_ID',
+    )
+    assert(cleanReason.length >= 8, 'Give a reason of at least 8 characters for this refund.', 'REASON_REQUIRED')
+    assert(Number.isInteger(amountSen) && amountSen > 0, 'Refund must be a positive amount in sen.', 'INVALID_REFUND')
+    const replayOwner = snapshot.payments.find((entry) =>
+      entry.events.some((event) => event.requestId === cleanRequestId),
+    )
+    if (replayOwner) {
+      const replayEvent = replayOwner.events.find((event) => event.requestId === cleanRequestId)!
+      const exactReplay =
+        replayEvent.refundIntent?.paymentId === paymentId &&
+        replayEvent.refundIntent.amountSen === amountSen &&
+        replayEvent.refundIntent.reason === cleanReason
+      assert(
+        exactReplay,
+        'Refund request identity was already used for different payment, amount, or reason.',
+        'IDEMPOTENCY_CONFLICT',
+      )
+      return {
+        payment: replayOwner,
+        changed: false,
+        message: 'Exact refund replay returned the original result.',
+      }
+    }
+
     return this.repository.update((state) => {
       const actor = getSessionUser(state)
       assertRole(actor, ['finance', 'admin', 'super_admin'], 'refund demo payments')
       const payment = state.payments.find((entry) => entry.id === paymentId)
       assert(payment, 'Payment was not found.', 'PAYMENT_MISSING')
-      const existing = state.payments.some((entry) => entry.events.some((event) => event.requestId === requestId))
-      if (existing) return { payment, changed: false, message: 'Duplicate refund request ignored safely.' }
-      const cleanReason = sanitizeText(reason, 240)
-      assert(cleanReason.length >= 8, 'Give a reason of at least 8 characters for this refund.', 'REASON_REQUIRED')
+      assert(
+        !state.payments.some((entry) =>
+          entry.events.some((event) => event.requestId === cleanRequestId),
+        ),
+        'Refund request identity changed before it could be saved.',
+        'IDEMPOTENCY_CONFLICT',
+      )
       assert(['succeeded', 'partially_refunded'].includes(payment.status), 'Only succeeded demo payments can be refunded.', 'NOT_REFUNDABLE')
-      assert(Number.isInteger(amountSen) && amountSen > 0, 'Refund must be a positive amount in sen.', 'INVALID_REFUND')
       assert(payment.refundedSen + amountSen <= payment.amountSen, 'Refund exceeds the paid demo amount.', 'REFUND_TOO_HIGH')
       const before = { status: payment.status, refundedSen: payment.refundedSen }
       payment.refundedSen += amountSen
@@ -422,13 +500,19 @@ export class MockPaymentGateway {
       payment.status = transitionPayment(payment.status, full ? 'refunded' : 'partially_refunded')
       const now = this.now()
       payment.updatedAt = now
+      const eventId = makeId('evt', cleanRequestId)
       payment.events.push({
-        id: makeId('evt', requestId),
-        requestId,
+        id: eventId,
+        requestId: cleanRequestId,
         type: payment.status,
         source: 'admin_reconcile',
         createdAt: now,
         processedAt: now,
+        refundIntent: {
+          paymentId: payment.id,
+          amountSen,
+          reason: cleanReason,
+        },
       })
       const order = state.orders.find((entry) => entry.id === payment.orderId)
       if (order && full && order.status !== 'refunded') {
@@ -439,7 +523,7 @@ export class MockPaymentGateway {
           'refunded',
           now,
           financialReason,
-          requestId,
+          cleanRequestId,
           { id: actor.id, role: actor.role },
         )
       }
@@ -451,7 +535,8 @@ export class MockPaymentGateway {
         targetId: payment.id,
         reason: cleanReason,
         at: now,
-        requestId,
+        requestId: cleanRequestId,
+        eventId,
         before,
         after: { status: payment.status, refundedSen: payment.refundedSen, allocationsReturned: 0 },
       })

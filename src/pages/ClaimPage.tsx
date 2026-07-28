@@ -14,34 +14,49 @@ export function ClaimPage() {
   const order = state.orders.find((entry) => entry.id === orderId && entry.userId === user?.id)
   const [kind, setKind] = useState<ClaimKind>('damage')
   const [note, setNote] = useState('DEMO: Outer carton is dented for workflow testing.')
-  const [linkedId, setLinkedId] = useState('')
+  const [linkedToken, setLinkedToken] = useState('')
   const [error, setError] = useState('')
   if (!user) return <Navigate to="/auth" replace />
   if (!order) return <Navigate to="/not-found" replace />
+
   const orderBoxes = state.boxes.filter((box) => box.orderId === order.id)
   const everyBoxRevealed =
     order.boxIds.length > 0 &&
     order.boxIds.every((boxId) => Boolean(orderBoxes.find((box) => box.id === boxId)?.revealedAt))
-  const shipmentClaimsLocked = kind !== 'value_floor' && !everyBoxRevealed
-  const eligibleShipments = everyBoxRevealed
-    ? state.shipments.filter((shipment) => {
-        if (shipment.orderId !== order.id) return false
-        if (kind === 'damage') return shipment.status === 'delivered' && shipment.kind !== 'DIGITAL'
-        if (kind === 'non_delivery') return ['shipped', 'failed_delivery', 'lost'].includes(shipment.status)
-        return false
-      })
-    : []
-  const eligibleBoxes = orderBoxes.filter((box) => Boolean(box.revealedAt))
-  const options = kind === 'value_floor' ? eligibleBoxes : eligibleShipments
-  const selectedId = options.some((entry) => entry.id === linkedId) ? linkedId : options[0]?.id ?? ''
+  const eligible = services.claims.eligibleLinks(order.id, kind)
+  const options = kind === 'value_floor'
+    ? eligible.boxes.map((box, index) => ({
+        token: `box-record-${index + 1}`,
+        id: box.id,
+        label: `Box ${String(box.number).padStart(2, '0')} · revealed`,
+      }))
+    : everyBoxRevealed
+      ? eligible.shipments.map((shipment, index) => ({
+          token: `delivery-record-${index + 1}`,
+          id: shipment.id,
+          label: `${shipment.id} · ${shipment.status.replaceAll('_', ' ')} · ${shipment.carrier}`,
+        }))
+      : eligible.orderLevelEligible
+        ? [{
+            token: 'order-delivery',
+            id: undefined,
+            label: 'Order delivery · eligible neutral record',
+          }]
+        : []
+  const selectedToken = options.some((entry) => entry.token === linkedToken)
+    ? linkedToken
+    : options[0]?.token ?? ''
+  const selectedId = options.find((entry) => entry.token === selectedToken)?.id ?? ''
 
   const submit = () => {
+    setError('')
     try {
       services.claims.submit({
         orderId: order.id,
         kind,
         note,
-        shipmentId: kind === 'value_floor' ? undefined : selectedId,
+        shipmentId: kind !== 'value_floor' && everyBoxRevealed ? selectedId : undefined,
+        orderLevelDelivery: kind !== 'value_floor' && !everyBoxRevealed,
         boxId: kind === 'value_floor' ? selectedId : undefined,
       })
       navigate(`/order/${order.id}`)
@@ -62,39 +77,32 @@ export function ClaimPage() {
         {error && <Notice tone="danger">{error}</Notice>}
         <form className="panel form-grid" onSubmit={(event) => { event.preventDefault(); submit() }}>
           <label>Claim type
-            <select value={kind} onChange={(event) => { setKind(event.target.value as ClaimKind); setLinkedId('') }}>
+            <select value={kind} onChange={(event) => { setKind(event.target.value as ClaimKind); setLinkedToken('') }}>
               <option value="damage">Damage</option>
               <option value="non_delivery">Non-delivery</option>
               <option value="value_floor">Value below RM100 floor</option>
             </select>
           </label>
-          {shipmentClaimsLocked ? (
+          <label>{kind === 'value_floor' ? 'Revealed box' : everyBoxRevealed ? 'Delivery record' : 'Order delivery'}
+            <select value={selectedToken} onChange={(event) => setLinkedToken(event.target.value)} required>
+              {options.length === 0 && <option value="">No eligible record</option>}
+              {options.map((entry) => (
+                <option key={entry.token} value={entry.token}>{entry.label}</option>
+              ))}
+            </select>
+          </label>
+          {!everyBoxRevealed && kind !== 'value_floor' && (
             <Notice>
-              Shipment-linked claim details unlock after all boxes in this order are opened. Until then, shipment information stays private.
+              Sealed prizes stay private. This single order-level option records the eligible physical delivery evidence internally without exposing split details.
             </Notice>
-          ) : (
-            <>
-              <label>{kind === 'value_floor' ? 'Revealed box' : 'Relevant shipment'}
-                <select value={selectedId} onChange={(event) => setLinkedId(event.target.value)} required>
-                  {options.length === 0 && <option value="">No eligible record</option>}
-                  {options.map((entry) => (
-                    <option key={entry.id} value={entry.id}>
-                      {entry.id}{'status' in entry ? ` · ${entry.status}` : ' · revealed'}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label>Fictional note (must include DEMO; no email or phone)
-                <textarea rows={5} value={note} onChange={(event) => setNote(event.target.value)} />
-              </label>
-              <button className="button" type="submit" disabled={!selectedId}>Submit demo claim</button>
-            </>
           )}
+          <label>Fictional note (must include DEMO; no email or phone)
+            <textarea rows={5} value={note} onChange={(event) => setNote(event.target.value)} />
+          </label>
+          <button className="button" type="submit" disabled={!selectedToken}>Submit demo claim</button>
         </form>
         <p className="fine-print">
-          {everyBoxRevealed
-            ? 'Damage needs delivered physical goods. Non-delivery needs a shipped/failed/lost overdue-like record. Value-floor review needs an already revealed box.'
-            : 'Value-floor review is available only for an individually revealed box.'}
+          Damage needs delivered physical evidence. Non-delivery can use an overdue, failed, lost, or returned-to-sender delivery, but never a customer return after delivery. Value-floor review still needs that exact box revealed.
         </p>
       </div>
     </section>

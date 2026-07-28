@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link, Navigate } from '../lib/router'
 import { useParams } from '../lib/router-core'
 import { Notice } from '../components/Notice'
@@ -17,16 +17,27 @@ export function OpenBoxPage() {
   const [showResult, setShowResult] = useState(Boolean(box?.revealedAt))
   const [opening, setOpening] = useState(false)
   const [error, setError] = useState('')
+  const [announcement, setAnnouncement] = useState('')
+  const resultHeadingRef = useRef<HTMLHeadingElement>(null)
+  const revealStartedRef = useRef(false)
+  const prize = prizeForBox(state, box)
+  const reveal = boxRevealEligibility(state, box)
+
+  useEffect(() => {
+    if (!showResult || !prize || !revealStartedRef.current) return
+    revealStartedRef.current = false
+    setAnnouncement(`Box revealed. Result: ${prize.name}.`)
+    resultHeadingRef.current?.focus({ preventScroll: true })
+  }, [prize, showResult])
 
   if (!user) return <Navigate to="/auth" replace />
   if (!box || !order || box.ownerId !== user.id) return <Navigate to="/not-found" replace />
-  const prize = prizeForBox(state, box)
-  const reveal = boxRevealEligibility(state, box)
 
   const open = () => {
     if (opening || showResult) return
     try {
       services.openBox(box.id)
+      revealStartedRef.current = true
       setOpening(true)
       setOpenSignal((value) => value + 1)
       window.setTimeout(() => {
@@ -40,6 +51,7 @@ export function OpenBoxPage() {
 
   return (
     <section className="reveal-page">
+      <p className="sr-only" role="status" aria-live="polite" aria-atomic="true">{announcement}</p>
       <div className="reveal-stage">
         <VaultCanvas openSignal={openSignal} holdOpen={showResult || opening} onActivate={!showResult && reveal.eligible ? open : undefined} label="Open this paid box once" />
         <div className="vault-grain" aria-hidden="true" />
@@ -53,9 +65,9 @@ export function OpenBoxPage() {
             {error && <Notice tone="danger">{error}</Notice>}
           </div>
         ) : showResult && prize ? (
-          <div className="reveal-result" aria-live="polite">
+          <div className="reveal-result" role="region" aria-labelledby="reveal-result-title">
             <div className="result-code"><span>{prize.tier} TIER</span><span>DEMO FLOOR · SAMPLE ✓</span></div>
-            <h1>{prize.name}</h1>
+            <h1 id="reveal-result-title" ref={resultHeadingRef} tabIndex={-1}>{prize.name}</h1>
             <div className="result-value"><span>Unverified fixture value</span><strong>{formatMYR(prize.valueSen)}</strong></div>
             <div className="result-identifiers"><span>Unique box <b>{box.id}</b></span><span>Manifest <b>{box.manifestId}</b></span></div>
             <Link className="button" to={`/order/${order.id}`}>Continue to fulfilment</Link>

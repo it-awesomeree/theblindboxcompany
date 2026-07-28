@@ -168,11 +168,18 @@ export function VaultCanvas({
     const fallback = fallbackRef.current
     if (!canvas || !fallback) return
     const showFallback = () => {
+      const interactive = canvas.getAttribute('role') === 'button'
+      const interactiveLabel = canvas.getAttribute('aria-label')
       canvas.hidden = true
       canvas.removeAttribute('role')
       canvas.tabIndex = -1
       canvas.removeAttribute('aria-label')
       fallback.hidden = false
+      if (interactive) {
+        fallback.setAttribute('role', 'button')
+        fallback.tabIndex = 0
+        if (interactiveLabel) fallback.setAttribute('aria-label', interactiveLabel)
+      }
       usingFallbackRef.current = true
     }
     const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches
@@ -237,6 +244,7 @@ export function VaultCanvas({
     let mouseTargetY = 0
     let mouseX = 0
     let mouseY = 0
+    let renderedFrames = 0
     const resize = () => {
       const scale = Math.min(window.devicePixelRatio || 1, 1.5)
       const width = Math.max(1, Math.round(canvas.clientWidth * scale))
@@ -259,6 +267,11 @@ export function VaultCanvas({
       gl!.uniform1f(uniforms.open, openNow)
       gl!.uniform1f(uniforms.flash, flash)
       gl!.drawArrays(gl!.TRIANGLES, 0, 3)
+      if (renderedFrames < 2) {
+        renderedFrames += 1
+        canvas.dataset.webglRenderer = 'live'
+        canvas.dataset.webglFrame = String(renderedFrames)
+      }
     }
     const loop = (time: number) => {
       if (!running) return
@@ -290,6 +303,13 @@ export function VaultCanvas({
         window.cancelAnimationFrame(frame)
       },
     }
+    const onContextLost = (event: Event) => {
+      event.preventDefault()
+      running = false
+      window.cancelAnimationFrame(frame)
+      showFallback()
+    }
+    canvas.addEventListener('webglcontextlost', onContextLost)
     draw(0)
     if (!reduce) frame = window.requestAnimationFrame(loop)
     return () => {
@@ -298,6 +318,7 @@ export function VaultCanvas({
       observer.disconnect()
       canvas.removeEventListener('pointermove', onMove)
       canvas.removeEventListener('pointerleave', onLeave)
+      canvas.removeEventListener('webglcontextlost', onContextLost)
       window.removeEventListener('resize', resize)
       engineRef.current = null
     }

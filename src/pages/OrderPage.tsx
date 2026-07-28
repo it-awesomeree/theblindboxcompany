@@ -2,6 +2,7 @@ import { Link, Navigate } from '../lib/router'
 import { useParams } from '../lib/router-core'
 import { Notice } from '../components/Notice'
 import { StatusBadge } from '../components/StatusBadge'
+import { neutralOrderDeliveryCode, neutralOrderDeliveryStatus } from '../domain/orderStatus'
 import { boxRevealEligibility, prizeForBox } from '../domain/selectors'
 import { formatDateTime, formatMYR } from '../lib/format'
 import { useAppState } from '../state/AppStateContext'
@@ -32,7 +33,7 @@ export function OrderPage() {
             <h1>{order.id.toUpperCase()}</h1>
             <p>Created {formatDateTime(order.createdAt)} · totals, address, odds and policy are frozen snapshots.</p>
           </div>
-          <StatusBadge value={order.status} />
+          {everyBoxRevealed && <StatusBadge value={order.status} />}
         </div>
         {order.status === 'pending_payment' && (
           <Notice tone="danger">Payment is not confirmed. No prize has been assigned. <Link to={`/pay/${order.id}/${latestPayment?.id ?? 'new'}`}>Continue mock payment</Link></Notice>
@@ -51,11 +52,18 @@ export function OrderPage() {
           </div>
           <div className="panel">
             <div className="panel-heading"><div><span>02 / TIMELINE</span><h2>Order events</h2></div></div>
-            <ol className="timeline">
-              {[...order.timeline].reverse().map((entry) => (
-                <li key={entry.id}><span /><div><StatusBadge value={entry.status} /><b>{entry.label}</b><small>{formatDateTime(entry.at)}</small></div></li>
-              ))}
-            </ol>
+            {everyBoxRevealed ? (
+              <ol className="timeline">
+                {[...order.timeline].reverse().map((entry) => (
+                  <li key={entry.id}><span /><div><StatusBadge value={entry.status} /><b>{entry.label}</b><small>{formatDateTime(entry.at)}</small></div></li>
+                ))}
+              </ol>
+            ) : (
+              <div className="empty-state compact">
+                <p>Detailed delivery events stay combined until every box is revealed.</p>
+                <small>Order created {formatDateTime(order.createdAt)}</small>
+              </div>
+            )}
           </div>
         </div>
 
@@ -70,7 +78,7 @@ export function OrderPage() {
                 <article className={`box-card ${box.revealedAt ? 'revealed' : ''}`} key={box.id}>
                   <span className="box-number">BOX {String(box.number).padStart(2, '0')}</span>
                   <div className="box-icon" aria-hidden="true"><span>{box.revealedAt ? 'OPEN' : 'SEALED'}</span></div>
-                  <StatusBadge value={box.status} />
+                  {everyBoxRevealed && <StatusBadge value={box.status} />}
                   <h3>{box.revealedAt ? prize?.name : box.prizeId ? 'Paid prize sealed' : 'Waiting for payment'}</h3>
                   <p>{box.revealedAt ? `${formatMYR(prize?.valueSen ?? 0)} · ${prize?.tier}` : 'The opener cannot choose or change this allocation.'}</p>
                   {box.prizeId && reveal.eligible && (
@@ -90,7 +98,16 @@ export function OrderPage() {
                 <article className="panel claim-history-card" key={claim.id}>
                   <div className="panel-heading"><div><span>{claim.id}</span><h3>{claim.kind.replaceAll('_', ' ')}</h3></div><StatusBadge value={claim.status} /></div>
                   <p>{claim.note}</p>
-                  {everyBoxRevealed && <small>Linked record: {claim.shipmentId ?? claim.boxId}</small>}
+                  {claim.shipmentCandidateIds
+                    ? <small>Linked record: neutral order-level delivery evidence</small>
+                    : everyBoxRevealed && <small>Linked record: {claim.shipmentId ?? claim.boxId}</small>}
+                  {claim.status === 'resolved' && (
+                    <div className="notice notice-info">
+                      <b>Recorded resolution</b>
+                      <p>{claim.resolutionOutcome?.replaceAll('_', ' ')} · {claim.resolutionReference}</p>
+                      <small>{claim.resolutionNote}</small>
+                    </div>
+                  )}
                   <ol className="mini-timeline">
                     {claim.history.map((entry) => <li key={entry.id}><b>{entry.note}</b><small>{formatDateTime(entry.at)} · {entry.status}</small></li>)}
                   </ol>
@@ -103,27 +120,53 @@ export function OrderPage() {
 
         <section className="subsection">
           <div className="subsection-heading">
-            <div><span>04 / FULFILMENT</span><h2>{everyBoxRevealed ? 'Split tracking' : 'Fulfilment details locked'}</h2></div>
+            <div><span>04 / FULFILMENT</span><h2>{everyBoxRevealed ? 'Split tracking' : 'Private-prize tracking'}</h2></div>
             <Link to={`/claim/new?order=${order.id}`}>Start a demo claim</Link>
           </div>
+          {!everyBoxRevealed && (
+            <Notice>Useful delivery progress stays visible while prize-derived carrier, fulfilment kind, flags, linked boxes, and prize clues remain private.</Notice>
+          )}
           {!everyBoxRevealed ? (
-            <Notice>Fulfilment details stay private until every box in this order has been revealed.</Notice>
+            <div className="shipment-grid">
+              <article className="panel shipment-card sealed-delivery-summary">
+                <div className="panel-heading">
+                  <div>
+                    <span>ORDER DELIVERY</span>
+                    <h3>Private delivery summary</h3>
+                  </div>
+                  <StatusBadge value={neutralOrderDeliveryStatus(order.status)} />
+                </div>
+                <p className="tracking-code">{neutralOrderDeliveryCode(order.id)}</p>
+                <p>All delivery groups stay combined until every box in this order is revealed.</p>
+              </article>
+            </div>
           ) : shipments.length ? (
             <div className="shipment-grid">
               {shipments.map((shipment) => (
                 <article className="panel shipment-card" key={shipment.id}>
-                  <div className="panel-heading"><div><span>{shipment.kind}</span><h3>{shipment.carrier}</h3></div><StatusBadge value={shipment.status} /></div>
+                  <div className="panel-heading">
+                    <div>
+                      <span>{shipment.kind}</span>
+                      <h3>{shipment.carrier}</h3>
+                    </div>
+                    <StatusBadge value={shipment.status} />
+                  </div>
                   <p className="tracking-code">{shipment.trackingNumber}</p>
                   <div className="shipment-flags">
                     {shipment.insured && <span>INSURED</span>}{shipment.signatureRequired && <span>SIGNATURE REQUIRED</span>}<span>{shipment.boxIds.length} BOX</span>
                   </div>
                   <ol className="mini-timeline">
-                    {shipment.timeline.map((entry) => <li key={entry.id}><b>{entry.label}</b><small>{formatDateTime(entry.at)}</small></li>)}
+                    {shipment.timeline.map((entry) => (
+                      <li key={entry.id}>
+                        <b>{entry.label}</b>
+                        <small>{formatDateTime(entry.at)}</small>
+                      </li>
+                    ))}
                   </ol>
                 </article>
               ))}
             </div>
-          ) : <div className="empty-state compact"><p>Split fulfilment appears only after the valid paid event allocates boxes.</p></div>}
+          ) : <div className="empty-state compact"><p>Fulfilment appears only after the valid paid event allocates boxes.</p></div>}
         </section>
       </div>
     </section>

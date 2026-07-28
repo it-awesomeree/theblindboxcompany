@@ -38,22 +38,36 @@ function publishableFiles() {
   ], { encoding: 'utf8' }).trim().split('\n').filter(Boolean)
 }
 
-function main() {
-  const files = publishableFiles()
+function readFailureCode(error) {
+  return typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    typeof error.code === 'string'
+    ? ` (${error.code})`
+    : ''
+}
+
+export function scanPublishableFiles(files, readFile = readFileSync) {
   const findings = []
   let scanned = 0
   for (const file of files) {
     let body
     try {
-      const bytes = readFileSync(file)
+      const bytes = readFile(file)
       if (bytes.includes(0)) continue
       body = bytes.toString('utf8')
-    } catch {
+    } catch (error) {
+      findings.push(`${file}: could not read publishable file${readFailureCode(error)}`)
       continue
     }
     scanned += 1
     for (const name of scanText(body)) findings.push(`${file}: possible ${name}`)
   }
+  return { findings, scanned }
+}
+
+function main() {
+  const { findings, scanned } = scanPublishableFiles(publishableFiles())
   if (findings.length) {
     process.stderr.write(`Accidental-secrets check failed:\n${findings.join('\n')}\n`)
     process.exit(1)

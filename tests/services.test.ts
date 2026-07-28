@@ -1,10 +1,16 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { BOX_PRICE_SEN, DEMO_ADMIN_ID, PRIZES, type AdminSection } from '../src/domain/constants'
 import type { Role } from '../src/domain/types'
-import { DEMO_ADDRESS } from '../src/data/fixtures'
+import { createDemoState, DEMO_ADDRESS } from '../src/data/fixtures'
+import { STORAGE_KEY } from '../src/data/MockRepository'
 import { validateDemoState } from '../src/data/StateValidator'
 import { AppServices } from '../src/services/AppServices'
-import { CountingStorage, MemoryStorage, FIXED_NOW } from './helpers'
+import {
+  CountingStorage,
+  MemoryStorage,
+  FIXED_NOW,
+  makeProcessingOrderTwoPhysicalShipments,
+} from './helpers'
 
 let checkoutSequence = 0
 const nextCheckoutRequestId = () => `checkout_f${(++checkoutSequence).toString(16).padStart(31, '0')}`
@@ -153,7 +159,7 @@ describe('customer, payment, allocation and admin services', () => {
     const unsubscribe = isolated.repository.subscribe(() => { listenerCalls += 1 })
 
     clock = '2026-07-28T05:00:00.000Z'
-    const duplicate = isolated.payments.processEvent(payment.id, eventId, 'succeeded')
+    const duplicate = isolated.payments.processEvent(payment.id, eventId, 'created')
     unsubscribe()
 
     const after = isolated.repository.getSnapshot()
@@ -173,24 +179,154 @@ describe('customer, payment, allocation and admin services', () => {
     expect(listenerCalls).toBe(0)
   })
 
-  it('authorizes duplicate events before revealing their idempotent result', () => {
-    const order = checkout(services)
-    const payment = services.payments.createAttempt(order.id)
-    const eventId = payment.events[0].id
+  it('rejects changed event intent, changed source, and cross-payment reuse without writes or listeners', () => {
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const guarded = new AppServices(storage, () => FIXED_NOW)
+    const firstOrder = checkout(guarded)
+    const firstPayment = guarded.payments.createAttempt(firstOrder.id)
+    const secondOrder = checkout(guarded)
+    const secondPayment = guarded.payments.createAttempt(secondOrder.id)
+    const eventId = firstPayment.events[0].id
+    const listener = vi.fn()
+    guarded.repository.subscribe(listener)
 
-    const beforeSourceSpoof = structuredClone(services.repository.getSnapshot())
-    expect(() => services.payments.processEvent(
+    const expectConflictWithoutChange = (operation: () => unknown) => {
+      const before = structuredClone(guarded.repository.getSnapshot())
+      const writesBefore = storage.writes
+      listener.mockClear()
+      expect(operation).toThrow(expect.objectContaining({ code: 'IDEMPOTENCY_CONFLICT' }))
+      expect(guarded.repository.getSnapshot()).toEqual(before)
+      expect(storage.writes).toBe(writesBefore)
+      expect(listener).not.toHaveBeenCalled()
+    }
+
+    expectConflictWithoutChange(() =>
+      guarded.payments.processEvent(firstPayment.id, eventId, 'succeeded'),
+    )
+
+    guarded.auth.oneClick('admin')
+    expectConflictWithoutChange(() =>
+      guarded.payments.processEvent(firstPayment.id, eventId, 'created', 'admin_reconcile'),
+    )
+
+    guarded.auth.oneClick('customer')
+    expectConflictWithoutChange(() =>
+      guarded.payments.processEvent(secondPayment.id, eventId, 'created'),
+    )
+  })
+
+  it('enforces the same exact replay contract inside the cloned concurrent update path', () => {
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const isolated = new AppServices(storage, () => FIXED_NOW)
+    isolated.auth.oneClick('customer')
+    const actual = isolated.repository.getSnapshot()
+    const payment = actual.payments.find((entry) => entry.id === 'pay-unopened')!
+    const event = payment.events[0]
+    const stale = structuredClone(actual)
+    stale.payments.find((entry) => entry.id === payment.id)!.events = []
+    const snapshot = vi.spyOn(isolated.repository, 'getSnapshot')
+    const listener = vi.fn()
+    isolated.repository.subscribe(listener)
+    const before = structuredClone(actual)
+    const writesBefore = storage.writes
+
+    snapshot.mockReturnValueOnce(stale)
+    expect(isolated.payments.processEvent(payment.id, event.id, event.type, 'mock_webhook')).toMatchObject({
+      changed: false,
+      message: 'Duplicate event ignored safely.',
+    })
+    expect(isolated.repository.getSnapshot()).toEqual(before)
+    expect(storage.writes).toBe(writesBefore)
+    expect(listener).not.toHaveBeenCalled()
+
+    snapshot.mockReturnValueOnce(stale)
+    expect(() => isolated.payments.processEvent(payment.id, event.id, 'failed', 'mock_webhook')).toThrow(
+      expect.objectContaining({ code: 'IDEMPOTENCY_CONFLICT' }),
+    )
+    expect(isolated.repository.getSnapshot()).toEqual(before)
+    expect(storage.writes).toBe(writesBefore)
+    expect(listener).not.toHaveBeenCalled()
+    snapshot.mockRestore()
+  })
+
+  it('rejects concurrent changed-source and cross-payment event reuse without side effects', () => {
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const isolated = new AppServices(storage, () => FIXED_NOW)
+    const listener = vi.fn()
+    isolated.repository.subscribe(listener)
+
+    isolated.auth.oneClick('admin')
+    listener.mockClear()
+    let actual = isolated.repository.getSnapshot()
+    const originalPayment = actual.payments.find((entry) => entry.id === 'pay-unopened')!
+    const originalEvent = originalPayment.events[0]
+    let stale = structuredClone(actual)
+    stale.payments.find((entry) => entry.id === originalPayment.id)!.events = []
+    const snapshot = vi.spyOn(isolated.repository, 'getSnapshot')
+    let writesBefore = storage.writes
+    snapshot.mockReturnValueOnce(stale)
+    expect(() => isolated.payments.processEvent(
+      originalPayment.id,
+      originalEvent.id,
+      originalEvent.type,
+      'admin_reconcile',
+    )).toThrow(expect.objectContaining({ code: 'IDEMPOTENCY_CONFLICT' }))
+    expect(isolated.repository.getSnapshot()).toEqual(actual)
+    expect(storage.writes).toBe(writesBefore)
+    expect(listener).not.toHaveBeenCalled()
+
+    snapshot.mockRestore()
+    isolated.auth.oneClick('customer')
+    listener.mockClear()
+    actual = isolated.repository.getSnapshot()
+    const otherPayment = actual.payments.find((entry) =>
+      entry.id !== originalPayment.id && entry.userId === originalPayment.userId,
+    )!
+    stale = structuredClone(actual)
+    stale.payments.find((entry) => entry.id === originalPayment.id)!.events = []
+    const crossPaymentSnapshot = vi.spyOn(isolated.repository, 'getSnapshot')
+    writesBefore = storage.writes
+    crossPaymentSnapshot.mockReturnValueOnce(stale)
+    expect(() => isolated.payments.processEvent(
+      otherPayment.id,
+      originalEvent.id,
+      originalEvent.type,
+      'mock_webhook',
+    )).toThrow(expect.objectContaining({ code: 'IDEMPOTENCY_CONFLICT' }))
+    expect(isolated.repository.getSnapshot()).toEqual(actual)
+    expect(storage.writes).toBe(writesBefore)
+    expect(listener).not.toHaveBeenCalled()
+    crossPaymentSnapshot.mockRestore()
+  })
+
+  it('authorizes duplicate events before revealing their idempotent result', () => {
+    const storage = new CountingStorage()
+    const guarded = new AppServices(storage, () => FIXED_NOW)
+    const order = checkout(guarded)
+    const payment = guarded.payments.createAttempt(order.id)
+    const eventId = payment.events[0].id
+    const listener = vi.fn()
+    guarded.repository.subscribe(listener)
+
+    const beforeSourceSpoof = structuredClone(guarded.repository.getSnapshot())
+    let writesBefore = storage.writes
+    expect(() => guarded.payments.processEvent(
       payment.id,
       eventId,
-      'succeeded',
+      'created',
       'admin_reconcile',
     )).toThrow(/cannot reconcile demo payments/i)
-    expect(services.repository.getSnapshot()).toEqual(beforeSourceSpoof)
+    expect(guarded.repository.getSnapshot()).toEqual(beforeSourceSpoof)
+    expect(storage.writes).toBe(writesBefore)
+    expect(listener).not.toHaveBeenCalled()
 
-    services.repository.update((state) => {
+    guarded.repository.update((state) => {
       state.users.push({
         id: 'usr-duplicate-other',
-        name: 'Duplicate Other',
+        name: 'Duplicate Other Demo',
         email: 'duplicate.other@example.test',
         role: 'customer',
         status: 'active',
@@ -198,11 +334,15 @@ describe('customer, payment, allocation and admin services', () => {
       })
       state.sessionUserId = 'usr-duplicate-other'
     })
-    const beforeOwnershipCheck = structuredClone(services.repository.getSnapshot())
-    expect(() => services.payments.processEvent(payment.id, eventId, 'succeeded')).toThrow(
+    listener.mockClear()
+    const beforeOwnershipCheck = structuredClone(guarded.repository.getSnapshot())
+    writesBefore = storage.writes
+    expect(() => guarded.payments.processEvent(payment.id, eventId, 'created')).toThrow(
       /belongs to another fictional user/i,
     )
-    expect(services.repository.getSnapshot()).toEqual(beforeOwnershipCheck)
+    expect(guarded.repository.getSnapshot()).toEqual(beforeOwnershipCheck)
+    expect(storage.writes).toBe(writesBefore)
+    expect(listener).not.toHaveBeenCalled()
   })
 
   it('handles failure, cancellation, expiry and retry without paying the order', () => {
@@ -353,6 +493,117 @@ describe('customer, payment, allocation and admin services', () => {
     expect(services.repository.getSnapshot().boxes.find((box) => box.id === boxId)?.revealedAt).toBeTruthy()
   })
 
+  it('makes repeat reveal, duplicate open claim, and exact refund replay true storage/listener no-ops', () => {
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const guarded = new AppServices(storage, () => FIXED_NOW)
+    guarded.auth.oneClick('customer')
+    const order = checkout(guarded)
+    const payment = guarded.payments.createAttempt(order.id)
+    guarded.payments.act(payment.id, 'approve')
+    const boxId = order.boxIds[0]
+    guarded.openBox(boxId)
+    const claim = guarded.claims.submit({
+      orderId: 'ord-shipped',
+      kind: 'non_delivery',
+      shipmentId: 'shp-shipped',
+      note: 'DEMO first idempotent claim record',
+    })
+    guarded.auth.oneClick('admin')
+    const refund = guarded.payments.refund(
+      'pay-unopened',
+      1000,
+      'Confirmed exact refund replay intent',
+      'req-exact-refund-replay',
+    )
+    guarded.auth.oneClick('customer')
+
+    const listener = vi.fn()
+    guarded.repository.subscribe(listener)
+    const beforeReveal = structuredClone(guarded.repository.getSnapshot())
+    const writesBeforeReveal = storage.writes
+    const repeatedReveal = guarded.openBox(boxId)
+    expect(repeatedReveal).toMatchObject({ changed: false, box: { revealedAt: expect.any(String) } })
+    expect(guarded.repository.getSnapshot()).toEqual(beforeReveal)
+    expect(storage.writes).toBe(writesBeforeReveal)
+    expect(listener).not.toHaveBeenCalled()
+
+    const beforeClaim = structuredClone(guarded.repository.getSnapshot())
+    const writesBeforeClaim = storage.writes
+    const duplicateClaim = guarded.claims.submit({
+      orderId: 'ord-shipped',
+      kind: 'non_delivery',
+      shipmentId: 'shp-shipped',
+      note: 'DEMO second note returns the open claim',
+    })
+    expect(duplicateClaim).toMatchObject({ changed: false, data: { id: claim.data.id } })
+    expect(guarded.repository.getSnapshot()).toEqual(beforeClaim)
+    expect(storage.writes).toBe(writesBeforeClaim)
+    expect(listener).not.toHaveBeenCalled()
+
+    guarded.auth.oneClick('admin')
+    listener.mockClear()
+    const beforeRefundReplay = structuredClone(guarded.repository.getSnapshot())
+    const writesBeforeRefundReplay = storage.writes
+    const refundReplay = guarded.payments.refund(
+      'pay-unopened',
+      1000,
+      'Confirmed exact refund replay intent',
+      'req-exact-refund-replay',
+    )
+    expect(refundReplay).toMatchObject({ changed: false, payment: { id: refund.payment.id } })
+    expect(guarded.repository.getSnapshot()).toEqual(beforeRefundReplay)
+    expect(storage.writes).toBe(writesBeforeRefundReplay)
+    expect(listener).not.toHaveBeenCalled()
+
+    for (const [targetPaymentId, amount, reason] of [
+      ['pay-delivered', 1000, 'Confirmed exact refund replay intent'],
+      ['pay-unopened', 2000, 'Confirmed exact refund replay intent'],
+      ['pay-unopened', 1000, 'Confirmed changed refund replay reason'],
+    ] as const) {
+      expect(() => guarded.payments.refund(
+        targetPaymentId,
+        amount,
+        reason,
+        'req-exact-refund-replay',
+      )).toThrow(expect.objectContaining({ code: 'IDEMPOTENCY_CONFLICT' }))
+    }
+    expect(guarded.repository.getSnapshot()).toEqual(beforeRefundReplay)
+    expect(storage.writes).toBe(writesBeforeRefundReplay)
+    expect(listener).not.toHaveBeenCalled()
+
+    guarded.repository.update((state) => {
+      state.users.push({
+        id: 'usr-noop-other',
+        name: 'Noop Other Demo',
+        email: 'noop.other@example.test',
+        role: 'customer',
+        status: 'active',
+        createdAt: FIXED_NOW,
+      })
+      state.sessionUserId = 'usr-noop-other'
+    })
+    listener.mockClear()
+    const beforeUnauthorized = structuredClone(guarded.repository.getSnapshot())
+    const writesBeforeUnauthorized = storage.writes
+    expect(() => guarded.openBox(boxId)).toThrow(expect.objectContaining({ code: 'FORBIDDEN' }))
+    expect(() => guarded.claims.submit({
+      orderId: 'ord-shipped',
+      kind: 'non_delivery',
+      shipmentId: 'shp-shipped',
+      note: 'DEMO unauthorized duplicate claim attempt',
+    })).toThrow(expect.objectContaining({ code: 'ORDER_MISSING' }))
+    expect(() => guarded.payments.refund(
+      'pay-unopened',
+      1000,
+      'Confirmed exact refund replay intent',
+      'req-exact-refund-replay',
+    )).toThrow(expect.objectContaining({ code: 'FORBIDDEN' }))
+    expect(guarded.repository.getSnapshot()).toEqual(beforeUnauthorized)
+    expect(storage.writes).toBe(writesBeforeUnauthorized)
+    expect(listener).not.toHaveBeenCalled()
+  })
+
   it('keeps reveal exactly-once and shipment state intact when one box opens before delivery and one after', () => {
     const order = checkout(services, 2)
     const payment = services.payments.createAttempt(order.id)
@@ -501,7 +752,12 @@ describe('customer, payment, allocation and admin services', () => {
     expect(snapshot.orders.find((entry) => entry.id === order.id)?.status).toBe('refunded')
     expect(snapshot.boxes.find((box) => box.id === boxId)?.prizeId).toBe(opened.prizeId)
     expect(snapshot.series[0].inventory.reduce((sum, entry) => sum + entry.assigned, 0)).toBe(assignedBefore)
-    const duplicate = services.payments.refund(payment.id, payment.amountSen, 'duplicate', 'req-refund-once')
+    const duplicate = services.payments.refund(
+      payment.id,
+      payment.amountSen,
+      'Test full refund retaining allocation',
+      'req-refund-once',
+    )
     expect(duplicate.changed).toBe(false)
     services.auth.oneClick('customer')
     const retainedReveal = services.openBox(boxId)
@@ -558,28 +814,183 @@ describe('customer, payment, allocation and admin services', () => {
     expect(() => validateDemoState(snapshot)).not.toThrow()
   })
 
-  it('preserves shipped history during dispute and resumes only after explicit resolution', () => {
-    const order = checkout(services)
-    const payment = services.payments.createAttempt(order.id)
-    services.payments.act(payment.id, 'approve')
-    const shipment = services.repository.getSnapshot().shipments.find((entry) => entry.orderId === order.id)!
+  it('records a delivered carrier outcome during dispute without reopening the financial hold', () => {
+    services.repository.update((state) => {
+      state.boxes.find((box) => box.id === 'box-shipped-01')!.revealedAt = undefined
+    })
+    const order = services.repository.getSnapshot().orders.find((entry) => entry.id === 'ord-shipped')!
+    const payment = services.repository.getSnapshot().payments.find((entry) => entry.id === 'pay-shipped')!
+    const shipment = services.repository.getSnapshot().shipments.find((entry) => entry.id === 'shp-shipped')!
     services.auth.oneClick('admin')
-    for (const status of ['picking', 'packed', 'label_created', 'shipped'] as const) {
-      services.fulfilment.advance(shipment.id, status, `Confirmed dispute setup ${status}`)
-    }
     services.payments.dispute(payment.id, 'Confirmed fictional payment dispute hold', 'evt-dispute-hold')
     let snapshot = services.repository.getSnapshot()
     expect(snapshot.orders.find((entry) => entry.id === order.id)?.status).toBe('disputed')
     expect(snapshot.shipments.find((entry) => entry.id === shipment.id)?.status).toBe('shipped')
     expect(snapshot.boxes.find((box) => box.id === order.boxIds[0])?.status).toBe('on_hold')
-    expect(() => services.fulfilment.advance(shipment.id, 'delivered', 'Attempt delivery during dispute')).toThrow(/stopped/i)
+    services.fulfilment.advance(shipment.id, 'delivered', 'Carrier delivered while dispute remained open')
+    snapshot = services.repository.getSnapshot()
+    expect(snapshot.orders.find((entry) => entry.id === order.id)?.status).toBe('disputed')
+    expect(snapshot.shipments.find((entry) => entry.id === shipment.id)?.status).toBe('delivered')
+    expect(snapshot.boxes.find((box) => box.id === order.boxIds[0])?.status).toBe('on_hold')
     services.payments.resolveDispute(payment.id, 'merchant_won', 'Confirmed dispute resolution restoring fulfilment', 'evt-dispute-resolved')
     snapshot = services.repository.getSnapshot()
-    expect(snapshot.orders.find((entry) => entry.id === order.id)?.status).toBe('processing')
-    expect(snapshot.boxes.find((box) => box.id === order.boxIds[0])?.status).toBe('fulfillment_pending')
-    services.fulfilment.advance(shipment.id, 'delivered', 'Confirmed delivery after dispute resolution')
+    expect(snapshot.orders.find((entry) => entry.id === order.id)?.status).toBe('fulfilled')
+    expect(snapshot.boxes.find((box) => box.id === order.boxIds[0])?.status).toBe('fulfilled')
     services.auth.oneClick('customer')
     expect(services.openBox(order.boxIds[0]).changed).toBe(true)
+  })
+
+  it.each(['delivered', 'failed_delivery', 'lost', 'returned'] as const)(
+    'records legal %s carrier evidence after refund while keeping finance stopped and sealed boxes held',
+    (outcome) => {
+      const held = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+      held.repository.update((state) => {
+        state.boxes.find((box) => box.id === 'box-shipped-01')!.revealedAt = undefined
+      })
+      held.auth.oneClick('admin')
+      const payment = held.repository.getSnapshot().payments.find((entry) => entry.id === 'pay-shipped')!
+      held.payments.refund(
+        payment.id,
+        payment.amountSen,
+        `Confirmed refund before ${outcome} carrier evidence`,
+        `req-refund-carrier-${outcome}`,
+      )
+      held.fulfilment.advance(
+        'shp-shipped',
+        outcome,
+        `Carrier recorded ${outcome} after financial stop`,
+      )
+      const snapshot = held.repository.getSnapshot()
+      expect(snapshot.orders.find((entry) => entry.id === 'ord-shipped')?.status).toBe('refunded')
+      expect(snapshot.payments.find((entry) => entry.id === 'pay-shipped')?.status).toBe('refunded')
+      expect(snapshot.shipments.find((entry) => entry.id === 'shp-shipped')?.status).toBe(outcome)
+      expect(snapshot.boxes.find((entry) => entry.id === 'box-shipped-01')?.status).toBe('on_hold')
+      expect(() => held.fulfilment.setTracking(
+        'shp-shipped',
+        'Demo Changed Carrier',
+        'DEMO-CHANGED-AFTER-HOLD',
+        'Attempt tracking edit after hold',
+      )).toThrow(/financial hold/i)
+      expect(() => validateDemoState(snapshot)).not.toThrow()
+    },
+  )
+
+  it.each(['refund', 'dispute'] as const)(
+    'allows failed-delivery reship and delivery evidence during a %s hold without reopening finance or boxes',
+    (hold) => {
+      const held = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+      held.repository.update((state) => {
+        state.boxes.find((box) => box.id === 'box-failed-01')!.revealedAt = undefined
+      })
+      held.auth.oneClick('admin')
+      const payment = held.repository.getSnapshot().payments.find((entry) => entry.id === 'pay-failed')!
+      if (hold === 'refund') {
+        held.payments.refund(
+          payment.id,
+          payment.amountSen,
+          'Confirmed refund before failed-delivery carrier retry',
+          'req-refund-failed-delivery-retry',
+        )
+      } else {
+        held.payments.dispute(
+          payment.id,
+          'Confirmed dispute before failed-delivery carrier retry',
+          'evt-dispute-failed-delivery-retry',
+        )
+      }
+
+      const stopped = structuredClone(held.repository.getSnapshot())
+      const stoppedOrder = stopped.orders.find((entry) => entry.id === 'ord-failed')!
+      const stoppedPayment = stopped.payments.find((entry) => entry.id === payment.id)!
+      const stoppedBoxes = stopped.boxes.filter((box) => stoppedOrder.boxIds.includes(box.id))
+
+      held.fulfilment.advance(
+        'shp-failed',
+        'shipped',
+        'Carrier retried the failed fictional delivery',
+      )
+      held.fulfilment.advance(
+        'shp-failed',
+        'delivered',
+        'Carrier completed the retried fictional delivery',
+      )
+
+      const snapshot = held.repository.getSnapshot()
+      expect(snapshot.shipments.find((entry) => entry.id === 'shp-failed')?.timeline.slice(-3).map((entry) => entry.status)).toEqual([
+        'failed_delivery',
+        'shipped',
+        'delivered',
+      ])
+      expect(snapshot.orders.find((entry) => entry.id === stoppedOrder.id)).toEqual(stoppedOrder)
+      expect(snapshot.payments.find((entry) => entry.id === stoppedPayment.id)).toEqual(stoppedPayment)
+      expect(snapshot.boxes.filter((box) => stoppedOrder.boxIds.includes(box.id))).toEqual(stoppedBoxes)
+      expect(stoppedBoxes.every((box) => box.status === 'on_hold')).toBe(true)
+      expect(() => validateDemoState(snapshot)).not.toThrow()
+    },
+  )
+
+  it('blocks non-carrier hold paths, cancelled restarts, tracking edits, and illegal delivered outcomes', () => {
+    const held = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    held.repository.update((state) => {
+      state.boxes.find((box) => box.id === 'box-failed-01')!.revealedAt = undefined
+    })
+    held.auth.oneClick('admin')
+    const payment = held.repository.getSnapshot().payments.find((entry) => entry.id === 'pay-failed')!
+    held.payments.refund(
+      payment.id,
+      payment.amountSen,
+      'Confirmed refund before illegal carrier path checks',
+      'req-refund-illegal-carrier-paths',
+    )
+    const before = structuredClone(held.repository.getSnapshot())
+
+    expect(() => held.fulfilment.advance(
+      'shp-failed',
+      'delivered',
+      'Attempted failed delivery jump',
+    )).toThrow(/graph-legal physical carrier evidence/i)
+    expect(() => held.fulfilment.advance(
+      'shp-refunded',
+      'unfulfilled',
+      'Attempted cancelled restart',
+    )).toThrow(/tracking, restarts, fulfilment progress/i)
+    expect(() => held.fulfilment.setTracking(
+      'shp-failed',
+      'Demo Changed Carrier',
+      'DEMO-HELD-TRACKING-CHANGE',
+      'Attempted tracking change',
+    )).toThrow(/financial hold/i)
+    expect(held.repository.getSnapshot()).toEqual(before)
+
+    held.fulfilment.advance('shp-failed', 'shipped', 'Carrier retried the held delivery')
+    held.fulfilment.advance('shp-failed', 'delivered', 'Carrier delivered the held retry')
+    const delivered = structuredClone(held.repository.getSnapshot())
+    expect(() => held.fulfilment.advance(
+      'shp-failed',
+      'lost',
+      'Attempted impossible post-delivery loss',
+    )).toThrow(/graph-legal physical carrier evidence/i)
+    expect(held.repository.getSnapshot()).toEqual(delivered)
+  })
+
+  it('does not treat digital fulfilment as physical carrier evidence during a financial hold', () => {
+    const held = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    held.auth.oneClick('admin')
+    for (const status of ['picking', 'packed', 'label_created', 'shipped'] as const) {
+      held.fulfilment.advance('shp-digital', status, `Confirmed digital hold setup ${status}`)
+    }
+    held.payments.dispute(
+      'pay-processing',
+      'Confirmed dispute before digital carrier evidence attempt',
+      'evt-dispute-digital-carrier-evidence',
+    )
+    const before = structuredClone(held.repository.getSnapshot())
+    expect(() => held.fulfilment.advance(
+      'shp-digital',
+      'delivered',
+      'Attempted digital carrier delivery evidence',
+    )).toThrow(/physical carrier evidence/i)
+    expect(held.repository.getSnapshot()).toEqual(before)
   })
 
   it('resumes only shipments stopped by that dispute and keeps earlier cancellations held', () => {
@@ -749,6 +1160,209 @@ describe('customer, payment, allocation and admin services', () => {
     expect(damage.data.requestId).toMatch(/^req-claim-/)
   })
 
+  it('stores sealed delivery claims at order level without allowing exact shipment or sealed value-floor links', () => {
+    const sealed = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    sealed.repository.update((state) => {
+      state.boxes.find((box) => box.id === 'box-shipped-01')!.revealedAt = undefined
+      state.boxes.find((box) => box.id === 'box-delivered-01')!.revealedAt = undefined
+    })
+    sealed.auth.oneClick('customer')
+    expect(() => sealed.claims.submit({
+      orderId: 'ord-shipped',
+      kind: 'non_delivery',
+      shipmentId: 'shp-shipped',
+      note: 'DEMO sealed exact shipment attempt',
+    })).toThrow(/neutral order-level delivery evidence/i)
+    const nonDelivery = sealed.claims.submit({
+      orderId: 'ord-shipped',
+      kind: 'non_delivery',
+      orderLevelDelivery: true,
+      note: 'DEMO sealed shipment is overdue and missing',
+    })
+    const damage = sealed.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'damage',
+      orderLevelDelivery: true,
+      note: 'DEMO sealed delivered carton is damaged',
+    })
+    expect(nonDelivery.changed).toBe(true)
+    expect(damage.changed).toBe(true)
+    expect(nonDelivery.data).not.toHaveProperty('shipmentCandidateIds')
+    expect(damage.data).not.toHaveProperty('shipmentCandidateIds')
+    expect(sealed.repository.getSnapshot().claims).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'non_delivery',
+        shipmentId: undefined,
+        shipmentCandidateIds: ['shp-shipped'],
+      }),
+      expect.objectContaining({
+        kind: 'damage',
+        shipmentId: undefined,
+        shipmentCandidateIds: ['shp-delivered'],
+      }),
+    ]))
+    expect(() => sealed.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'value_floor',
+      boxId: 'box-delivered-01',
+      note: 'DEMO sealed value-floor attempt',
+    })).toThrow(/revealed box/i)
+    expect(() => validateDemoState(sealed.repository.getSnapshot())).not.toThrow()
+  })
+
+  it('rejects a customer return after delivery as non-delivery evidence without changing state', () => {
+    services.auth.oneClick('admin')
+    services.fulfilment.advance(
+      'shp-delivered',
+      'returned',
+      'Confirmed physical return for non-delivery evidence',
+    )
+    services.auth.oneClick('customer')
+    const before = structuredClone(services.repository.getSnapshot())
+
+    expect(() => services.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'non_delivery',
+      shipmentId: 'shp-delivered',
+      note: 'DEMO customer return after confirmed delivery',
+    })).toThrow(/customer return after delivery is not non-delivery evidence/i)
+    expect(services.repository.getSnapshot()).toEqual(before)
+  })
+
+  it('accepts returned-to-sender physical evidence when no delivered event exists', () => {
+    services.auth.oneClick('admin')
+    services.fulfilment.advance(
+      'shp-failed',
+      'returned',
+      'Confirmed returned-to-sender non-delivery evidence',
+    )
+    services.auth.oneClick('customer')
+    const result = services.claims.submit({
+      orderId: 'ord-failed',
+      kind: 'non_delivery',
+      shipmentId: 'shp-failed',
+      note: 'DEMO returned-to-sender parcel never reached the customer',
+    })
+    expect(result).toMatchObject({
+      changed: true,
+      data: { kind: 'non_delivery', shipmentId: 'shp-failed' },
+    })
+    expect(() => validateDemoState(services.repository.getSnapshot())).not.toThrow()
+  })
+
+  it('does not treat a returned digital fulfilment as physical non-delivery evidence', () => {
+    services.auth.oneClick('customer')
+    services.openBox('box-processing-02')
+    services.auth.oneClick('admin')
+    for (const status of ['picking', 'packed', 'label_created', 'shipped', 'returned'] as const) {
+      services.fulfilment.advance(
+        'shp-digital',
+        status,
+        `Confirmed digital non-delivery guard setup ${status}`,
+      )
+    }
+    services.auth.oneClick('customer')
+    const before = structuredClone(services.repository.getSnapshot())
+
+    expect(() => services.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'non_delivery',
+      shipmentId: 'shp-digital',
+      note: 'DEMO digital fulfilment cannot be a physical non-delivery',
+    })).toThrow(/digital fulfilment cannot have physical non-delivery/i)
+    expect(services.repository.getSnapshot()).toEqual(before)
+  })
+
+  it('stores every eligible sealed physical shipment canonically and keeps duplicate creation harmless', () => {
+    const multi = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    makeProcessingOrderTwoPhysicalShipments(multi)
+    multi.auth.oneClick('admin')
+    for (const [shipmentId, path] of [
+      ['shp-processing', ['packed', 'label_created', 'shipped', 'failed_delivery']],
+      ['shp-digital', ['picking', 'packed', 'label_created', 'shipped', 'failed_delivery']],
+    ] as const) {
+      for (const status of path) {
+        multi.fulfilment.advance(shipmentId, status, `Confirmed canonical claim setup ${status}`)
+      }
+    }
+    multi.repository.update((state) => {
+      state.boxes.find((box) => box.id === 'box-processing-01')!.revealedAt = undefined
+    })
+    multi.auth.oneClick('customer')
+    expect(() => multi.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'non_delivery',
+      shipmentId: 'shp-processing',
+      note: 'DEMO exact sealed parcel targeting attempt',
+    })).toThrow(/neutral order-level delivery evidence/i)
+    const refundedBefore = multi.repository.getSnapshot().payments.reduce(
+      (sum, payment) => sum + payment.refundedSen,
+      0,
+    )
+    const first = multi.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'non_delivery',
+      orderLevelDelivery: true,
+      note: 'DEMO neutral multi-shipment non-delivery evidence',
+    })
+    const beforeDuplicate = structuredClone(multi.repository.getSnapshot())
+    const duplicate = multi.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'non_delivery',
+      orderLevelDelivery: true,
+      note: 'DEMO repeated neutral multi-shipment submission',
+    })
+    const snapshot = multi.repository.getSnapshot()
+
+    expect(first.data).not.toHaveProperty('shipmentCandidateIds')
+    expect(duplicate).toMatchObject({ changed: false, data: { id: first.data.id } })
+    expect(snapshot).toEqual(beforeDuplicate)
+    expect(snapshot.claims.at(-1)).toMatchObject({
+      shipmentId: undefined,
+      shipmentCandidateIds: ['shp-digital', 'shp-processing'],
+    })
+    expect(snapshot.audits.at(-1)).toMatchObject({
+      action: 'claim.submitted',
+      after: {
+        shipmentId: undefined,
+        shipmentCandidateIds: ['shp-digital', 'shp-processing'],
+        refundCreated: false,
+      },
+    })
+    expect(multi.claims.listMine().at(-1)).not.toHaveProperty('shipmentCandidateIds')
+    expect(snapshot.payments.reduce((sum, payment) => sum + payment.refundedSen, 0)).toBe(refundedBefore)
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+  })
+
+  it('returns an existing order-level claim when a later exact shipment scope overlaps it', () => {
+    let now = FIXED_NOW
+    const scoped = new AppServices(new MemoryStorage(), () => now)
+    scoped.repository.update((state) => {
+      state.boxes.find((box) => box.id === 'box-shipped-01')!.revealedAt = undefined
+    })
+    scoped.auth.oneClick('customer')
+    const orderLevel = scoped.claims.submit({
+      orderId: 'ord-shipped',
+      kind: 'non_delivery',
+      orderLevelDelivery: true,
+      note: 'DEMO sealed order-level overlap evidence',
+    })
+    now = '2026-07-28T05:00:00.000Z'
+    scoped.openBox('box-shipped-01')
+    const beforeExactRetry = structuredClone(scoped.repository.getSnapshot())
+    const exactRetry = scoped.claims.submit({
+      orderId: 'ord-shipped',
+      kind: 'non_delivery',
+      shipmentId: 'shp-shipped',
+      note: 'DEMO later exact scope overlaps the open claim',
+    })
+
+    expect(exactRetry).toMatchObject({ changed: false, data: { id: orderLevel.data.id } })
+    expect(exactRetry.data).not.toHaveProperty('shipmentCandidateIds')
+    expect(scoped.repository.getSnapshot()).toEqual(beforeExactRetry)
+    expect(scoped.repository.getSnapshot().claims).toHaveLength(1)
+  })
+
   it('requires explicit DEMO customer notes and rejects likely contact details without changing state', () => {
     services.auth.oneClick('customer')
     const submit = (note: string) => services.claims.submit({
@@ -783,10 +1397,19 @@ describe('customer, payment, allocation and admin services', () => {
     services.auth.oneClick('admin')
     services.claims.review(claim.id, 'acknowledge', 'Support acknowledged fictional evidence')
     services.claims.review(claim.id, 'approve', 'Support approved fictional eligibility')
-    services.claims.review(claim.id, 'resolve', 'Support resolved fictional replacement path')
+    services.claims.review(
+      claim.id,
+      'resolve',
+      'Support resolved fictional replacement path',
+      { outcome: 'replacement_authorized', reference: `DEMO-${claim.id.toUpperCase()}` },
+    )
     const snapshot = services.repository.getSnapshot()
     const resolved = snapshot.claims.find((entry) => entry.id === claim.id)!
     expect(resolved.status).toBe('resolved')
+    expect(resolved).toMatchObject({
+      resolutionOutcome: 'replacement_authorized',
+      resolutionReference: `DEMO-${claim.id.toUpperCase()}`,
+    })
     expect(resolved.history.map((entry) => entry.status)).toEqual(['submitted', 'reviewing', 'approved', 'resolved'])
     expect(snapshot.audits.filter((entry) => entry.targetId === claim.id).map((entry) => entry.action)).toEqual([
       'claim.submitted',
@@ -798,13 +1421,69 @@ describe('customer, payment, allocation and admin services', () => {
     expect(() => services.claims.review(claim.id, 'resolve', 'Duplicate invalid resolution attempt')).toThrow(/cannot resolve/i)
   })
 
+  it('requires structured resolution evidence and verifies refund references on the same order', () => {
+    services.auth.oneClick('customer')
+    const claim = services.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'damage',
+      shipmentId: 'shp-delivered',
+      note: 'DEMO delivered damage needs structured resolution',
+    }).data
+    services.auth.oneClick('admin')
+    services.claims.review(claim.id, 'acknowledge', 'Support acknowledged the fictional damage evidence')
+    services.claims.review(claim.id, 'approve', 'Support approved the fictional damage eligibility')
+    const beforeMissing = structuredClone(services.repository.getSnapshot())
+    expect(() => services.claims.review(
+      claim.id,
+      'resolve',
+      'Resolution text without structured evidence',
+    )).toThrow(expect.objectContaining({ code: 'RESOLUTION_EVIDENCE_REQUIRED' }))
+    expect(services.repository.getSnapshot()).toEqual(beforeMissing)
+    expect(() => services.claims.review(
+      claim.id,
+      'resolve',
+      'Replacement note is sufficiently descriptive',
+      { outcome: 'replacement_authorized', reference: 'REAL-REF-001' },
+    )).toThrow(/DEMO-/i)
+
+    services.payments.refund(
+      'pay-delivered',
+      1000,
+      'Confirmed audited refund for claim resolution',
+      'req-claim-resolution-refund',
+    )
+    const refundEvent = services.repository.getSnapshot().payments
+      .find((payment) => payment.id === 'pay-delivered')!
+      .events.find((event) => event.requestId === 'req-claim-resolution-refund')!
+    const result = services.claims.review(
+      claim.id,
+      'resolve',
+      'Recorded the separate audited demo refund as resolution evidence',
+      { outcome: 'refund_recorded', reference: refundEvent.id },
+    )
+    expect(result.data).toMatchObject({
+      status: 'resolved',
+      resolutionOutcome: 'refund_recorded',
+      resolutionReference: refundEvent.id,
+    })
+    expect(services.repository.getSnapshot().audits.find((audit) => audit.eventId === refundEvent.id)).toMatchObject({
+      targetId: 'pay-delivered',
+      action: 'payment.partially_refunded',
+    })
+    expect(() => validateDemoState(services.repository.getSnapshot())).not.toThrow()
+  })
+
   it('treats a refund request identity as global across payments', () => {
     services.auth.oneClick('admin')
     const [first, second] = services.repository.getSnapshot().payments.filter((payment) => payment.status === 'succeeded')
     const secondBefore = second.refundedSen
     services.payments.refund(first.id, 1000, 'First global request use', 'req-global-refund-once')
-    const replay = services.payments.refund(second.id, 1000, 'Replayed on another payment', 'req-global-refund-once')
-    expect(replay.changed).toBe(false)
+    expect(() => services.payments.refund(
+      second.id,
+      1000,
+      'Replayed on another payment',
+      'req-global-refund-once',
+    )).toThrow(expect.objectContaining({ code: 'IDEMPOTENCY_CONFLICT' }))
     expect(services.repository.getSnapshot().payments.find((payment) => payment.id === second.id)?.refundedSen).toBe(secondBefore)
   })
 
@@ -842,7 +1521,7 @@ describe('customer, payment, allocation and admin services', () => {
     services.repository.update((state) => {
       state.users.push({
         id: 'usr-summary-other',
-        name: 'Summary Other',
+        name: 'Summary Other Demo',
         email: 'summary@example.test',
         role: 'customer',
         status: 'active',
@@ -871,6 +1550,56 @@ describe('customer, payment, allocation and admin services', () => {
     services.auth.oneClick('admin')
     expect(services.admin.dashboard().users).toBeGreaterThan(1)
     expect(() => services.admin.setUserStatus(DEMO_ADMIN_ID, 'suspended', 'Trying to suspend self')).toThrow(/cannot suspend themselves/i)
+  })
+
+  it('allows only a super admin to suspend or reactivate another super admin', () => {
+    services.repository.update((state) => {
+      state.users.find((user) => user.id === 'usr-support')!.role = 'admin'
+      state.users.push(
+        {
+          id: 'usr-super-peer',
+          name: 'Peer Super Admin',
+          email: 'peer.super@demo.local',
+          role: 'super_admin',
+          status: 'active',
+          createdAt: FIXED_NOW,
+        },
+        {
+          id: 'usr-super-suspended',
+          name: 'Suspended Super Admin',
+          email: 'suspended.super@demo.local',
+          role: 'super_admin',
+          status: 'suspended',
+          createdAt: FIXED_NOW,
+        },
+      )
+      state.sessionUserId = 'usr-support'
+    })
+    const beforeBlockedChanges = structuredClone(services.repository.getSnapshot())
+
+    expect(() => services.admin.setUserStatus(
+      'usr-super-peer',
+      'suspended',
+      'Ordinary admin attempted suspension',
+    )).toThrow(expect.objectContaining({ code: 'FORBIDDEN' }))
+    expect(() => services.admin.setUserStatus(
+      'usr-super-suspended',
+      'active',
+      'Ordinary admin attempted reactivation',
+    )).toThrow(expect.objectContaining({ code: 'FORBIDDEN' }))
+    expect(services.repository.getSnapshot()).toEqual(beforeBlockedChanges)
+
+    services.auth.oneClick('admin')
+    expect(services.admin.setUserStatus(
+      'usr-super-peer',
+      'suspended',
+      'Super admin confirmed peer suspension',
+    ).status).toBe('suspended')
+    expect(services.admin.setUserStatus(
+      'usr-super-peer',
+      'active',
+      'Super admin confirmed peer reactivation',
+    ).status).toBe('active')
   })
 
   it('counts captured disputes and keeps paid volume gross through partial and full refunds', () => {

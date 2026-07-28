@@ -1,5 +1,6 @@
 import { Link, Navigate } from '../lib/router'
 import { StatusBadge } from '../components/StatusBadge'
+import { neutralOrderDeliveryCode, neutralOrderDeliveryStatus } from '../domain/orderStatus'
 import { boxRevealEligibility, prizeForBox } from '../domain/selectors'
 import { formatDateTime, formatMYR } from '../lib/format'
 import { useAppState } from '../state/AppStateContext'
@@ -13,6 +14,9 @@ export function AccountPage() {
   const boxes = state.boxes.filter((entry) => entry.ownerId === user.id)
   const unopened = boxes.filter((box) => box.prizeId && !box.revealedAt && boxRevealEligibility(state, box).eligible)
   const held = boxes.filter((box) => box.prizeId && !box.revealedAt && !boxRevealEligibility(state, box).eligible)
+  const ordersInTransit = orders.filter((order) =>
+    state.shipments.some((shipment) => shipment.orderId === order.id && shipment.status === 'shipped'),
+  )
 
   return (
     <section className="route-page">
@@ -25,7 +29,7 @@ export function AccountPage() {
           <article><span>ORDERS</span><b>{orders.length}</b><small>all local demo records</small></article>
           <article><span>UNOPENED</span><b>{unopened.length}</b><small>{held.length} separately on hold</small></article>
           <article><span>OPENED</span><b>{boxes.filter((box) => box.revealedAt).length}</b><small>immutable reveals</small></article>
-          <article><span>IN TRANSIT</span><b>{state.shipments.filter((shipment) => orders.some((order) => order.id === shipment.orderId) && shipment.status === 'shipped').length}</b><small>fictional tracking</small></article>
+          <article><span>IN TRANSIT</span><b>{ordersInTransit.length}</b><small>fictional orders</small></article>
         </div>
         {unopened.length > 0 && (
           <section className="attention-strip">
@@ -39,22 +43,43 @@ export function AccountPage() {
             {orders.map((order) => {
               const payment = state.payments.find((entry) => order.paymentIds.includes(entry.id) && ['succeeded', 'partially_refunded', 'refunded', 'disputed'].includes(entry.status))
               const orderBoxes = order.boxIds.map((id) => state.boxes.find((box) => box.id === id)).filter(Boolean)
-              const shipment = state.shipments.find((entry) => entry.orderId === order.id)
+              const shipments = state.shipments.filter((entry) => entry.orderId === order.id)
+              const everyBoxRevealed =
+                orderBoxes.length === order.boxIds.length &&
+                orderBoxes.length > 0 &&
+                orderBoxes.every((box) => Boolean(box?.revealedAt))
               return (
                 <article className="panel account-order" key={order.id}>
-                  <header><div><span>{formatDateTime(order.createdAt)}</span><h3>{order.id.toUpperCase()}</h3></div><StatusBadge value={order.status} /></header>
+                  <header>
+                    <div><span>{formatDateTime(order.createdAt)}</span><h3>{order.id.toUpperCase()}</h3></div>
+                    {everyBoxRevealed && <StatusBadge value={order.status} />}
+                  </header>
                   <div className="account-order-grid">
                     <div><span>PAYMENT</span>{payment ? <><StatusBadge value={payment.status} />{payment.status === 'disputed' && <small>Captured · under dispute</small>}</> : <small>Not confirmed</small>}</div>
                     <div><span>BOXES</span><b>{orderBoxes.length} total · {orderBoxes.filter((box) => box?.revealedAt).length} opened</b></div>
-                    <div><span>FULFILMENT</span>{shipment ? <StatusBadge value={shipment.status} /> : <small>Not queued</small>}</div>
+                    <div>
+                      <span>FULFILMENT</span>
+                      {everyBoxRevealed
+                        ? shipments.length > 0
+                          ? <>{shipments.map((shipment, index) => <span key={shipment.id}>Record {index + 1}: <StatusBadge value={shipment.status} /></span>)}</>
+                          : <small>Not queued</small>
+                        : (
+                          <div className="sealed-delivery-summary">
+                            <b className="tracking-code">{neutralOrderDeliveryCode(order.id)}</b>
+                            <StatusBadge value={neutralOrderDeliveryStatus(order.status)} />
+                          </div>
+                        )}
+                    </div>
                     <div><span>TOTAL</span><b>{formatMYR(order.snapshot.totals.totalSen)}</b></div>
                   </div>
-                  <div className="account-prizes">
-                    {orderBoxes.filter((box) => box?.revealedAt).map((box) => {
-                      const prize = prizeForBox(state, box)
-                      return <span key={box!.id}>{prize?.shortName} · {box!.manifestId}</span>
-                    })}
-                  </div>
+                  {everyBoxRevealed && (
+                    <div className="account-prizes">
+                      {orderBoxes.map((box) => {
+                        const prize = prizeForBox(state, box)
+                        return <span key={box!.id}>{prize?.shortName} · {box!.manifestId}</span>
+                      })}
+                    </div>
+                  )}
                   <Link className="button button-ghost" to={`/order/${order.id}`}>View full record</Link>
                 </article>
               )

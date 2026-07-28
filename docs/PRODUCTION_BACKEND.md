@@ -40,7 +40,8 @@ Important uniqueness/check rules include:
 - one prize assignment per `box_id`.
 - one reveal record per `box_id`.
 - `(series_id, allocation_serial)` unique.
-- refund request ID unique.
+- refund request ID globally unique, with normalized target payment, amount and
+  reason stored so exact replays are no-ops and changed intent is a conflict.
 - shipment event request ID unique.
 - quantities and money non-negative; declared prize value at least 10,000 sen
   for a published RM100-floor series.
@@ -59,6 +60,9 @@ reconciliation ledger remain the source of truth.
 Full refund, accepted cancellation and dispute handling must update the payment,
 order, eligible unshipped fulfilment and unopened-box holds in one database
 transaction. Already shipped/delivered events remain append-only history.
+While an order remains refunded or disputed, legal carrier outcomes for an
+already-shipped record may still be appended without reopening fulfilment,
+unlocking tracking edits or releasing unopened boxes.
 Resuming a dispute hold needs its own authorized resolution command and audit
 record; it must not be a generic status edit.
 
@@ -153,15 +157,29 @@ later application constant or draft edit cannot rewrite allocation meaning.
 
 ## Production claims
 
-Claims need authenticated ownership, type-specific eligibility and a direct
-shipment/box foreign key. Use a unique open-claim key for order, type and linked
-record. Damage requires delivered physical goods; non-delivery needs a reviewed
-overdue shipment/exception rule; value-floor review needs an immutable reveal.
+Claims need authenticated ownership, type-specific eligibility and exactly one
+evidence scope: a value-floor box foreign key, an exact shipment foreign key, or
+a nonempty canonical order-level candidate relation. Use overlap-safe unique
+open-claim keys for order, type and evidence scope. Damage requires delivered
+physical goods. Non-delivery may use a reviewed overdue or returned-to-sender
+exception only when no delivered event existed by claim creation; a
+post-delivery customer return is never non-delivery. Value-floor review needs an
+immutable reveal.
 
 Store append-only claim events for acknowledge, approve, reject and resolve,
-including actor, note and UTC time. Claim approval must not silently issue
-money. A separate finance permission, idempotency key and refund transaction are
-required.
+including actor, note and UTC time. Delivery claims must not require customers
+to reveal unrelated prizes. While any box remains sealed, show exactly one
+neutral order-level option and store every eligible physical shipment in a
+sorted candidate relation captured at submission, without choosing an arbitrary
+exact shipment. Do not expose the candidate IDs, candidate count, shipment IDs,
+carrier, kind, flags, prize or per-split status to the customer. Exact shipment
+claims unlock only after every box is revealed; authorized claim staff may
+inspect candidate evidence. Resolution needs a finite outcome and reference. A
+recorded-refund outcome must identify a real, audited refund on a payment for
+the same order; replacement, RMA or no-remedy outcomes need their own clearly
+non-production reference and descriptive note. Claim approval or resolution
+must not silently issue money. A separate finance permission, idempotency key
+and refund transaction are required.
 
 ## Roles and admin security
 

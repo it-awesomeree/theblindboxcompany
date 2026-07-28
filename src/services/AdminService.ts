@@ -66,6 +66,11 @@ export class AdminService {
       assertRole(actor, ['admin', 'super_admin'], `${status === 'active' ? 'reactivate' : 'suspend'} users`)
       const target = state.users.find((user) => user.id === userId)
       assert(target, 'Demo user was not found.', 'USER_MISSING')
+      assert(
+        target.role !== 'super_admin' || actor.role === 'super_admin',
+        'Only a super admin can change another super admin.',
+        'FORBIDDEN',
+      )
       assert(!(status === 'suspended' && target.id === actor.id), 'Admins cannot suspend themselves.', 'SELF_SUSPENSION')
       const cleanReason = sanitizeText(reason, 220)
       assert(cleanReason.length >= 6, 'Give a short reason for this sensitive demo action.', 'REASON_REQUIRED')

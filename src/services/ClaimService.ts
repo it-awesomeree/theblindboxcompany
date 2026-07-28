@@ -6,9 +6,14 @@ import {
   sanitizeText,
   validateDemoClaimNote,
 } from '../domain/guards'
+import {
+  shipmentClaimEligibility,
+  valueFloorClaimEligibility,
+} from '../domain/claimEligibility'
 import type {
   Claim,
   ClaimKind,
+  ClaimResolutionOutcome,
   ClaimStatus,
   DemoState,
 } from '../domain/types'
@@ -20,13 +25,18 @@ export interface SubmitClaimInput {
   kind: ClaimKind
   note: string
   shipmentId?: string
+  orderLevelDelivery?: boolean
   boxId?: string
 }
 
 export type ClaimReviewAction = 'acknowledge' | 'approve' | 'reject' | 'resolve'
 
 const OPEN_CLAIM_STATUSES: ClaimStatus[] = ['submitted', 'reviewing', 'approved']
-const SHIPPED_OVERDUE_MS = 3 * 24 * 60 * 60 * 1000
+
+export interface ClaimResolutionInput {
+  outcome: ClaimResolutionOutcome
+  reference: string
+}
 
 function nextClaimIdentity(state: DemoState, seed: string) {
   const sequence = state.nextSequence
@@ -39,8 +49,57 @@ function nextClaimIdentity(state: DemoState, seed: string) {
   }
 }
 
-function linkKey(kind: ClaimKind, shipmentId?: string, boxId?: string) {
-  return `${kind}:${kind === 'value_floor' ? boxId ?? '' : shipmentId ?? ''}`
+function everyOrderBoxRevealedAt(state: DemoState, orderId: string, at: string) {
+  const order = state.orders.find((entry) => entry.id === orderId)
+  return Boolean(
+    order?.boxIds.length &&
+    order.boxIds.every((boxId) => {
+      const box = state.boxes.find((entry) => entry.id === boxId && entry.orderId === order.id)
+      return Boolean(box?.revealedAt && Date.parse(box.revealedAt) <= Date.parse(at))
+    }),
+  )
+}
+
+function eligibleShipmentIds(
+  state: DemoState,
+  orderId: string,
+  kind: Extract<ClaimKind, 'damage' | 'non_delivery'>,
+  at: string,
+) {
+  return state.shipments
+    .filter((shipment) =>
+      shipment.orderId === orderId &&
+      shipmentClaimEligibility(shipment, kind, at).eligible,
+    )
+    .map((shipment) => shipment.id)
+    .sort((left, right) => left.localeCompare(right))
+}
+
+function openClaimMatches(
+  claim: Claim,
+  kind: ClaimKind,
+  shipmentId: string | undefined,
+  boxId: string | undefined,
+  shipmentCandidateIds: string[] | undefined,
+) {
+  if (claim.kind !== kind || !OPEN_CLAIM_STATUSES.includes(claim.status)) return false
+  if (kind === 'value_floor') return claim.boxId === boxId
+  if (shipmentCandidateIds) {
+    return Boolean(
+      claim.shipmentCandidateIds ||
+      (claim.shipmentId && shipmentCandidateIds.includes(claim.shipmentId)),
+    )
+  }
+  return Boolean(
+    claim.shipmentId === shipmentId ||
+    (shipmentId && claim.shipmentCandidateIds?.includes(shipmentId)),
+  )
+}
+
+function customerClaimReceipt(claim: Claim) {
+  const receipt = structuredClone(claim)
+  delete receipt.shipmentCandidateIds
+  return receipt
 }
 
 export class ClaimService {
@@ -50,76 +109,128 @@ export class ClaimService {
     private readonly now: () => string,
   ) {}
 
-  submit(input: SubmitClaimInput) {
-    return this.repository.update((state) => {
-      const user = getSessionUser(state)
-      assertRole(user, ['customer'], 'submit a demo claim')
-      const order = state.orders.find((entry) => entry.id === input.orderId && entry.userId === user.id)
-      assert(order, 'Order not found for this fictional account.', 'ORDER_MISSING')
-      const note = validateDemoClaimNote(input.note)
-      const now = this.now()
-      const selectedShipment = input.shipmentId
-        ? state.shipments.find((shipment) => shipment.id === input.shipmentId && shipment.orderId === order.id)
-        : undefined
-      const selectedBox = input.boxId
-        ? state.boxes.find((box) => box.id === input.boxId && box.orderId === order.id && box.ownerId === user.id)
-        : undefined
+  private prepareSubmission(state: DemoState, input: SubmitClaimInput, now: string) {
+    const user = getSessionUser(state)
+    assertRole(user, ['customer'], 'submit a demo claim')
+    const order = state.orders.find((entry) => entry.id === input.orderId && entry.userId === user.id)
+    assert(order, 'Order not found for this fictional account.', 'ORDER_MISSING')
+    const note = validateDemoClaimNote(input.note)
+    const selectedShipment = input.shipmentId
+      ? state.shipments.find((shipment) => shipment.id === input.shipmentId && shipment.orderId === order.id)
+      : undefined
+    const selectedBox = input.boxId
+      ? state.boxes.find((box) => box.id === input.boxId && box.orderId === order.id && box.ownerId === user.id)
+      : undefined
+    const orderLevelDelivery = input.orderLevelDelivery === true
+    const selectedLinkCount =
+      Number(Boolean(input.shipmentId)) +
+      Number(Boolean(input.boxId)) +
+      Number(orderLevelDelivery)
+    assert(selectedLinkCount === 1, 'Choose exactly one valid claim evidence scope.', 'CLAIM_LINK_REQUIRED')
+    const everyBoxRevealed = everyOrderBoxRevealedAt(state, order.id, now)
+    let shipmentCandidateIds: string[] | undefined
 
-      if (input.kind !== 'value_floor') {
+    if (input.kind === 'damage' || input.kind === 'non_delivery') {
+      assert(!input.boxId, 'Delivery claims cannot link a value-floor box.', 'CLAIM_LINK_INVALID')
+      if (everyBoxRevealed) {
         assert(
-          order.boxIds.length > 0 &&
-            order.boxIds.every((boxId) => {
-              const box = state.boxes.find((entry) => entry.id === boxId)
-              return Boolean(box?.revealedAt && Date.parse(box.revealedAt) <= Date.parse(now))
-            }),
-          'Shipment-linked claims require every box in the order to be revealed first.',
-          'CLAIM_REVEAL_REQUIRED',
+          input.shipmentId && selectedShipment && !orderLevelDelivery,
+          input.kind === 'damage'
+            ? 'Choose the delivered shipment with the damage.'
+            : 'Choose the shipment that did not arrive.',
+          'CLAIM_LINK_REQUIRED',
         )
-      }
-
-      if (input.kind === 'damage') {
-        assert(input.shipmentId && selectedShipment, 'Choose the delivered shipment with the damage.', 'CLAIM_LINK_REQUIRED')
-        assert(selectedShipment.status === 'delivered', 'Damage claims require a delivered shipment.', 'CLAIM_INELIGIBLE')
-        assert(selectedShipment.kind !== 'DIGITAL', 'A digital fulfilment cannot have physical damage.', 'CLAIM_INELIGIBLE')
-      } else if (input.kind === 'non_delivery') {
-        assert(input.shipmentId && selectedShipment, 'Choose the shipment that did not arrive.', 'CLAIM_LINK_REQUIRED')
+        const eligibility = shipmentClaimEligibility(selectedShipment, input.kind, now)
         assert(
-          ['shipped', 'failed_delivery', 'lost'].includes(selectedShipment.status),
-          'Non-delivery claims require a shipped, failed-delivery, or lost shipment.',
+          eligibility.eligible,
+          eligibility.reason,
+          input.kind === 'non_delivery' && eligibility.reason.includes('three demo days')
+            ? 'CLAIM_NOT_OVERDUE'
+            : 'CLAIM_INELIGIBLE',
+        )
+      } else {
+        assert(
+          orderLevelDelivery && !input.shipmentId,
+          'While any box is sealed, use the neutral order-level delivery evidence.',
+          'CLAIM_ORDER_LEVEL_REQUIRED',
+        )
+        shipmentCandidateIds = eligibleShipmentIds(state, order.id, input.kind, now)
+        assert(
+          shipmentCandidateIds.length > 0,
+          input.kind === 'damage'
+            ? 'No delivered physical order evidence is eligible for damage.'
+            : 'No physical order evidence is currently eligible for non-delivery.',
           'CLAIM_INELIGIBLE',
         )
-        if (selectedShipment.status === 'shipped') {
-          const hasExceptionEvidence = selectedShipment.timeline.some((entry) =>
-            ['failed_delivery', 'lost'].includes(entry.status) && Date.parse(entry.at) <= Date.parse(now),
-          )
-          const shippedAt = [...selectedShipment.timeline].reverse().find((entry) => entry.status === 'shipped')?.at
-          assert(
-            hasExceptionEvidence ||
-              (Boolean(shippedAt) && Date.parse(now) - Date.parse(shippedAt!) >= SHIPPED_OVERDUE_MS),
-            'A shipped parcel must be at least three demo days overdue.',
-            'CLAIM_NOT_OVERDUE',
-          )
-        }
-      } else {
-        assert(input.boxId && selectedBox, 'Choose the revealed box for this value-floor claim.', 'CLAIM_LINK_REQUIRED')
-        assert(selectedBox.revealedAt && selectedBox.prizeId, 'Value-floor claims require a revealed box.', 'CLAIM_INELIGIBLE')
       }
-
-      const duplicate = state.claims.find((claim) =>
-        claim.orderId === order.id &&
-        OPEN_CLAIM_STATUSES.includes(claim.status) &&
-        linkKey(claim.kind, claim.shipmentId, claim.boxId) === linkKey(input.kind, input.shipmentId, input.boxId),
+    } else {
+      assert(
+        input.boxId && selectedBox && !input.shipmentId && !orderLevelDelivery,
+        'Choose the revealed box for this value-floor claim.',
+        'CLAIM_LINK_REQUIRED',
       )
-      if (duplicate) return { data: duplicate, changed: false, message: 'The existing open claim was returned safely.' }
+      const eligibility = valueFloorClaimEligibility(selectedBox, now)
+      assert(eligibility.eligible, eligibility.reason, 'CLAIM_INELIGIBLE')
+    }
 
-      const identity = nextClaimIdentity(state, `${order.id}:${input.kind}:${input.shipmentId ?? input.boxId ?? ''}`)
+    const duplicate = state.claims.find((claim) =>
+      claim.orderId === order.id &&
+      openClaimMatches(
+        claim,
+        input.kind,
+        selectedShipment?.id,
+        selectedBox?.id,
+        shipmentCandidateIds,
+      ),
+    )
+    return {
+      user,
+      order,
+      note,
+      selectedShipment,
+      selectedBox,
+      shipmentCandidateIds,
+      duplicate,
+    }
+  }
+
+  submit(input: SubmitClaimInput) {
+    const now = this.now()
+    const prepared = this.prepareSubmission(this.repository.getSnapshot(), input, now)
+    if (prepared.duplicate) {
+      return {
+        data: customerClaimReceipt(prepared.duplicate),
+        changed: false,
+        message: 'The existing open claim was returned safely.',
+      }
+    }
+
+    return this.repository.update((state) => {
+      const {
+        user,
+        order,
+        note,
+        selectedShipment,
+        selectedBox,
+        shipmentCandidateIds,
+        duplicate,
+      } = this.prepareSubmission(state, input, now)
+      assert(!duplicate, 'The claim request changed before it could be saved.', 'IDEMPOTENCY_CONFLICT')
+
+      const evidenceSeed =
+        selectedBox?.id ??
+        selectedShipment?.id ??
+        shipmentCandidateIds?.join(',') ??
+        ''
+      const identity = nextClaimIdentity(state, `${order.id}:${input.kind}:${evidenceSeed}`)
       const claim: Claim = {
         ...identity,
         orderId: order.id,
         userId: user.id,
         kind: input.kind,
         note,
-        shipmentId: input.kind === 'value_floor' ? undefined : selectedShipment!.id,
+        shipmentId: input.kind === 'value_floor' ? undefined : selectedShipment?.id,
+        shipmentCandidateIds,
         boxId: input.kind === 'value_floor' ? selectedBox!.id : undefined,
         status: 'submitted',
         createdAt: now,
@@ -144,9 +255,20 @@ export class ClaimService {
         reason: note,
         at: now,
         requestId: claim.requestId,
-        after: { kind: claim.kind, status: claim.status, shipmentId: claim.shipmentId, boxId: claim.boxId },
+        after: {
+          kind: claim.kind,
+          status: claim.status,
+          shipmentId: claim.shipmentId,
+          shipmentCandidateIds: claim.shipmentCandidateIds,
+          boxId: claim.boxId,
+          refundCreated: false,
+        },
       })
-      return { data: claim, changed: true, message: 'Demo claim submitted for review.' }
+      return {
+        data: customerClaimReceipt(claim),
+        changed: true,
+        message: 'Demo claim submitted for review.',
+      }
     })
   }
 
@@ -154,7 +276,45 @@ export class ClaimService {
     const state = this.repository.getSnapshot()
     const user = getSessionUser(state)
     assertRole(user, ['customer'], 'view claim history')
-    return state.claims.filter((claim) => claim.userId === user.id)
+    return state.claims
+      .filter((claim) => claim.userId === user.id)
+      .map(customerClaimReceipt)
+  }
+
+  eligibleLinks(orderId: string, kind: ClaimKind) {
+    const state = this.repository.getSnapshot()
+    const user = getSessionUser(state)
+    assertRole(user, ['customer'], 'view demo claim eligibility')
+    const order = state.orders.find((entry) => entry.id === orderId && entry.userId === user.id)
+    assert(order, 'Order not found for this fictional account.', 'ORDER_MISSING')
+    const now = this.now()
+    if (kind === 'value_floor') {
+      return {
+        boxes: state.boxes.filter((box) =>
+          box.orderId === order.id &&
+          box.ownerId === user.id &&
+          valueFloorClaimEligibility(box, now).eligible,
+        ),
+        shipments: [],
+        orderLevelEligible: false,
+      }
+    }
+    const everyBoxRevealed = everyOrderBoxRevealedAt(state, order.id, now)
+    if (!everyBoxRevealed) {
+      return {
+        boxes: [],
+        shipments: [],
+        orderLevelEligible: eligibleShipmentIds(state, order.id, kind, now).length > 0,
+      }
+    }
+    return {
+      boxes: [],
+      shipments: state.shipments.filter((shipment) =>
+        shipment.orderId === order.id &&
+        shipmentClaimEligibility(shipment, kind, now).eligible,
+      ),
+      orderLevelEligible: false,
+    }
   }
 
   queue() {
@@ -164,7 +324,57 @@ export class ClaimService {
     return [...state.claims].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
   }
 
-  review(claimId: string, action: ClaimReviewAction, rawNote: string) {
+  private validateResolution(
+    state: DemoState,
+    claim: Claim,
+    note: string,
+    resolution?: ClaimResolutionInput,
+  ) {
+    assert(resolution, 'Choose a structured resolution outcome and reference.', 'RESOLUTION_EVIDENCE_REQUIRED')
+    const outcomes: ClaimResolutionOutcome[] = [
+      'replacement_authorized',
+      'return_rma_created',
+      'refund_recorded',
+      'no_remedy',
+    ]
+    assert(outcomes.includes(resolution.outcome), 'Choose a valid resolution outcome.', 'RESOLUTION_OUTCOME_INVALID')
+    const reference = sanitizeText(resolution.reference, 100)
+    assert(reference.length >= 4, 'Enter the fictional resolution reference.', 'RESOLUTION_REFERENCE_REQUIRED')
+    if (resolution.outcome === 'refund_recorded') {
+      const payment = state.payments.find((entry) =>
+        entry.orderId === claim.orderId &&
+        entry.events.some((event) =>
+          event.id === reference &&
+          !event.ignoredReason &&
+          Boolean(event.refundIntent) &&
+          ['partially_refunded', 'refunded'].includes(event.type),
+        ),
+      )
+      const event = payment?.events.find((entry) => entry.id === reference)
+      const audited = Boolean(payment && event && state.audits.some((audit) =>
+        audit.targetType === 'payment' &&
+        audit.targetId === payment.id &&
+        audit.eventId === event.id &&
+        ['payment.partially_refunded', 'payment.refunded'].includes(audit.action),
+      ))
+      assert(audited, 'Refund resolution must reference an existing audited refund event for this order.', 'RESOLUTION_REFUND_MISSING')
+    } else {
+      assert(
+        /^DEMO-[A-Z0-9][A-Z0-9-]{2,96}$/.test(reference),
+        'Replacement, RMA, and no-remedy references must be clearly fictional DEMO- codes.',
+        'DEMO_DATA_ONLY',
+      )
+      assert(note.length >= 16, 'Describe the fictional resolution in at least 16 characters.', 'RESOLUTION_NOTE_REQUIRED')
+    }
+    return { outcome: resolution.outcome, reference }
+  }
+
+  review(
+    claimId: string,
+    action: ClaimReviewAction,
+    rawNote: string,
+    resolution?: ClaimResolutionInput,
+  ) {
     return this.repository.update((state) => {
       const actor = getSessionUser(state)
       assertRole(actor, ['support', 'admin', 'super_admin'], 'review claims')
@@ -182,9 +392,16 @@ export class ClaimService {
       assert(transition.from.includes(claim.status), `Claim cannot ${action} from ${claim.status}.`, 'INVALID_CLAIM_TRANSITION')
       const before = claim.status
       const now = this.now()
+      const structured = action === 'resolve'
+        ? this.validateResolution(state, claim, note, resolution)
+        : undefined
       claim.status = transition.to
       claim.updatedAt = now
       if (action === 'reject' || action === 'resolve') claim.resolutionNote = note
+      if (structured) {
+        claim.resolutionOutcome = structured.outcome
+        claim.resolutionReference = structured.reference
+      }
       claim.history.push({
         id: `${claim.id}-h-${String(claim.history.length + 1).padStart(2, '0')}`,
         status: claim.status,
@@ -204,7 +421,12 @@ export class ClaimService {
         at: now,
         requestId,
         before: { status: before },
-        after: { status: claim.status, refundCreated: false },
+        after: {
+          status: claim.status,
+          refundCreated: false,
+          resolutionOutcome: claim.resolutionOutcome,
+          resolutionReference: claim.resolutionReference,
+        },
       })
       return { data: claim, changed: true, message: `Claim is now ${claim.status}. No refund was created.` }
     })

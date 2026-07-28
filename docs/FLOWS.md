@@ -88,17 +88,23 @@ purchased box.
 ## Refunds
 
 Finance/admin roles must confirm a partial or full fictional refund. A request
-ID makes the operation idempotent. A full refund moves the order to `refunded`
-when allowed.
+ID makes the operation idempotent across every payment. The stored normalized
+intent includes the payment ID, amount and sanitized reason. An exact replay
+returns the original target with no write, revision, listener, audit or
+timestamp change. Reusing the ID with different intent is an explicit conflict.
+A full refund moves the order to `refunded` when allowed.
 
 An assigned prize is never rerolled or returned to the series. A revealed box
 keeps its immutable result. An unopened refunded box is held, not reallocated.
 The same financial-stop helper cancels only unshipped fulfilment records and
-keeps shipped/delivered history intact. Shipment changes are rejected while the
-order is cancelled, refunded or disputed. A disputed order can resume eligible
-held work only through an explicit protected resolution. That resolution
-restarts only shipments stopped by that dispute, preserves any earlier partial
-refund, and restores the prior coherent order state (including `closed`).
+keeps shipped/delivered history intact. A refunded or disputed order remains
+financially stopped and unopened boxes stay on hold, but an already-shipped
+record may still receive legal real-world carrier outcomes such as delivered,
+failed delivery, lost or returned. This does not reopen fulfilment, and tracking
+details remain locked. A disputed order can resume eligible held work only
+through an explicit protected resolution. That resolution restarts only
+shipments stopped by that dispute, preserves any earlier partial refund, and
+restores the prior coherent order state (including `closed`).
 
 ## Fulfilment and tracking
 
@@ -114,13 +120,16 @@ shipment moves through unfulfilled → picking → packed → label created → 
 → delivered. Shipped parcels may enter failed delivery, lost or returned
 exceptions. A delivered shipment may be explicitly recorded as returned; this
 reopens the affected order and holds its boxes but does not create a claim or
-refund. Customer order pages show shipment grouping, carrier, tracking and flags
-only after every box in that order has been revealed. Until then they show one
-generic locked fulfilment message.
-Before shipment, fulfilment/admin roles may enter a clearly fictional carrier
-and `DEMO-` tracking code. The service validates uniqueness and demo-only
-format, locks the fields after shipping, and records confirmed before/after
-values in audit.
+refund. Customer order pages show individual shipment groups, carrier, tracking
+and flags only after every box in that order has been revealed. While any box
+is still sealed, all split groups collapse into one generic order-level
+delivery summary with one neutral combined status, one fictional order-level
+reference and generic progress. It does not expose one card per split. Raw
+shipment IDs, prize-derived kind, carrier, insurance/signature flags, linked
+box IDs and prize names stay hidden. Before shipment, fulfilment/admin roles
+may enter a clearly fictional carrier and `DEMO-` tracking code. The service
+validates uniqueness and demo-only format, locks the fields after shipping, and
+records confirmed before/after values in audit.
 
 ## Claims
 
@@ -129,14 +138,31 @@ sanitized, attached to the order and audited. Real incident details must never
 be entered.
 
 - Damage must link a delivered, non-digital shipment.
-- Non-delivery must link a shipped, failed-delivery or lost overdue-like shipment.
-- Value-floor review must link an already revealed box.
-- Repeating the same open claim returns the existing claim.
+- Non-delivery must link a failed-delivery, lost or returned-to-sender physical
+  shipment, or one still shipped for at least three days. A return is valid
+  non-delivery evidence only when no delivered event exists at or before claim
+  creation. A customer return after delivery and any returned digital
+  fulfilment are never physical non-delivery evidence.
+- Value-floor review must link that exact already revealed box.
+- Delivery claims do not require every prize to be revealed. Before all boxes
+  are revealed, the customer sees exactly one generic order-delivery option.
+  Submission stores the complete sorted set of eligible physical shipment IDs
+  at that moment, with no arbitrary exact shipment link. The customer never
+  sees that set, split count, IDs, carrier, kind, flags, prize or per-split
+  status; authorized claim staff may inspect the internal evidence. Exact
+  shipment selection becomes available only after every box is revealed.
+- Repeating the same open claim returns the existing claim with no repository
+  revision, storage write, listener, audit or timestamp change.
 
 Support/admin review requires a note for acknowledge, approve, reject and
-resolve. Every step appends customer-visible history and protected audit
-evidence. A claim never creates a refund implicitly; refund remains a separate
-finance action.
+resolve. The approved → resolved step also requires one structured outcome:
+replacement authorized, return/RMA created, refund recorded or no remedy. A
+replacement, RMA or no-remedy result needs a clearly fictional `DEMO-` reference
+and descriptive note. A refund-recorded result must name an existing audited
+refund event for a payment on that order. The outcome and reference stay
+visible to both admin and customer. Every step appends customer-visible history
+and protected audit evidence. A claim never creates a refund implicitly; refund
+remains a separate finance action.
 
 ## Admin
 
@@ -151,6 +177,8 @@ protection.
   customer, payment, hidden-prize, fulfilment and claim data.
 - Admin/super admin have wider access.
 - An admin cannot suspend their own account.
+- Only a `super_admin` can change another `super_admin`; an ordinary admin
+  cannot suspend or reactivate one.
 - Users links to that fictional user’s filtered order list; Orders can filter by
   every order state, user, order/payment identity and tracking text.
 
@@ -206,7 +234,12 @@ Aina Demo begins with fictional records covering:
 Reset demo data restores these exact cases.
 
 The repository validates all required collections, cart, integer counters,
-unique IDs, active session identity, published allocation totals, assigned and
-reserved counts, and important order/payment/box/shipment/claim links before a
-write is accepted. Malformed current-schema storage is replaced by these
-deterministic fixtures.
+unique IDs, globally unique normalized fictional email addresses, complete
+normalized demo addresses, active session identity, the exact published Series
+001 total of 10,000, assigned and reserved counts, global refund intent,
+structured resolution evidence, and important
+order/payment/box/shipment/claim links before a write is accepted. The stronger
+order checks also enforce the fixed RM100 unit price, fixed shipping schedule,
+integer quantity from 1–10, exact published odds and policy versions, matching
+box count, and coherent assignment/reveal time and reveal-state combinations.
+Malformed current-schema storage is replaced by these deterministic fixtures.

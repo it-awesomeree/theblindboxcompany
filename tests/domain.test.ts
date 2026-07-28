@@ -14,7 +14,7 @@ import {
 } from '../src/domain/guards'
 import { formatMYR } from '../src/lib/format'
 import { DEMO_ADDRESS } from '../src/data/fixtures'
-import { deriveOrderStatusFromShipments } from '../src/domain/orderStatus'
+import { deriveOrderStatusFromShipments, neutralOrderDeliveryStatus } from '../src/domain/orderStatus'
 
 describe('Series 001 and domain guards', () => {
   it('has exactly 10,000 fixed allocations and every value clears RM100', () => {
@@ -65,6 +65,14 @@ describe('Series 001 and domain guards', () => {
     expect(deriveOrderStatusFromShipments(['delivered', 'unfulfilled'])).toBe('partially_fulfilled')
     expect(deriveOrderStatusFromShipments(['delivered', 'returned'])).toBe('partially_fulfilled')
     expect(deriveOrderStatusFromShipments(['delivered', 'delivered'])).toBe('fulfilled')
+  })
+
+  it('keeps split-sensitive order progress neutral until customer details unlock', () => {
+    expect(neutralOrderDeliveryStatus('confirmed')).toBe('delivery_preparing')
+    expect(neutralOrderDeliveryStatus('processing')).toBe('delivery_in_progress')
+    expect(neutralOrderDeliveryStatus('partially_fulfilled')).toBe('delivery_in_progress')
+    expect(neutralOrderDeliveryStatus('fulfilled')).toBe('delivery_complete')
+    expect(neutralOrderDeliveryStatus('disputed')).toBe('disputed')
   })
 
   it('accepts fictional input and blocks likely real data', () => {

@@ -2,6 +2,8 @@ import {
   assert,
   assertRole,
   getSessionUser,
+  isClearlyFictionalCarrier,
+  isValidDemoTracking,
   makeId,
   sanitizeText,
   transitionOrder,
@@ -19,6 +21,12 @@ const carrierFor = (kind: FulfilmentKind) => {
   if (kind === 'BULKY') return 'Demo Bulky Freight'
   if (kind === 'SELF_COLLECT') return 'Vault Counter'
   return 'Demo Express'
+}
+
+const FINANCIAL_HOLD_CARRIER_EDGES: Partial<Record<ShipmentStatus, ShipmentStatus[]>> = {
+  failed_delivery: ['shipped'],
+  shipped: ['delivered', 'failed_delivery', 'lost', 'returned'],
+  delivered: ['returned'],
 }
 
 export class FulfillmentService {
@@ -53,7 +61,7 @@ export class FulfillmentService {
         kind,
         status: 'unfulfilled',
         carrier: carrierFor(kind),
-        trackingNumber: `DEMO-${shipmentId.slice(-8).toUpperCase()}`,
+        trackingNumber: `DEMO-${shipmentId.slice(4).toUpperCase()}`,
         insured: shipmentPrizes.some((prize) => prize.insured),
         signatureRequired: shipmentPrizes.some((prize) => prize.signatureRequired),
         createdAt: at,
@@ -77,11 +85,16 @@ export class FulfillmentService {
       assert(shipment, 'Shipment was not found.', 'SHIPMENT_MISSING')
       const order = state.orders.find((entry) => entry.id === shipment.orderId)
       assert(order, 'Shipment order was not found.', 'ORDER_MISSING')
-      assert(
-        !['cancelled', 'refunded', 'disputed'].includes(order.status),
-        `Fulfilment is stopped while the order is ${order.status}.`,
-        'FINANCIAL_HOLD',
-      )
+      const financiallyStopped = ['cancelled', 'refunded', 'disputed'].includes(order.status)
+      if (financiallyStopped) {
+        assert(
+          ['refunded', 'disputed'].includes(order.status) &&
+            shipment.kind !== 'DIGITAL' &&
+            FINANCIAL_HOLD_CARRIER_EDGES[shipment.status]?.includes(next),
+          `Financial hold: the ${order.status} order can only record a graph-legal physical carrier evidence step for an already-shipped delivery; tracking, restarts, fulfilment progress, and financial state remain locked.`,
+          'FINANCIAL_HOLD',
+        )
+      }
       const cleanReason = sanitizeText(reason, 220)
       assert(cleanReason.length >= 6, 'Give a short reason for this shipment change.', 'REASON_REQUIRED')
       const before = shipment.status
@@ -95,23 +108,25 @@ export class FulfillmentService {
         label: cleanReason,
         at: now,
       })
-      for (const boxId of shipment.boxIds) {
-        const box = state.boxes.find((entry) => entry.id === boxId)
-        if (!box) continue
-        box.status = transitionBoxForShipment(box.status, next)
+      if (!financiallyStopped) {
+        for (const boxId of shipment.boxIds) {
+          const box = state.boxes.find((entry) => entry.id === boxId)
+          if (!box) continue
+          box.status = transitionBoxForShipment(box.status, next)
+        }
+        const related = state.shipments.filter((entry) => entry.orderId === order.id)
+        const derived = deriveOrderStatusFromShipments(related.map((entry) => entry.status))
+        if (order.status !== derived) {
+          order.status = transitionOrder(order.status, derived)
+        }
+        order.updatedAt = now
+        order.timeline.push({
+          id: makeId('tl', `${order.id}:${shipment.id}:${next}:${now}:${sequence}`),
+          status: order.status,
+          label: cleanReason,
+          at: now,
+        })
       }
-      const related = state.shipments.filter((entry) => entry.orderId === order.id)
-      const derived = deriveOrderStatusFromShipments(related.map((entry) => entry.status))
-      if (order.status !== derived) {
-        order.status = transitionOrder(order.status, derived)
-      }
-      order.updatedAt = now
-      order.timeline.push({
-        id: makeId('tl', `${order.id}:${shipment.id}:${next}:${now}:${sequence}`),
-        status: order.status,
-        label: cleanReason,
-        at: now,
-      })
       this.audit.append(state, {
         actorId: actor.id,
         actorRole: actor.role,
@@ -122,7 +137,11 @@ export class FulfillmentService {
         at: now,
         requestId: makeId('req', `${shipment.id}:${next}:${now}:${sequence}`),
         before: { status: before },
-        after: { status: next },
+        after: {
+          status: next,
+          orderStatus: order.status,
+          financialHoldPreserved: financiallyStopped,
+        },
       })
       return shipment
     })
@@ -148,13 +167,12 @@ export class FulfillmentService {
       const cleanCarrier = sanitizeText(carrier, 70)
       const cleanTracking = sanitizeText(trackingNumber, 48).toUpperCase()
       const cleanReason = sanitizeText(reason, 220)
-      assert(cleanCarrier.length >= 3, 'Enter a fictional carrier name.', 'INVALID_CARRIER')
       assert(
-        /demo|digital vault|vault counter/i.test(cleanCarrier),
+        isClearlyFictionalCarrier(cleanCarrier),
         'Use a clearly fictional carrier containing Demo, Digital Vault, or Vault Counter.',
         'DEMO_DATA_ONLY',
       )
-      assert(/^DEMO-[A-Z0-9][A-Z0-9-]{2,42}$/.test(cleanTracking), 'Tracking must be a fictional DEMO- code.', 'DEMO_DATA_ONLY')
+      assert(isValidDemoTracking(cleanTracking), 'Tracking must be a fictional DEMO- code.', 'DEMO_DATA_ONLY')
       assert(cleanReason.length >= 6, 'Give a short reason for the tracking change.', 'REASON_REQUIRED')
       assert(
         !state.shipments.some((entry) => entry.id !== shipment.id && entry.trackingNumber === cleanTracking),

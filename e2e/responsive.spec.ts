@@ -18,6 +18,22 @@ async function expectInsideViewport(locator: Locator, page: Page) {
   expect(bounds!.x + bounds!.width).toBeLessThanOrEqual((viewport?.width ?? 0) + 1)
 }
 
+async function computedThemeColors(page: Page) {
+  return page.evaluate(() => {
+    const toHex = (value: string) => {
+      const channels = value.match(/\d+(?:\.\d+)?/g)?.slice(0, 3).map(Number) ?? []
+      return `#${channels.map((channel) => Math.round(channel).toString(16).padStart(2, '0')).join('')}`
+    }
+    const cyanLabel = document.querySelector<HTMLElement>('.demo-opener-label')
+    const goldButton = document.querySelector<HTMLElement>('.hero-actions .button')
+    return {
+      black: toHex(getComputedStyle(document.body).backgroundColor),
+      gold: toHex(getComputedStyle(goldButton!).backgroundColor),
+      cyan: toHex(getComputedStyle(cyanLabel!).color),
+    }
+  })
+}
+
 test('responsive shell preserves navigation, legal text, input sizing and important bounds', async ({ page }) => {
   await page.addInitScript(() => localStorage.clear())
   await page.goto('')
@@ -28,8 +44,30 @@ test('responsive shell preserves navigation, legal text, input sizing and import
   await expectInsideViewport(page.locator('.hero-actions'), page)
   await expectInsideViewport(page.locator('.nav-inner'), page)
   await expectNoRootOverflow(page)
+  expect(await computedThemeColors(page)).toEqual({
+    black: '#080908',
+    gold: '#e8b44c',
+    cyan: '#72d9ed',
+  })
+  const importantSmallCopySizes = await page
+    .locator('.hero-copy > small, .demo-opener-label')
+    .evaluateAll((elements) =>
+      elements.map((element) => Number.parseFloat(getComputedStyle(element).fontSize)),
+    )
+  expect(importantSmallCopySizes).toHaveLength(2)
+  expect(importantSmallCopySizes.every((size) => size >= 11)).toBe(true)
 
   const width = page.viewportSize()?.width ?? 1000
+  if (width <= 768) {
+    await expect(page.locator('#pool')).toBeVisible()
+    await expect(page.locator('#pool').getByRole('heading', { name: /everything in the box/i })).toBeVisible()
+    await expect(page.locator('#how')).toBeVisible()
+    await expect(page.locator('#how').getByRole('heading', { name: /simulate payment/i })).toBeVisible()
+    await expect(page.locator('#faq')).toBeVisible()
+    await expect(page.locator('#faq').getByRole('heading', { name: /ask the awkward ones/i })).toBeVisible()
+    await expect(page.locator('.final-cta')).toBeVisible()
+    await expect(page.locator('.final-cta').getByRole('button', { name: /get a demo box/i })).toBeVisible()
+  }
   if (width <= 620) {
     await expect(page.locator('.prize-table thead')).not.toHaveCSS('display', 'none')
   }
@@ -55,13 +93,16 @@ test('responsive shell preserves navigation, legal text, input sizing and import
   }
 
   await page.getByRole('link', { name: /demo sign in/i }).click()
-  if (width <= 620) {
-    const fontSizes = await page.locator('input, select, textarea').evaluateAll((elements) =>
-      elements.map((element) => Number.parseFloat(getComputedStyle(element).fontSize)),
-    )
-    expect(fontSizes.length).toBeGreaterThan(0)
-    expect(fontSizes.every((size) => size >= 16)).toBe(true)
-  }
+  const fontSizes = await page.locator('input, select, textarea').evaluateAll((elements) =>
+    elements.map((element) => Number.parseFloat(getComputedStyle(element).fontSize)),
+  )
+  expect(fontSizes.length).toBeGreaterThan(0)
+  expect(fontSizes.every((size) => size >= 16)).toBe(true)
+  const labelSizes = await page.locator('label').evaluateAll((elements) =>
+    elements.map((element) => Number.parseFloat(getComputedStyle(element).fontSize)),
+  )
+  expect(labelSizes.length).toBeGreaterThan(0)
+  expect(labelSizes.every((size) => size >= 12)).toBe(true)
   await page.getByRole('button', { name: /one-click aina demo/i }).click()
   const accountLink = page.getByRole('link', { name: 'Account', exact: true })
   await expect(accountLink).toBeVisible()
@@ -108,6 +149,66 @@ test('WebGL-disabled fallback is the single keyboard opener and visibly opens', 
   await expect(page.locator('.hologram')).toBeVisible()
   await expect(fallback).toHaveClass(/is-open/)
   await expect(fallback).toHaveAttribute('aria-pressed', 'true')
+})
+
+test('installed Chrome exercises the live WebGL canvas opener', async ({ page }) => {
+  test.skip(process.env.PLAYWRIGHT_BROWSER === 'chromium', 'Bundled Chromium intentionally tests the faithful static fallback.')
+  await page.goto('')
+  const canvas = page.getByRole('button', { name: /activate boosted demo vault opener/i })
+  await expect(canvas).toBeVisible()
+  await expect(canvas).toHaveAttribute('tabindex', '0')
+  await expect(canvas).toHaveAttribute('data-webgl-renderer', 'live')
+  await expect(canvas).toHaveAttribute('data-webgl-frame', '2')
+  await expect(page.getByTestId('webgl-fallback')).toBeHidden()
+  const liveProof = await canvas.evaluate((element: HTMLCanvasElement) => {
+    const gl = element.getContext('webgl')
+    return {
+      width: element.width,
+      height: element.height,
+      version: gl?.getParameter(gl.VERSION),
+      error: gl?.getError(),
+      noError: gl?.NO_ERROR,
+    }
+  })
+  expect(liveProof.width).toBeGreaterThan(0)
+  expect(liveProof.height).toBeGreaterThan(0)
+  expect(liveProof.version).toMatch(/WebGL/i)
+  expect(liveProof.error).toBe(liveProof.noError)
+  await canvas.click()
+  await expect(page.locator('.hologram')).toBeVisible()
+})
+
+test('header keyboard order follows the visible desktop and mobile arrangement', async ({ page }) => {
+  await page.addInitScript(() => localStorage.clear())
+  await page.goto('')
+  const brand = page.getByRole('banner').getByRole('link', { name: /the blind box company demo home/i })
+  const mobileSession = page.locator('.nav-session-mobile .nav-action')
+  const desktopSession = page.locator('.nav-session-desktop .nav-action')
+  const vault = page.getByRole('link', { name: 'Vault', exact: true })
+  const cart = page.getByRole('link', { name: /^Cart/ })
+  const stackedMobile = (page.viewportSize()?.width ?? 1000) <= 620
+
+  await expect(page.locator('body')).toBeFocused()
+  await page.keyboard.press('Tab')
+  await expect(page.getByRole('button', { name: /skip to content/i })).toBeFocused()
+  await page.keyboard.press('Tab')
+  await expect(brand).toBeFocused()
+  await page.keyboard.press('Tab')
+  if (stackedMobile) {
+    await expect(mobileSession).toBeFocused()
+    await page.keyboard.press('Tab')
+    await expect(vault).toBeFocused()
+    await page.keyboard.press('Tab')
+    await expect(cart).toBeFocused()
+    await expect(page.locator('.nav-session-desktop')).toBeHidden()
+  } else {
+    await expect(vault).toBeFocused()
+    await page.keyboard.press('Tab')
+    await expect(cart).toBeFocused()
+    await page.keyboard.press('Tab')
+    await expect(desktopSession).toBeFocused()
+    await expect(page.locator('.nav-session-mobile')).toBeHidden()
+  }
 })
 
 test('admin mobile keeps fulfilment actions', async ({ page, isMobile }) => {

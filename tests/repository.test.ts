@@ -2,14 +2,22 @@ import { describe, expect, it, vi } from 'vitest'
 import { MockRepository, STORAGE_KEY } from '../src/data/MockRepository'
 import { createDemoState } from '../src/data/fixtures'
 import { validateDemoState } from '../src/data/StateValidator'
+import { BOX_PRICE_SEN, MAX_CART_QUANTITY } from '../src/domain/constants'
 import type { DemoState } from '../src/domain/types'
 import { AppServices } from '../src/services/AppServices'
-import { CountingStorage, FIXED_NOW, MemoryStorage } from './helpers'
+import {
+  CountingStorage,
+  FIXED_NOW,
+  MemoryStorage,
+  makeProcessingOrderTwoPhysicalShipments,
+} from './helpers'
 
 class FaultStorage extends MemoryStorage {
   throwOnRead = false
   throwOnWrite = false
   failNextWrites = 0
+  writeAttempts = 0
+  successfulWrites = 0
 
   getItem(key: string) {
     if (this.throwOnRead) throw new Error('read blocked')
@@ -17,11 +25,13 @@ class FaultStorage extends MemoryStorage {
   }
 
   setItem(key: string, value: string) {
+    this.writeAttempts += 1
     if (this.throwOnWrite || this.failNextWrites > 0) {
       this.failNextWrites = Math.max(0, this.failNextWrites - 1)
       throw new Error('write blocked')
     }
     super.setItem(key, value)
+    this.successfulWrites += 1
   }
 }
 
@@ -54,6 +64,31 @@ function servicesWithClaim(
     })
   }
   return services
+}
+
+function stateWithSealedMultiShipmentClaim() {
+  const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+  makeProcessingOrderTwoPhysicalShipments(services)
+  services.auth.oneClick('admin')
+  for (const [shipmentId, path] of [
+    ['shp-processing', ['packed', 'label_created', 'shipped', 'failed_delivery']],
+    ['shp-digital', ['picking', 'packed', 'label_created', 'shipped', 'failed_delivery']],
+  ] as const) {
+    for (const status of path) {
+      services.fulfilment.advance(shipmentId, status, `Confirmed candidate validation setup ${status}`)
+    }
+  }
+  services.repository.update((state) => {
+    state.boxes.find((box) => box.id === 'box-processing-01')!.revealedAt = undefined
+  })
+  services.auth.oneClick('customer')
+  services.claims.submit({
+    orderId: 'ord-processing',
+    kind: 'non_delivery',
+    orderLevelDelivery: true,
+    note: 'DEMO canonical order-level candidate validation',
+  })
+  return services.repository.exportForTest()
 }
 
 describe('MockRepository recovery and persistence', () => {
@@ -165,6 +200,57 @@ describe('MockRepository recovery and persistence', () => {
     expect(listener).toHaveBeenCalledOnce()
   })
 
+  it('keeps failed startup reservation cleanup atomic, visible, and retryable on the same storage', () => {
+    const preparedStorage = new MemoryStorage()
+    const prepared = new AppServices(preparedStorage, () => '2026-07-28T03:00:00.000Z')
+    prepared.auth.oneClick('customer')
+    prepared.orders.setCartQuantity(1)
+    const dueOrder = prepared.orders.create({
+      requestId: 'checkout_0000000000000000000000000000d001',
+      quantity: 1,
+      shippingMethod: 'standard',
+      address: createDemoState().orders[0].snapshot.address,
+      acknowledged: true,
+      displayedTotalSen: 11_200,
+    })
+    const storedBefore = preparedStorage.getItem(STORAGE_KEY)!
+    const stateBefore = JSON.parse(storedBefore) as DemoState
+    const storage = new FaultStorage()
+    storage.seed(STORAGE_KEY, storedBefore)
+    storage.failNextWrites = 1
+
+    const services = new AppServices(storage, () => FIXED_NOW)
+    const listener = vi.fn()
+    services.repository.subscribe(listener)
+
+    expect(services.repository.getSnapshot()).toEqual(stateBefore)
+    expect(services.repository.getSnapshot().revision).toBe(stateBefore.revision)
+    expect(storage.getItem(STORAGE_KEY)).toBe(storedBefore)
+    expect(storage.writeAttempts).toBe(1)
+    expect(storage.successfulWrites).toBe(0)
+    expect(listener).not.toHaveBeenCalled()
+    expect(services.repository.recoveryNotice).toMatch(
+      /automatic cleanup was not saved.+nothing changed.+safe to retry or refresh/i,
+    )
+
+    const retried = services.orders.expireReservations()
+    expect(retried).toMatchObject({ changed: true, count: 1, orderIds: [dueOrder.id] })
+    expect(services.repository.getSnapshot().revision).toBe(stateBefore.revision + 1)
+    expect(services.repository.getSnapshot().boxes.find((box) => box.orderId === dueOrder.id)?.status).toBe('void')
+    expect(JSON.parse(storage.getItem(STORAGE_KEY)!)).toEqual(services.repository.getSnapshot())
+    expect(storage.writeAttempts).toBe(2)
+    expect(storage.successfulWrites).toBe(1)
+    expect(listener).toHaveBeenCalledOnce()
+  })
+
+  it('rethrows invalid clocks and unexpected startup failures', () => {
+    expect(() => new AppServices(new MemoryStorage(), () => 'not-an-iso-time')).toThrow(
+      expect.objectContaining({ code: 'INVALID_TIME' }),
+    )
+    const unexpected = new Error('unexpected clock failure')
+    expect(() => new AppServices(new MemoryStorage(), () => { throw unexpected })).toThrow(unexpected)
+  })
+
   it('rolls back a failed reset write and keeps storage active for a successful retry', () => {
     const storage = new FaultStorage()
     const repository = new MockRepository(storage)
@@ -255,6 +341,82 @@ describe('MockRepository recovery and persistence', () => {
     expect(state.shipments.every((shipment) => shipment.timeline.at(-1)?.status === shipment.status)).toBe(true)
   })
 
+  it('rejects duplicate normalized user emails even when user IDs differ', () => {
+    const state = createDemoState()
+    state.users[1].email = state.users[0].email
+
+    expect(() => validateDemoState(state)).toThrow(/user emails must be globally unique/i)
+  })
+
+  it.each([0, 1.5, MAX_CART_QUANTITY + 1])(
+    'rejects persisted order quantity outside the integer 1 through maximum range: %s',
+    (quantity) => {
+      const state = createDemoState()
+      state.orders[0].snapshot.quantity = quantity
+
+      expect(() => validateDemoState(state)).toThrow(/order quantity is invalid/i)
+    },
+  )
+
+  it('accepts a persisted order quantity exactly at the maximum', () => {
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    services.auth.oneClick('customer')
+    services.orders.setCartQuantity(MAX_CART_QUANTITY)
+    const order = services.orders.create({
+      requestId: 'checkout_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      quantity: MAX_CART_QUANTITY,
+      shippingMethod: 'standard',
+      address: createDemoState().orders[0].snapshot.address,
+      acknowledged: true,
+      displayedTotalSen: MAX_CART_QUANTITY * BOX_PRICE_SEN + 1200,
+    })
+
+    expect(order.snapshot.quantity).toBe(MAX_CART_QUANTITY)
+    expect(() => validateDemoState(services.repository.getSnapshot())).not.toThrow()
+  })
+
+  it.each(['oddsVersion', 'policyVersion'] as const)(
+    'rejects an order snapshot whose %s does not match its published series',
+    (versionKey) => {
+      const state = createDemoState()
+      state.orders[0].snapshot[versionKey] = 'tampered-version'
+
+      expect(() => validateDemoState(state)).toThrow(/snapshot versions must match its published series/i)
+    },
+  )
+
+  it.each(['reserved', 'paid_unopened', 'void'] as const)(
+    'rejects a revealed box that remains %s',
+    (status) => {
+      const state = createDemoState()
+      const box = state.boxes.find((entry) => entry.id === 'box-unopened-01')!
+      box.revealedAt = '2026-07-25T02:00:00.000Z'
+      box.status = status
+
+      expect(() => validateDemoState(state)).toThrow(/revealed box cannot remain/i)
+    },
+  )
+
+  it('rejects opened status without a reveal time', () => {
+    const state = createDemoState()
+    state.boxes.find((entry) => entry.id === 'box-processing-01')!.revealedAt = undefined
+
+    expect(() => validateDemoState(state)).toThrow(/opened box requires a reveal time/i)
+  })
+
+  it.each([
+    ['box-shipped-01', 'fulfillment_pending'],
+    ['box-delivered-01', 'fulfilled'],
+    ['box-failed-01', 'on_hold'],
+  ] as const)('preserves %s as a revealed box in its later valid %s state', (boxId, status) => {
+    const state = createDemoState()
+    expect(state.boxes.find((box) => box.id === boxId)).toMatchObject({
+      status,
+      revealedAt: expect.any(String),
+    })
+    expect(() => validateDemoState(state)).not.toThrow()
+  })
+
   it('rejects a split order labelled processing after one shipment is delivered', () => {
     const state = createDemoState()
     const order = state.orders.find((entry) => entry.id === 'ord-processing')!
@@ -301,7 +463,7 @@ describe('MockRepository recovery and persistence', () => {
     const state = createDemoState()
     state.payments.find((entry) => entry.id === 'pay-unopened')!.refundedSen = 1000
 
-    expect(() => validateDemoState(state)).toThrow(/non-refund payment status.+zero/i)
+    expect(() => validateDemoState(state)).toThrow(/refund intents|non-refund payment status.+zero/i)
   })
 
   it('rejects an active attempt beside a captured payment', () => {
@@ -381,31 +543,6 @@ describe('MockRepository recovery and persistence', () => {
     ['value-floor claim before reveal', () => {
       const state = servicesWithClaim('value_floor').repository.exportForTest()
       state.boxes.find((entry) => entry.id === 'box-delivered-01')!.revealedAt = '2026-07-29T08:00:00.000Z'
-      return state
-    }],
-    ['shipment claim before every order box reveal', () => {
-      const state = servicesWithClaim('non_delivery').repository.exportForTest()
-      const order = state.orders.find((entry) => entry.id === 'ord-shipped')!
-      const shipment = state.shipments.find((entry) => entry.id === 'shp-shipped')!
-      order.snapshot.quantity = 2
-      order.snapshot.totals.itemSubtotalSen = 20_000
-      order.snapshot.totals.totalSen = 21_200
-      order.boxIds.push('box-shipped-02')
-      state.payments.find((entry) => entry.id === 'pay-shipped')!.amountSen = 21_200
-      shipment.boxIds.push('box-shipped-02')
-      state.boxes.push({
-        id: 'box-shipped-02',
-        manifestId: 'TBBC-001-SHIPPED02',
-        orderId: order.id,
-        ownerId: order.userId,
-        seriesId: order.snapshot.seriesId,
-        number: 2,
-        status: 'fulfillment_pending',
-        prizeId: 'tng',
-        assignedAt: '2026-07-20T01:00:00.000Z',
-        shipmentId: shipment.id,
-      })
-      state.series[0].inventory.find((entry) => entry.prizeId === 'tng')!.assigned += 1
       return state
     }],
     ['customer claim note without DEMO', () => {
@@ -500,18 +637,114 @@ describe('MockRepository recovery and persistence', () => {
     expect(() => validateDemoState(services.repository.getSnapshot())).not.toThrow()
   })
 
+  it('does not use a later returned status as claim-time non-delivery evidence', () => {
+    const state = servicesWithClaim('non_delivery').repository.exportForTest()
+    const claim = state.claims[0]
+    claim.createdAt = '2026-07-20T05:30:00.000Z'
+    claim.updatedAt = claim.createdAt
+    claim.history[0].at = claim.createdAt
+    const shipment = state.shipments.find((entry) => entry.id === 'shp-shipped')!
+    shipment.status = 'returned'
+    shipment.timeline.push({
+      id: 'shp-shipped-later-return',
+      status: 'returned',
+      label: 'Returned after the historical claim time',
+      at: FIXED_NOW,
+    })
+    state.boxes.find((entry) => entry.id === 'box-shipped-01')!.status = 'on_hold'
+
+    expect(() => validateDemoState(state)).toThrow(/non-delivery claim requires eligible evidence at claim creation/i)
+  })
+
+  it('rejects persisted non-delivery claims for a customer return after delivery', () => {
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    services.auth.oneClick('admin')
+    services.fulfilment.advance(
+      'shp-delivered',
+      'returned',
+      'Confirmed post-delivery customer return persistence setup',
+    )
+    const state = services.repository.exportForTest()
+    const order = state.orders.find((entry) => entry.id === 'ord-delivered')!
+    const claim: DemoState['claims'][number] = {
+      id: 'clm-post-delivery-return',
+      requestId: 'req-clm-post-delivery-return',
+      orderId: order.id,
+      userId: order.userId,
+      kind: 'non_delivery',
+      note: 'DEMO post-delivery customer return is not non-delivery',
+      shipmentId: 'shp-delivered',
+      status: 'submitted',
+      createdAt: FIXED_NOW,
+      updatedAt: FIXED_NOW,
+      history: [{
+        id: 'clm-post-delivery-return-h-01',
+        status: 'submitted',
+        note: 'DEMO post-delivery customer return is not non-delivery',
+        actorId: order.userId,
+        actorRole: 'customer',
+        at: FIXED_NOW,
+      }],
+    }
+    state.claims.push(claim)
+    order.claimIds.push(claim.id)
+
+    expect(() => validateDemoState(state)).toThrow(
+      /non-delivery claim requires eligible evidence at claim creation/i,
+    )
+  })
+
+  it.each([
+    ['no evidence scope', (claim: DemoState['claims'][number]) => {
+      delete claim.shipmentCandidateIds
+    }],
+    ['an empty candidate set', (claim: DemoState['claims'][number]) => {
+      claim.shipmentCandidateIds = []
+    }],
+    ['duplicate candidates', (claim: DemoState['claims'][number]) => {
+      claim.shipmentCandidateIds = ['shp-digital', 'shp-digital']
+    }],
+    ['noncanonical candidate order', (claim: DemoState['claims'][number]) => {
+      claim.shipmentCandidateIds = [...claim.shipmentCandidateIds!].reverse()
+    }],
+    ['an eligible-set subset', (claim: DemoState['claims'][number]) => {
+      claim.shipmentCandidateIds = ['shp-digital']
+    }],
+    ['a candidate from another order', (claim: DemoState['claims'][number]) => {
+      claim.shipmentCandidateIds = ['shp-delivered']
+    }],
+    ['both exact and order-level shipment links', (claim: DemoState['claims'][number]) => {
+      claim.shipmentId = 'shp-digital'
+    }],
+    ['an exact shipment while a box was sealed', (claim: DemoState['claims'][number]) => {
+      delete claim.shipmentCandidateIds
+      claim.shipmentId = 'shp-processing'
+    }],
+  ] as const)('rejects order-level claim corruption with %s', (_label, mutate) => {
+    const state = stateWithSealedMultiShipmentClaim()
+    mutate(state.claims[0])
+    expect(() => validateDemoState(state)).toThrow()
+  })
+
   const malformedCases: Array<[string, (state: DemoState) => void]> = [
     ['missing cart', (state) => { delete (state as Partial<DemoState>).cart }],
     ['missing claims', (state) => { delete (state as Partial<DemoState>).claims }],
     ['non-integer revision', (state) => { state.revision = 1.5 }],
     ['invalid sequence counter', (state) => { state.nextSequence = 0 }],
     ['duplicate user ID', (state) => { state.users[1].id = state.users[0].id }],
+    ['real user email', (state) => { state.users[0].email = 'person@gmail.com' }],
+    ['non-fictional user name', (state) => { state.users[0].name = 'Aina Person' }],
+    ['unsafe user name', (state) => { state.users[0].name = '<script>Demo</script>' }],
     ['invalid checkout request identity', (state) => { state.orders[0].checkoutRequestId = 'unsafe' }],
     ['duplicate checkout request identity', (state) => { state.orders[1].checkoutRequestId = state.orders[0].checkoutRequestId }],
     ['unknown session user', (state) => { state.sessionUserId = 'usr-missing' }],
     ['negative assigned count', (state) => { state.series[0].inventory[0].assigned = -1 }],
     ['negative reserved count', (state) => { state.series[0].reservedBoxes = -1 }],
     ['wrong allocation total', (state) => { state.series[0].allocationTotal -= 1 }],
+    ['published allocation other than exactly 10,000', (state) => {
+      state.series[0].allocationTotal += 1
+      state.series[0].publishedPrizes![0].allocation += 1
+    }],
     ['invalid order status', (state) => {
       state.orders[0].status = 'mystery' as never
       state.orders[0].timeline.at(-1)!.status = 'mystery' as never
@@ -523,6 +756,7 @@ describe('MockRepository recovery and persistence', () => {
     ['missing order address', (state) => { delete (state.orders[0].snapshot as Partial<DemoState['orders'][number]['snapshot']>).address }],
     ['non-fictional order address', (state) => { state.orders[0].snapshot.address.line1 = '12 Real Street' }],
     ['non-fictional order phone', (state) => { state.orders[0].snapshot.address.phone = '010-123-4567' }],
+    ['unnormalized order address', (state) => { state.orders[0].snapshot.address.city = '  Kuala Lumpur  ' }],
     ['invalid order acknowledgement', (state) => { state.orders[0].snapshot.acknowledgement = 'Accepted' }],
     ['invalid shipping method', (state) => { state.orders[0].snapshot.shippingMethod = 'teleport' as never }],
     ['invalid payment method', (state) => { state.payments[0].method = 'CASH' as never }],
@@ -554,10 +788,61 @@ describe('MockRepository recovery and persistence', () => {
         ignoredReason: { reason: 'ignored' } as unknown as string,
       })
     }],
+    ['refund intent with wrong payment', (state) => {
+      state.payments.find((payment) => payment.id === 'pay-refunded')!
+        .events.find((event) => event.type === 'refunded')!
+        .refundIntent!.paymentId = 'pay-unopened'
+    }],
+    ['refund amount unexplained by intent', (state) => {
+      state.payments.find((payment) => payment.id === 'pay-refunded')!
+        .events.find((event) => event.type === 'refunded')!
+        .refundIntent!.amountSen -= 1
+    }],
+    ['coherent lower unit price, subtotal, total, and linked payment amount', (state) => {
+      const order = state.orders.find((entry) => entry.id === 'ord-unopened')!
+      const payment = state.payments.find((entry) => entry.id === 'pay-unopened')!
+      order.snapshot.unitPriceSen = 9000
+      order.snapshot.totals.itemSubtotalSen = 9000 * order.snapshot.quantity
+      order.snapshot.totals.totalSen =
+        order.snapshot.totals.itemSubtotalSen + order.snapshot.totals.shippingSen
+      payment.amountSen = order.snapshot.totals.totalSen
+    }],
+    ['altered shipping, total, and linked payment amount', (state) => {
+      const order = state.orders.find((entry) => entry.id === 'ord-unopened')!
+      const payment = state.payments.find((entry) => entry.id === 'pay-unopened')!
+      order.snapshot.totals.shippingSen = 100
+      order.snapshot.totals.totalSen =
+        order.snapshot.totals.itemSubtotalSen + order.snapshot.totals.shippingSen
+      payment.amountSen = order.snapshot.totals.totalSen
+    }],
     ['wrong calculated subtotal', (state) => { state.orders[0].snapshot.totals.itemSubtotalSen += 100 }],
     ['broken order user reference', (state) => { state.orders[0].userId = 'usr-missing' }],
     ['broken shipment reference', (state) => { state.boxes[0].shipmentId = 'shp-missing' }],
+    ['shipment kind mismatched with its linked prize', (state) => {
+      state.shipments.find((entry) => entry.id === 'shp-unopened')!.kind = 'BULKY'
+    }],
+    ['shipment kind mismatched with a coherent self-collect order edit', (state) => {
+      const order = state.orders.find((entry) => entry.id === 'ord-unopened')!
+      const payment = state.payments.find((entry) => entry.id === 'pay-unopened')!
+      order.snapshot.shippingMethod = 'self_collect'
+      order.snapshot.totals.shippingSen = 0
+      order.snapshot.totals.totalSen = order.snapshot.totals.itemSubtotalSen
+      payment.amountSen = order.snapshot.totals.totalSen
+    }],
+    ['shipment insurance below linked prize requirements', (state) => {
+      state.shipments.find((entry) => entry.id === 'shp-shipped')!.insured = false
+    }],
+    ['shipment signature below linked prize requirements', (state) => {
+      state.shipments.find((entry) => entry.id === 'shp-shipped')!.signatureRequired = false
+    }],
+    ['shipment carrier that is not clearly fictional', (state) => {
+      state.shipments.find((entry) => entry.id === 'shp-unopened')!.carrier = 'DHL'
+    }],
+    ['shipment tracking without a DEMO code', (state) => {
+      state.shipments.find((entry) => entry.id === 'shp-unopened')!.trackingNumber = 'REAL-TRACKING-001'
+    }],
     ['invalid cart quantity', (state) => { state.cart[0].quantity = -1 }],
+    ['altered fixed cart price', (state) => { state.cart[0].unitPriceSen -= 100 }],
     ['order updated before creation', (state) => { state.orders[0].updatedAt = '2026-07-24T23:59:00.000Z' }],
     ['order timeline out of sequence', (state) => { state.orders[0].timeline[1].at = '2026-07-24T23:59:00.000Z' }],
     ['payment event before payment creation', (state) => {
@@ -641,6 +926,44 @@ describe('MockRepository recovery and persistence', () => {
     const storage = new MemoryStorage()
     const malformed = createDemoState()
     mutate(malformed)
+    storage.seed(STORAGE_KEY, JSON.stringify(malformed))
+    const repository = new MockRepository(storage)
+    expect(repository.recoveryNotice).toMatch(/replaced/i)
+    expect(repository.getSnapshot()).toEqual(createDemoState())
+  })
+
+  it.each([
+    ['missing resolution outcome', (claim: DemoState['claims'][number]) => {
+      claim.resolutionOutcome = undefined
+    }],
+    ['invalid resolution outcome', (claim: DemoState['claims'][number]) => {
+      claim.resolutionOutcome = 'cash_sent' as never
+    }],
+    ['non-fictional resolution reference', (claim: DemoState['claims'][number]) => {
+      claim.resolutionReference = 'REAL-REPLACEMENT-001'
+    }],
+    ['short non-refund resolution note', (claim: DemoState['claims'][number]) => {
+      claim.resolutionNote = 'Too short'
+    }],
+    ['unverified refund resolution reference', (claim: DemoState['claims'][number]) => {
+      claim.resolutionOutcome = 'refund_recorded'
+      claim.resolutionReference = 'evt-ord-refunded-refund'
+    }],
+  ] as const)('recovers current-schema claim resolution corruption: %s', (_label, mutate) => {
+    const services = servicesWithClaim('damage')
+    const claim = services.repository.getSnapshot().claims[0]
+    services.auth.oneClick('admin')
+    services.claims.review(claim.id, 'acknowledge', 'Confirmed resolution corruption acknowledgement')
+    services.claims.review(claim.id, 'approve', 'Confirmed resolution corruption approval')
+    services.claims.review(
+      claim.id,
+      'resolve',
+      'Confirmed sufficiently descriptive fictional replacement resolution',
+      { outcome: 'replacement_authorized', reference: `DEMO-${claim.id.toUpperCase()}` },
+    )
+    const malformed = services.repository.exportForTest()
+    mutate(malformed.claims[0])
+    const storage = new MemoryStorage()
     storage.seed(STORAGE_KEY, JSON.stringify(malformed))
     const repository = new MockRepository(storage)
     expect(repository.recoveryNotice).toMatch(/replaced/i)

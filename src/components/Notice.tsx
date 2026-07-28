@@ -1,3 +1,12 @@
 export function Notice({ children, tone = 'info' }: { children: React.ReactNode; tone?: 'info' | 'danger' | 'success' }) {
-  return <div className={`notice notice-${tone}`} role="status" aria-live="polite">{children}</div>
+  const urgent = tone === 'danger'
+  return (
+    <div
+      className={`notice notice-${tone}`}
+      role={urgent ? 'alert' : 'status'}
+      aria-live={urgent ? 'assertive' : 'polite'}
+    >
+      {children}
+    </div>
+  )
 }

@@ -4,6 +4,15 @@ import { describe, expect, it } from 'vitest'
 
 const read = (path: string) => readFileSync(resolve(process.cwd(), path), 'utf8')
 
+function jobSection(workflow: string, job: string) {
+  const marker = `  ${job}:\n`
+  const start = workflow.indexOf(marker)
+  if (start < 0) throw new Error(`Workflow job ${job} is missing.`)
+  const remaining = workflow.slice(start + marker.length)
+  const nextJob = remaining.search(/^ {2}[A-Za-z0-9_-]+:\s*$/m)
+  return nextJob < 0 ? remaining : remaining.slice(0, nextJob)
+}
+
 function channel(hex: string) {
   return Number.parseInt(hex, 16) / 255
 }
@@ -38,27 +47,51 @@ describe('release and responsive safety configuration', () => {
     expect(deployJob).toContain('needs: build-test-upload')
   })
 
+  it('keeps the root error boundary outside provider construction', () => {
+    const main = read('src/main.tsx')
+    expect(main).toMatch(/<ErrorBoundary>\s*<AppStateProvider>[\s\S]*?<\/AppStateProvider>\s*<\/ErrorBoundary>/)
+  })
+
   it('pins the runner, Node and Playwright package while keeping local Chrome separate from CI Chromium', () => {
-    const workflows = readdirSync(resolve(process.cwd(), '.github/workflows'))
-      .filter((name) => /\.ya?ml$/.test(name))
-      .map((name) => read(`.github/workflows/${name}`))
-      .join('\n')
+    const ci = read('.github/workflows/ci.yml')
+    const pages = read('.github/workflows/pages.yml')
+    const workflows = `${ci}\n${pages}`
     const packageJson = JSON.parse(read('package.json')) as {
       scripts: Record<string, string>
       devDependencies: Record<string, string>
+      engines: { node: string }
+      packageManager: string
     }
     const packageLock = JSON.parse(read('package-lock.json')) as {
-      packages: Record<string, { devDependencies?: Record<string, string> }>
+      packages: Record<string, {
+        devDependencies?: Record<string, string>
+        engines?: { node?: string }
+      }>
     }
     const config = read('playwright.config.ts')
     const runners = [...workflows.matchAll(/runs-on:\s*([^\s]+)/g)]
     const nodeVersions = [...workflows.matchAll(/node-version:\s*([^\s]+)/g)]
+    const expectedTimeouts = [
+      [ci, 'verify', 10],
+      [ci, 'e2e', 20],
+      [pages, 'build-test-upload', 25],
+      [pages, 'deploy', 5],
+    ] as const
 
     expect(workflows).not.toContain('ubuntu-latest')
     expect(runners.length).toBeGreaterThan(0)
     expect(runners.every((match) => match[1] === 'ubuntu-24.04')).toBe(true)
     expect(nodeVersions.length).toBeGreaterThan(0)
     expect(nodeVersions.every((match) => match[1] === '22.22.3')).toBe(true)
+    expect(packageJson.engines).toEqual({ node: '22.22.3' })
+    expect(packageJson.packageManager).toBe('npm@10.9.8')
+    expect(packageLock.packages[''].engines).toEqual({ node: '22.22.3' })
+    expect(workflows.match(/^\s+timeout-minutes:\s+\d+$/gm)).toHaveLength(expectedTimeouts.length)
+    for (const [workflow, job, timeout] of expectedTimeouts) {
+      expect(jobSection(workflow, job)).toMatch(
+        new RegExp(`^ {4}timeout-minutes: ${timeout}$`, 'm'),
+      )
+    }
     expect(workflows).not.toMatch(/\bnpx playwright\b/)
     expect(workflows).not.toContain('install --with-deps chrome')
     expect(workflows).toContain('./node_modules/.bin/playwright install --with-deps chromium')
@@ -70,7 +103,32 @@ describe('release and responsive safety configuration', () => {
     expect(config).toContain("process.env.PLAYWRIGHT_EXISTING_DIST === '1'")
     expect(config).toContain("process.env.PLAYWRIGHT_BROWSER === 'chromium'")
     expect(config).toContain("channel: 'chrome'")
+    expect(config).toContain("const previewURL = 'http://127.0.0.1:4173/theblindboxcompany/'")
+    expect(config).toContain("const browserBaseURL = useBundledChromium ? `${previewURL}?nogl=1` : previewURL")
+    expect(config).toContain('baseURL: browserBaseURL')
+    expect(config).toContain('url: previewURL')
+    expect(config).toContain('./node_modules/.bin/vite preview --host 127.0.0.1 --port 4173')
+    expect(config).not.toContain('npm exec vite preview')
+    expect(config).not.toMatch(/webServer:[\s\S]*?url:\s*[^,\n]*nogl/)
     expect(config).toContain('reuseExistingServer: false')
+  })
+
+  it('disables checkout credential persistence without changing pinned actions', () => {
+    const workflows = readdirSync(resolve(process.cwd(), '.github/workflows'))
+      .filter((name) => /\.ya?ml$/.test(name))
+      .map((name) => read(`.github/workflows/${name}`))
+      .join('\n')
+    const checkouts = workflows.split('\n').flatMap((line, index, lines) =>
+      line.includes('uses: actions/checkout@')
+        ? [{ line, following: lines.slice(index + 1, index + 4).join('\n') }]
+        : [],
+    )
+
+    expect(checkouts.length).toBeGreaterThan(0)
+    for (const checkout of checkouts) {
+      expect(checkout.line).toContain('actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4')
+      expect(checkout.following).toMatch(/with:\s*\n\s+persist-credentials:\s*false/)
+    }
   })
 
   it('pins every official GitHub Action and rejects mutable major-version tags', () => {

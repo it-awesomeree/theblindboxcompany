@@ -6,6 +6,12 @@ import { ConfirmDialog } from '../../components/ConfirmDialog'
 import { Notice } from '../../components/Notice'
 import { StatusBadge } from '../../components/StatusBadge'
 import { ADMIN_SECTION_PERMISSIONS, type AdminSection } from '../../domain/constants'
+import { isOpenClaimStatus } from '../../domain/claimStatus'
+import {
+  shipmentStatusActionEligibility,
+  shipmentTrackingActionEligibility,
+} from '../../domain/fulfillmentEligibility'
+import { paymentRetryEligibility } from '../../domain/paymentEligibility'
 import { prizeForBox, publishedPrizesFor } from '../../domain/selectors'
 import type { ClaimResolutionOutcome, ShipmentStatus } from '../../domain/types'
 import type { ClaimReviewAction } from '../../services/ClaimService'
@@ -71,7 +77,7 @@ function AdminDashboardContent() {
   const { services, state } = useAppState()
   const metrics = services.admin.dashboard()
   const exceptions = state.shipments.filter((entry) => ['failed_delivery', 'lost', 'returned'].includes(entry.status))
-  const openClaims = state.claims.filter((entry) => !['rejected', 'resolved'].includes(entry.status))
+  const openClaims = state.claims.filter((entry) => isOpenClaimStatus(entry.status))
   return (
     <>
       <AdminHeading code="A00" title="Vault overview" description="Current fictional operations snapshot. Nothing here controls a real store." />
@@ -83,7 +89,7 @@ function AdminDashboardContent() {
       </div>
       <div className="admin-dashboard-grid">
         <section className="panel">
-          <div className="panel-heading"><div><span>PRIORITY QUEUE</span><h2>Needs fictional attention</h2></div><b>{exceptions.length + metrics.paymentExceptions + openClaims.length}</b></div>
+          <div className="panel-heading"><div><span>PRIORITY QUEUE</span><h2>Needs fictional attention</h2></div><b>{exceptions.length + metrics.paymentExceptions + metrics.openClaims}</b></div>
           <div className="queue-list">
             {exceptions.map((shipment) => <Link key={shipment.id} to="/admin/fulfilment"><StatusBadge value={shipment.status} /><span><b>{shipment.trackingNumber}</b><small>{shipment.kind} · {shipment.orderId}</small></span><i>→</i></Link>)}
             {state.payments.filter((entry) => ['failed', 'expired', 'disputed'].includes(entry.status)).map((payment) => <Link key={payment.id} to="/admin/payments"><StatusBadge value={payment.status} /><span><b>{payment.id}</b><small>{formatMYR(payment.amountSen)} · attempt {payment.attempt}</small></span><i>→</i></Link>)}
@@ -405,10 +411,19 @@ export function AdminPaymentsPage() {
     <div className="admin-record-list">
       {[...filteredPayments].reverse().map((payment) => {
         const remainingSen = payment.amountSen - payment.refundedSen
+        const order = state.orders.find((entry) => entry.id === payment.orderId)
+        const orderPayments = order
+          ? order.paymentIds
+              .map((id) => state.payments.find((entry) => entry.id === id))
+              .filter((entry) => entry !== undefined)
+          : []
+        const canRetry = Boolean(
+          order && paymentRetryEligibility(order, payment, orderPayments).eligible,
+        )
         return <details className="admin-record payment-record" key={payment.id}>
           <summary><span><b>{payment.id}</b><small>{payment.method ?? 'NO METHOD'} · attempt {payment.attempt}</small></span><span>{formatMYR(payment.amountSen)}<small>refunded {formatMYR(payment.refundedSen)}</small></span><StatusBadge value={payment.status} /></summary>
           <div className="record-actions">
-            {['failed', 'cancelled', 'expired'].includes(payment.status) && <button className="button button-ghost" type="button" onClick={() => setPending({ kind: 'retry', id: payment.id })}>Retry attempt</button>}
+            {canRetry && <button className="button button-ghost" type="button" onClick={() => setPending({ kind: 'retry', id: payment.id })}>Retry attempt</button>}
             {['pending', 'processing'].includes(payment.status) && <button className="button" type="button" onClick={() => setPending({ kind: 'reconcile', id: payment.id })}>Reconcile succeeded</button>}
             {['succeeded', 'partially_refunded'].includes(payment.status) && remainingSen > 1000 && <button className="button button-ghost" type="button" onClick={() => setPending({ kind: 'partial', id: payment.id })}>Partial refund RM10</button>}
             {['succeeded', 'partially_refunded'].includes(payment.status) && remainingSen > 0 && <button className="button button-danger" type="button" onClick={() => setPending({ kind: 'full', id: payment.id })}>Refund remaining {formatMYR(remainingSen)}</button>}
@@ -438,6 +453,7 @@ export function AdminInventoryPage() {
   const [draftName, setDraftName] = useState(draft?.draftPrizes?.[0]?.name ?? publishedPrizes[0].name)
   const [draftValue, setDraftValue] = useState((draft?.draftPrizes?.[0]?.valueSen ?? publishedPrizes[0].valueSen) / 100)
   const assigned = published.inventory.reduce((sum, entry) => sum + entry.assigned, 0)
+  const draftNameValid = draftName.trim().length > 0
 
   const copy = () => {
     try {
@@ -475,9 +491,9 @@ export function AdminInventoryPage() {
       <div className="panel-heading"><div><span>DRAFT WORKSPACE</span><h2>{draft ? draft.name : 'No draft copy'}</h2></div><StatusBadge value={draft ? 'draft' : 'published'} /></div>
       {!draft ? <button className="button" type="button" onClick={copy}>Copy published series to draft</button> : (
         <div className="form-grid">
-          <label>Draft Maggi name<input value={draftName} onChange={(event) => setDraftName(event.target.value)} /></label>
+          <label>Draft Maggi name<input required value={draftName} onChange={(event) => setDraftName(event.target.value)} />{!draftNameValid && <small>Prize name cannot be blank.</small>}</label>
           <label>Draft value in RM<input type="number" min="100" step="1" value={draftValue} onChange={(event) => setDraftValue(Number(event.target.value))} /></label>
-          <button className="button" type="button" onClick={saveDraft}>Save draft-only edit</button>
+          <button className="button" type="button" disabled={!draftNameValid} onClick={saveDraft}>Save draft-only edit</button>
         </div>
       )}
     </section>
@@ -547,20 +563,27 @@ export function AdminFulfilmentPage() {
     <div className="shipment-admin-grid">
       {state.shipments.map((shipment) => {
         const next = nextStatus[shipment.status]
+        const order = state.orders.find((entry) => entry.id === shipment.orderId)
+        const canMoveTo = (status: ShipmentStatus) => Boolean(
+          order && shipmentStatusActionEligibility(order.status, shipment, status).eligible,
+        )
+        const canEditTracking = Boolean(
+          order && shipmentTrackingActionEligibility(order.status, shipment).eligible,
+        )
         return <article className="panel shipment-admin-card" key={shipment.id}>
           <div className="panel-heading"><div><span>{shipment.kind} / {shipment.id}</span><h2>{shipment.trackingNumber}</h2></div><StatusBadge value={shipment.status} /></div>
           <dl className="detail-list compact"><div><dt>Carrier</dt><dd>{shipment.carrier}</dd></div><div><dt>Boxes</dt><dd>{shipment.boxIds.join(', ')}</dd></div><div><dt>Controls</dt><dd>{shipment.insured ? 'Insured' : 'Standard'}{shipment.signatureRequired ? ' · signature required' : ''}</dd></div></dl>
           <div className="record-actions">
-            {next && <button className="button" type="button" onClick={() => setPending({ kind: 'status', id: shipment.id, status: next })}>Mark {titleCase(next)}</button>}
-            {['unfulfilled', 'picking', 'packed', 'label_created'].includes(shipment.status) && (
+            {next && canMoveTo(next) && <button className="button" type="button" onClick={() => setPending({ kind: 'status', id: shipment.id, status: next })}>Mark {titleCase(next)}</button>}
+            {canEditTracking && (
               <button className="button button-ghost" type="button" onClick={() => setEditing({ id: shipment.id, carrier: shipment.carrier, trackingNumber: shipment.trackingNumber })}>
                 Edit carrier &amp; tracking
               </button>
             )}
-            {shipment.status === 'shipped' && <button className="button button-danger" type="button" onClick={() => setPending({ kind: 'status', id: shipment.id, status: 'failed_delivery' })}>Delivery exception</button>}
-            {shipment.status === 'shipped' && <button className="button button-danger" type="button" onClick={() => setPending({ kind: 'status', id: shipment.id, status: 'lost' })}>Mark lost</button>}
-            {shipment.status === 'shipped' && <button className="button button-ghost" type="button" onClick={() => setPending({ kind: 'status', id: shipment.id, status: 'returned' })}>Mark returned</button>}
-            {shipment.status === 'delivered' && <button className="button button-ghost" type="button" onClick={() => setPending({ kind: 'status', id: shipment.id, status: 'returned' })}>Record post-delivery return</button>}
+            {shipment.status === 'shipped' && canMoveTo('failed_delivery') && <button className="button button-danger" type="button" onClick={() => setPending({ kind: 'status', id: shipment.id, status: 'failed_delivery' })}>Delivery exception</button>}
+            {shipment.status === 'shipped' && canMoveTo('lost') && <button className="button button-danger" type="button" onClick={() => setPending({ kind: 'status', id: shipment.id, status: 'lost' })}>Mark lost</button>}
+            {shipment.status === 'shipped' && canMoveTo('returned') && <button className="button button-ghost" type="button" onClick={() => setPending({ kind: 'status', id: shipment.id, status: 'returned' })}>Mark returned</button>}
+            {shipment.status === 'delivered' && canMoveTo('returned') && <button className="button button-ghost" type="button" onClick={() => setPending({ kind: 'status', id: shipment.id, status: 'returned' })}>Record post-delivery return</button>}
           </div>
           {editing?.id === shipment.id && (
             <div className="tracking-entry-form">

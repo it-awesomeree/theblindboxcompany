@@ -245,6 +245,7 @@ export interface Claim {
   note: string
   shipmentId?: string
   shipmentCandidateIds?: string[]
+  shipmentCandidateEvidenceAt?: Record<string, string>
   boxId?: string
   status: ClaimStatus
   createdAt: string

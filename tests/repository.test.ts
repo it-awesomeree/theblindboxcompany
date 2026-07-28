@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { MockRepository, STORAGE_KEY } from '../src/data/MockRepository'
 import { createDemoState } from '../src/data/fixtures'
 import { validateDemoState } from '../src/data/StateValidator'
+import { CLAIM_EVIDENCE_WIDENING_NOTE } from '../src/domain/claimStatus'
 import { BOX_PRICE_SEN, MAX_CART_QUANTITY } from '../src/domain/constants'
 import type { DemoState } from '../src/domain/types'
 import { AppServices } from '../src/services/AppServices'
@@ -87,6 +88,39 @@ function stateWithSealedMultiShipmentClaim() {
     kind: 'non_delivery',
     orderLevelDelivery: true,
     note: 'DEMO canonical order-level candidate validation',
+  })
+  return services.repository.exportForTest()
+}
+
+function stateWithWidenedSealedClaim() {
+  let now = '2026-07-28T04:00:00.000Z'
+  const services = new AppServices(new MemoryStorage(), () => now)
+  makeProcessingOrderTwoPhysicalShipments(services)
+  services.auth.oneClick('admin')
+  now = '2026-07-28T05:00:00.000Z'
+  for (const status of ['packed', 'label_created', 'shipped', 'failed_delivery'] as const) {
+    services.fulfilment.advance('shp-processing', status, `Confirmed persisted first evidence ${status}`)
+  }
+  services.auth.oneClick('customer')
+  now = '2026-07-28T06:00:00.000Z'
+  services.claims.submit({
+    orderId: 'ord-processing',
+    kind: 'non_delivery',
+    orderLevelDelivery: true,
+    note: 'DEMO persisted first neutral evidence',
+  })
+  services.auth.oneClick('admin')
+  now = '2026-07-28T07:00:00.000Z'
+  for (const status of ['picking', 'packed', 'label_created', 'shipped', 'failed_delivery'] as const) {
+    services.fulfilment.advance('shp-digital', status, `Confirmed persisted second evidence ${status}`)
+  }
+  services.auth.oneClick('customer')
+  now = '2026-07-28T08:00:00.000Z'
+  services.claims.submit({
+    orderId: 'ord-processing',
+    kind: 'non_delivery',
+    orderLevelDelivery: true,
+    note: 'DEMO persisted widened neutral evidence',
   })
   return services.repository.exportForTest()
 }
@@ -339,6 +373,14 @@ describe('MockRepository recovery and persistence', () => {
     expect(state.boxes.find((box) => box.id === 'box-failed-01')?.status).toBe('on_hold')
     expect(state.orders.find((order) => order.id === 'ord-shipped')?.status).toBe('processing')
     expect(state.shipments.every((shipment) => shipment.timeline.at(-1)?.status === shipment.status)).toBe(true)
+  })
+
+  it('rejects an order timeline whose creation row is not pending payment', () => {
+    const state = createDemoState()
+    state.orders.find((order) => order.id === 'ord-processing')!.timeline[0].status =
+      'confirmed'
+
+    expect(() => validateDemoState(state)).toThrow(/begin at pending payment/i)
   })
 
   it('rejects duplicate normalized user emails even when user IDs differ', () => {
@@ -724,6 +766,138 @@ describe('MockRepository recovery and persistence', () => {
     const state = stateWithSealedMultiShipmentClaim()
     mutate(state.claims[0])
     expect(() => validateDemoState(state)).toThrow()
+  })
+
+  it.each([
+    ['blank name', (state: DemoState) => {
+      state.series.find((entry) => entry.status === 'draft')!.draftPrizes![0].name = '   '
+    }],
+    ['blank independent short name', (state: DemoState) => {
+      state.series.find((entry) => entry.status === 'draft')!.draftPrizes![0].shortName = '\t'
+    }],
+    ['blank odds', (state: DemoState) => {
+      state.series.find((entry) => entry.status === 'draft')!.draftPrizes![0].odds = ''
+    }],
+    ['invalid tier', (state: DemoState) => {
+      state.series.find((entry) => entry.status === 'draft')!.draftPrizes![0].tier = 'Ultra' as never
+    }],
+    ['invalid allocation', (state: DemoState) => {
+      state.series.find((entry) => entry.status === 'draft')!.draftPrizes![0].allocation = 0
+    }],
+    ['invalid insurance flag', (state: DemoState) => {
+      state.series.find((entry) => entry.status === 'draft')!.draftPrizes![0].insured = 'yes' as never
+    }],
+  ] as const)('recovers corrupted persisted draft prize definition: %s', (_label, mutate) => {
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    services.auth.oneClick('admin')
+    services.admin.copyPublishedToDraft()
+    const malformed = services.repository.exportForTest()
+    mutate(malformed)
+    const storage = new MemoryStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(malformed))
+
+    const repository = new MockRepository(storage)
+
+    expect(repository.recoveryNotice).toMatch(/replaced/i)
+    expect(repository.getSnapshot()).toEqual(createDemoState())
+  })
+
+  it.each([
+    ['missing evidence key', (state: DemoState) => {
+      delete state.claims[0].shipmentCandidateEvidenceAt!['shp-digital']
+    }],
+    ['evidence before claim creation', (state: DemoState) => {
+      state.claims[0].shipmentCandidateEvidenceAt!['shp-digital'] =
+        '2026-07-28T05:00:00.000Z'
+    }],
+    ['missing widening audit', (state: DemoState) => {
+      state.audits = state.audits.filter((audit) =>
+        audit.action !== 'claim.order_level_evidence_widened')
+    }],
+    ['all candidate evidence moved after creation', (state: DemoState) => {
+      state.claims[0].shipmentCandidateEvidenceAt!['shp-processing'] =
+        '2026-07-28T08:00:00.000Z'
+      const wideningAudit = state.audits.find((audit) =>
+        audit.action === 'claim.order_level_evidence_widened')!
+      wideningAudit.before = { shipmentCandidateIds: [] }
+    }],
+    ['missing widening history', (state: DemoState) => {
+      state.claims[0].history = state.claims[0].history.filter((entry) =>
+        entry.note !== CLAIM_EVIDENCE_WIDENING_NOTE)
+    }],
+    ['altered widening history', (state: DemoState) => {
+      state.claims[0].history.find((entry) =>
+        entry.note === CLAIM_EVIDENCE_WIDENING_NOTE)!.note =
+          'Altered neutral evidence history'
+    }],
+    ['candidate not included by canonical evidence snapshots', (state: DemoState) => {
+      state.claims[0].shipmentCandidateIds!.push('shp-shipped')
+      state.claims[0].shipmentCandidateIds!.sort((left, right) => left.localeCompare(right))
+      state.claims[0].shipmentCandidateEvidenceAt!['shp-shipped'] =
+        '2026-07-28T08:00:00.000Z'
+    }],
+  ] as const)('rejects widened order-level claim corruption with %s', (_label, mutate) => {
+    const state = stateWithWidenedSealedClaim()
+    mutate(state)
+    expect(() => validateDemoState(state)).toThrow()
+  })
+
+  it('rejects mapped evidence widened after a claim was approved', () => {
+    const state = stateWithWidenedSealedClaim()
+    const claim = state.claims[0]
+    claim.history = claim.history.filter((entry) =>
+      entry.note !== CLAIM_EVIDENCE_WIDENING_NOTE)
+    state.audits = state.audits.filter((audit) =>
+      audit.action !== 'claim.order_level_evidence_widened')
+    claim.shipmentCandidateEvidenceAt!['shp-digital'] =
+      '2026-07-28T11:00:00.000Z'
+    claim.status = 'approved'
+    claim.updatedAt = '2026-07-28T11:00:00.000Z'
+    claim.history.push(
+      {
+        id: `${claim.id}-h-reviewing-corrupt`,
+        status: 'reviewing',
+        note: 'Confirmed fictional review before approval.',
+        actorId: 'usr-demo-admin',
+        actorRole: 'super_admin',
+        at: '2026-07-28T09:00:00.000Z',
+      },
+      {
+        id: `${claim.id}-h-approved-corrupt`,
+        status: 'approved',
+        note: 'Confirmed fictional approval freezing evidence.',
+        actorId: 'usr-demo-admin',
+        actorRole: 'super_admin',
+        at: '2026-07-28T10:00:00.000Z',
+      },
+      {
+        id: `${claim.id}-h-widened-after-approval-corrupt`,
+        status: 'approved',
+        note: CLAIM_EVIDENCE_WIDENING_NOTE,
+        actorId: claim.userId,
+        actorRole: 'customer',
+        at: '2026-07-28T11:00:00.000Z',
+      },
+    )
+    state.audits.push({
+      id: 'audit-approved-evidence-freeze-corrupt',
+      actorId: claim.userId,
+      actorRole: 'customer',
+      action: 'claim.order_level_evidence_widened',
+      targetType: 'claim',
+      targetId: claim.id,
+      reason: CLAIM_EVIDENCE_WIDENING_NOTE,
+      at: '2026-07-28T11:00:00.000Z',
+      requestId: 'req-approved-evidence-freeze-corrupt',
+      before: { shipmentCandidateIds: ['shp-processing'] },
+      after: {
+        shipmentCandidateIds: ['shp-digital', 'shp-processing'],
+        shipmentCandidateEvidenceAt: claim.shipmentCandidateEvidenceAt,
+        refundCreated: false,
+      },
+    })
+
+    expect(() => validateDemoState(state)).toThrow(/unchanged-status customer history/i)
   })
 
   const malformedCases: Array<[string, (state: DemoState) => void]> = [

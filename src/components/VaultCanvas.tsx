@@ -194,37 +194,90 @@ export function VaultCanvas({
       showFallback()
       return
     }
+    let vertex: WebGLShader | null = null
+    let fragment: WebGLShader | null = null
+    let program: WebGLProgram | null = null
+    let buffer: WebGLBuffer | null = null
+    let vertexAttached = false
+    let fragmentAttached = false
+    let resourcesReleased = false
+    const safely = (action: () => void) => {
+      try {
+        action()
+      } catch {
+        // Lost or partially initialized WebGL contexts may reject cleanup calls.
+      }
+    }
+    const releaseResources = () => {
+      if (resourcesReleased) return
+      resourcesReleased = true
+      safely(() => gl!.bindBuffer(gl!.ARRAY_BUFFER, null))
+      safely(() => gl!.useProgram(null))
+      if (program && vertex && vertexAttached) {
+        safely(() => gl!.detachShader(program!, vertex!))
+      }
+      if (program && fragment && fragmentAttached) {
+        safely(() => gl!.detachShader(program!, fragment!))
+      }
+      if (buffer) safely(() => gl!.deleteBuffer(buffer!))
+      if (program) safely(() => gl!.deleteProgram(program!))
+      if (vertex) safely(() => gl!.deleteShader(vertex!))
+      if (fragment) safely(() => gl!.deleteShader(fragment!))
+      buffer = null
+      program = null
+      vertex = null
+      fragment = null
+      vertexAttached = false
+      fragmentAttached = false
+    }
+    const failSetup = () => {
+      releaseResources()
+      showFallback()
+    }
     const compile = (type: number, source: string) => {
       const shader = gl!.createShader(type)
       if (!shader) return null
       gl!.shaderSource(shader, source)
       gl!.compileShader(shader)
-      if (!gl!.getShaderParameter(shader, gl!.COMPILE_STATUS)) return null
+      if (!gl!.getShaderParameter(shader, gl!.COMPILE_STATUS)) {
+        safely(() => gl!.deleteShader(shader))
+        return null
+      }
       return shader
     }
-    const vertex = compile(gl.VERTEX_SHADER, VERT)
-    const fragment = compile(gl.FRAGMENT_SHADER, FRAG)
+    vertex = compile(gl.VERTEX_SHADER, VERT)
+    fragment = compile(gl.FRAGMENT_SHADER, FRAG)
     if (!vertex || !fragment) {
-      showFallback()
+      failSetup()
       return
     }
-    const program = gl.createProgram()
+    program = gl.createProgram()
     if (!program) {
-      showFallback()
+      failSetup()
       return
     }
     gl.attachShader(program, vertex)
+    vertexAttached = true
     gl.attachShader(program, fragment)
+    fragmentAttached = true
     gl.linkProgram(program)
     if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-      showFallback()
+      failSetup()
       return
     }
     gl.useProgram(program)
-    const buffer = gl.createBuffer()
+    buffer = gl.createBuffer()
+    if (!buffer) {
+      failSetup()
+      return
+    }
     gl.bindBuffer(gl.ARRAY_BUFFER, buffer)
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW)
     const position = gl.getAttribLocation(program, 'aPos')
+    if (position < 0) {
+      failSetup()
+      return
+    }
     gl.enableVertexAttribArray(position)
     gl.vertexAttribPointer(position, 2, gl.FLOAT, false, 0, 0)
     const uniforms = {
@@ -307,6 +360,7 @@ export function VaultCanvas({
       event.preventDefault()
       running = false
       window.cancelAnimationFrame(frame)
+      releaseResources()
       showFallback()
     }
     canvas.addEventListener('webglcontextlost', onContextLost)
@@ -320,6 +374,7 @@ export function VaultCanvas({
       canvas.removeEventListener('pointerleave', onLeave)
       canvas.removeEventListener('webglcontextlost', onContextLost)
       window.removeEventListener('resize', resize)
+      releaseResources()
       engineRef.current = null
     }
   }, [])

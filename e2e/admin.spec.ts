@@ -6,6 +6,15 @@ async function login(page: Page, kind: 'customer' | 'admin') {
   await page.getByRole('button', { name: kind === 'admin' ? /one-click vault admin/i : /one-click aina demo/i }).click()
 }
 
+async function markPaymentDisputed(page: Page, paymentId: string) {
+  const payment = page.locator('.payment-record').filter({ hasText: paymentId })
+  await payment.locator('summary').click()
+  await payment.getByRole('button', { name: /mark disputed/i }).click()
+  const dialog = page.getByRole('dialog', { name: /confirm dispute payment action/i })
+  await dialog.getByRole('button', { name: /confirm and audit/i }).click()
+  await expect(payment.locator('summary').getByText('Disputed', { exact: true })).toBeVisible()
+}
+
 test.describe('desktop admin journeys', () => {
   test.skip(({ isMobile }) => isMobile, 'Detailed admin journeys run once in installed Chrome.')
 
@@ -93,5 +102,39 @@ test.describe('desktop admin journeys', () => {
     await expect(dialog).toContainText(/does not create a claim or refund/i)
     await dialog.getByRole('button', { name: /confirm return record & audit/i }).click()
     await expect(page.getByText(/no claim or refund was created/i)).toBeVisible()
+  })
+
+  test('disputes hide held digital actions, retain physical evidence, and stay finance-only for customers', async ({ page }) => {
+    await login(page, 'admin')
+    await page.getByRole('link', { name: 'Payments', exact: true }).click()
+    await markPaymentDisputed(page, 'pay-processing')
+    await markPaymentDisputed(page, 'pay-shipped')
+
+    await page.getByRole('link', { name: 'Fulfilment' }).click()
+    const digital = page.locator('.shipment-admin-card').filter({ hasText: 'shp-digital' })
+    await expect(digital.getByText('Cancelled', { exact: true })).toBeVisible()
+    await expect(digital.locator('.record-actions button')).toHaveCount(0)
+
+    const physical = page.locator('.shipment-admin-card').filter({ hasText: 'shp-shipped' })
+    await expect(physical.getByText('Shipped', { exact: true })).toBeVisible()
+    await expect(physical.getByRole('button', { name: /mark delivered/i })).toBeVisible()
+    await expect(physical.getByRole('button', { name: /delivery exception/i })).toBeVisible()
+    await expect(physical.getByRole('button', { name: /edit carrier & tracking/i })).toHaveCount(0)
+
+    await page.getByRole('button', { name: /log out/i }).click()
+    await page.getByRole('link', { name: /demo sign in/i }).click()
+    await page.getByRole('button', { name: /one-click aina demo/i }).click()
+    await page.goto('#/pay/ord-processing/pay-processing')
+
+    await expect(page.getByText(/under dispute.+protected finance review/i)).toBeVisible()
+    for (const action of [
+      /approve \+ valid mock webhook/i,
+      /^decline$/i,
+      /^cancel$/i,
+      /^expire$/i,
+      /retry attempt/i,
+    ]) {
+      await expect(page.getByRole('button', { name: action })).toHaveCount(0)
+    }
   })
 })

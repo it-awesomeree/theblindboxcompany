@@ -20,27 +20,37 @@ export function OpenBoxPage() {
   const [announcement, setAnnouncement] = useState('')
   const resultHeadingRef = useRef<HTMLHeadingElement>(null)
   const revealStartedRef = useRef(false)
-  const prize = prizeForBox(state, box)
+  const revealTimeoutRef = useRef<number | null>(null)
+  const prize = box?.revealedAt ? prizeForBox(state, box) : undefined
   const reveal = boxRevealEligibility(state, box)
+  const hasRevealedResult = Boolean(showResult && box?.revealedAt && prize)
 
   useEffect(() => {
-    if (!showResult || !prize || !revealStartedRef.current) return
+    if (!hasRevealedResult || !prize || !revealStartedRef.current) return
     revealStartedRef.current = false
     setAnnouncement(`Box revealed. Result: ${prize.name}.`)
     resultHeadingRef.current?.focus({ preventScroll: true })
-  }, [prize, showResult])
+  }, [hasRevealedResult, prize])
+
+  useEffect(() => () => {
+    if (revealTimeoutRef.current !== null) {
+      window.clearTimeout(revealTimeoutRef.current)
+      revealTimeoutRef.current = null
+    }
+  }, [])
 
   if (!user) return <Navigate to="/auth" replace />
   if (!box || !order || box.ownerId !== user.id) return <Navigate to="/not-found" replace />
 
   const open = () => {
-    if (opening || showResult) return
+    if (opening || hasRevealedResult) return
     try {
       services.openBox(box.id)
       revealStartedRef.current = true
       setOpening(true)
       setOpenSignal((value) => value + 1)
-      window.setTimeout(() => {
+      revealTimeoutRef.current = window.setTimeout(() => {
+        revealTimeoutRef.current = null
         setShowResult(true)
         setOpening(false)
       }, window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 120 : 1700)
@@ -53,10 +63,10 @@ export function OpenBoxPage() {
     <section className="reveal-page">
       <p className="sr-only" role="status" aria-live="polite" aria-atomic="true">{announcement}</p>
       <div className="reveal-stage">
-        <VaultCanvas openSignal={openSignal} holdOpen={showResult || opening} onActivate={!showResult && reveal.eligible ? open : undefined} label="Open this paid box once" />
+        <VaultCanvas openSignal={openSignal} holdOpen={hasRevealedResult || opening} onActivate={!hasRevealedResult && reveal.eligible ? open : undefined} label="Open this paid box once" />
         <div className="vault-grain" aria-hidden="true" />
         <div className="reveal-topline"><span>PAID BOX / {box.id.toUpperCase()}</span><span>OWNER CHECK · PASS</span></div>
-        {!showResult && reveal.eligible ? (
+        {!hasRevealedResult && reveal.eligible ? (
           <div className="reveal-control">
             <span className="eyebrow">PRIZE PREASSIGNED · ANIMATION CANNOT CHANGE IT</span>
             <h1>{opening ? 'Vault seal releasing…' : 'Open exactly once.'}</h1>
@@ -64,7 +74,7 @@ export function OpenBoxPage() {
             <button className="button" type="button" onClick={open} disabled={opening}>{opening ? 'Opening…' : 'Break demo seal'}</button>
             {error && <Notice tone="danger">{error}</Notice>}
           </div>
-        ) : showResult && prize ? (
+        ) : hasRevealedResult && prize ? (
           <div className="reveal-result" role="region" aria-labelledby="reveal-result-title">
             <div className="result-code"><span>{prize.tier} TIER</span><span>DEMO FLOOR · SAMPLE ✓</span></div>
             <h1 id="reveal-result-title" ref={resultHeadingRef} tabIndex={-1}>{prize.name}</h1>
@@ -82,7 +92,7 @@ export function OpenBoxPage() {
           </div>
         )}
       </div>
-      {showResult && prize && (
+      {hasRevealedResult && prize && (
         <div className="content reveal-manifest">
           <div className="manifest">
             <div className="manifest-stamp">Demo sample</div>

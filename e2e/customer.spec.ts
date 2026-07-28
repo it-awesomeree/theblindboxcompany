@@ -6,7 +6,7 @@ async function clearAndOpen(page: Page) {
   await page.reload()
 }
 
-async function reachCheckout(page: Page) {
+async function reachPaymentSelection(page: Page) {
   await clearAndOpen(page)
   await page.getByRole('button', { name: /get a demo box/i }).first().click()
   await page.getByRole('button', { name: /sign in to checkout/i }).click()
@@ -14,6 +14,10 @@ async function reachCheckout(page: Page) {
   await expect(page.getByRole('heading', { name: /seal the demo order/i })).toBeVisible()
   await page.getByRole('checkbox').check()
   await page.getByRole('button', { name: /reserve & continue/i }).click()
+}
+
+async function reachCheckout(page: Page) {
+  await reachPaymentSelection(page)
   await page.getByRole('button', { name: /create pending demo attempt/i }).click()
 }
 
@@ -43,6 +47,16 @@ test.describe('desktop customer journeys', () => {
     await expect(page.getByText('ATTEMPT 2')).toBeVisible()
     await page.getByRole('button', { name: /approve \+ valid mock webhook/i }).click()
     await expect(page.getByRole('heading', { name: /payment confirmed by event/i })).toBeVisible()
+  })
+
+  test('CARD stays selected after the new payment route becomes an attempt route', async ({ page }) => {
+    await reachPaymentSelection(page)
+    const card = page.getByRole('radio', { name: /^card/i })
+    await card.check()
+    await page.getByRole('button', { name: /create pending demo attempt/i }).click()
+
+    await expect(page.getByText('ATTEMPT 1')).toBeVisible()
+    await expect(page.getByRole('radio', { name: /^card/i })).toBeChecked()
   })
 
   test('open later and refresh returns the same reveal', async ({ page }) => {
@@ -88,6 +102,36 @@ test.describe('desktop customer journeys', () => {
     await expect(page.getByText('PARCEL', { exact: true })).toHaveCount(0)
     await expect(page.getByText(/signature required/i)).toHaveCount(0)
     await expect(page.getByText('shp-unopened', { exact: false })).toHaveCount(0)
+    const timeline = page.getByRole('heading', { name: /order events/i })
+      .locator('xpath=ancestor::div[contains(concat(" ", normalize-space(@class), " "), " panel ")][1]')
+    await expect(timeline.getByText('Demo order created')).toBeVisible()
+    await expect(timeline.getByText('Mock payment confirmed')).toBeVisible()
+    await expect(timeline.getByText(/mock webhook confirmed payment/i)).toHaveCount(0)
+  })
+
+  test('route changes never carry a reveal or manifest into another sealed box', async ({ page }) => {
+    await clearAndOpen(page)
+    await page.getByRole('link', { name: /demo sign in/i }).click()
+    await page.getByRole('button', { name: /one-click aina demo/i }).click()
+
+    await page.goto('#/open/box-refunded-01')
+    await expect(page.getByRole('heading', { name: /beras 10kg/i })).toBeVisible()
+    await expect(page.getByText(/value manifest \/ immutable record/i)).toBeVisible()
+
+    await page.goto('#/open/box-unopened-01')
+    await expect(page.getByRole('button', { name: /break demo seal/i })).toBeVisible()
+    await expect(page.getByRole('heading', { name: /beras 10kg/i })).toHaveCount(0)
+    await expect(page.getByText(/value manifest \/ immutable record/i)).toHaveCount(0)
+
+    await page.getByRole('button', { name: /break demo seal/i }).click()
+    await page.goto('#/open/box-processing-02')
+    await page.waitForTimeout(1900)
+
+    await expect(page.getByText(/paid box \/ box-processing-02/i)).toBeVisible()
+    await expect(page.getByRole('button', { name: /break demo seal/i })).toBeVisible()
+    await expect(page.getByText(/air fryer 5l/i)).toHaveCount(0)
+    await expect(page.getByText(/tng reload rm100/i)).toHaveCount(0)
+    await expect(page.getByText(/value manifest \/ immutable record/i)).toHaveCount(0)
   })
 
   test('sealed shipped and delivered orders create eligible neutral claims that survive reload', async ({ page }) => {

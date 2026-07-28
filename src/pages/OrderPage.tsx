@@ -3,6 +3,7 @@ import { useParams } from '../lib/router-core'
 import { Notice } from '../components/Notice'
 import { StatusBadge } from '../components/StatusBadge'
 import { neutralOrderDeliveryCode, neutralOrderDeliveryStatus } from '../domain/orderStatus'
+import { sealedCustomerTimeline } from '../domain/orderTimeline'
 import { boxRevealEligibility, prizeForBox } from '../domain/selectors'
 import { formatDateTime, formatMYR } from '../lib/format'
 import { useAppState } from '../state/AppStateContext'
@@ -23,6 +24,9 @@ export function OrderPage() {
     boxes.length === order.boxIds.length &&
     boxes.length > 0 &&
     boxes.every((box) => Boolean(box?.revealedAt))
+  const visibleTimeline = everyBoxRevealed
+    ? order.timeline
+    : sealedCustomerTimeline(order)
 
   return (
     <section className="route-page">
@@ -52,17 +56,13 @@ export function OrderPage() {
           </div>
           <div className="panel">
             <div className="panel-heading"><div><span>02 / TIMELINE</span><h2>Order events</h2></div></div>
-            {everyBoxRevealed ? (
-              <ol className="timeline">
-                {[...order.timeline].reverse().map((entry) => (
-                  <li key={entry.id}><span /><div><StatusBadge value={entry.status} /><b>{entry.label}</b><small>{formatDateTime(entry.at)}</small></div></li>
-                ))}
-              </ol>
-            ) : (
-              <div className="empty-state compact">
-                <p>Detailed delivery events stay combined until every box is revealed.</p>
-                <small>Order created {formatDateTime(order.createdAt)}</small>
-              </div>
+            <ol className="timeline">
+              {[...visibleTimeline].reverse().map((entry) => (
+                <li key={entry.id}><span /><div><StatusBadge value={entry.status} /><b>{entry.label}</b><small>{formatDateTime(entry.at)}</small></div></li>
+              ))}
+            </ol>
+            {!everyBoxRevealed && (
+              <p className="fine-print">Detailed delivery events stay combined until every box is revealed; only sanitized order and payment history is shown.</p>
             )}
           </div>
         </div>
@@ -91,7 +91,7 @@ export function OrderPage() {
           </div>
         </section>
         <section className="subsection">
-          <div className="subsection-heading"><div><span>05 / CLAIMS</span><h2>Claim status &amp; history</h2></div></div>
+          <div className="subsection-heading"><div><span>04 / CLAIMS</span><h2>Claim status &amp; history</h2></div></div>
           {claims.length > 0 ? (
             <div className="claim-history-grid">
               {claims.map((claim) => (
@@ -120,7 +120,7 @@ export function OrderPage() {
 
         <section className="subsection">
           <div className="subsection-heading">
-            <div><span>04 / FULFILMENT</span><h2>{everyBoxRevealed ? 'Split tracking' : 'Private-prize tracking'}</h2></div>
+            <div><span>05 / FULFILMENT</span><h2>{everyBoxRevealed ? 'Split tracking' : 'Private-prize tracking'}</h2></div>
             <Link to={`/claim/new?order=${order.id}`}>Start a demo claim</Link>
           </div>
           {!everyBoxRevealed && (

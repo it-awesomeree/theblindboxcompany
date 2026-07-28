@@ -10,6 +10,11 @@ import {
   shipmentClaimEligibility,
   valueFloorClaimEligibility,
 } from '../domain/claimEligibility'
+import {
+  canWidenClaimEvidence,
+  CLAIM_EVIDENCE_WIDENING_NOTE,
+  isOpenClaimStatus,
+} from '../domain/claimStatus'
 import type {
   Claim,
   ClaimKind,
@@ -30,8 +35,6 @@ export interface SubmitClaimInput {
 }
 
 export type ClaimReviewAction = 'acknowledge' | 'approve' | 'reject' | 'resolve'
-
-const OPEN_CLAIM_STATUSES: ClaimStatus[] = ['submitted', 'reviewing', 'approved']
 
 export interface ClaimResolutionInput {
   outcome: ClaimResolutionOutcome
@@ -82,7 +85,7 @@ function openClaimMatches(
   boxId: string | undefined,
   shipmentCandidateIds: string[] | undefined,
 ) {
-  if (claim.kind !== kind || !OPEN_CLAIM_STATUSES.includes(claim.status)) return false
+  if (claim.kind !== kind || !isOpenClaimStatus(claim.status)) return false
   if (kind === 'value_floor') return claim.boxId === boxId
   if (shipmentCandidateIds) {
     return Boolean(
@@ -99,6 +102,7 @@ function openClaimMatches(
 function customerClaimReceipt(claim: Claim) {
   const receipt = structuredClone(claim)
   delete receipt.shipmentCandidateIds
+  delete receipt.shipmentCandidateEvidenceAt
   return receipt
 }
 
@@ -197,7 +201,15 @@ export class ClaimService {
   submit(input: SubmitClaimInput) {
     const now = this.now()
     const prepared = this.prepareSubmission(this.repository.getSnapshot(), input, now)
-    if (prepared.duplicate) {
+    const newCandidateIds = prepared.shipmentCandidateIds ?? []
+    const existingCandidateIds = prepared.duplicate?.shipmentCandidateIds ?? []
+    const shouldWidenOrderLevelClaim = Boolean(
+      prepared.duplicate?.shipmentCandidateIds &&
+      prepared.shipmentCandidateIds &&
+      canWidenClaimEvidence(prepared.duplicate.status) &&
+      newCandidateIds.some((shipmentId) => !existingCandidateIds.includes(shipmentId)),
+    )
+    if (prepared.duplicate && !shouldWidenOrderLevelClaim) {
       return {
         data: customerClaimReceipt(prepared.duplicate),
         changed: false,
@@ -215,7 +227,74 @@ export class ClaimService {
         shipmentCandidateIds,
         duplicate,
       } = this.prepareSubmission(state, input, now)
-      assert(!duplicate, 'The claim request changed before it could be saved.', 'IDEMPOTENCY_CONFLICT')
+      if (duplicate) {
+        assert(
+          duplicate.shipmentCandidateIds &&
+            shipmentCandidateIds &&
+            canWidenClaimEvidence(duplicate.status),
+          'The claim request changed before it could be saved.',
+          'IDEMPOTENCY_CONFLICT',
+        )
+        const additions = shipmentCandidateIds.filter((shipmentId) =>
+          !duplicate.shipmentCandidateIds!.includes(shipmentId),
+        )
+        assert(
+          additions.length > 0,
+          'The claim request changed before it could be saved.',
+          'IDEMPOTENCY_CONFLICT',
+        )
+        const beforeCandidateIds = [...duplicate.shipmentCandidateIds]
+        const evidenceAt = {
+          ...Object.fromEntries(
+            duplicate.shipmentCandidateIds.map((shipmentId) => [
+              shipmentId,
+              duplicate.shipmentCandidateEvidenceAt?.[shipmentId] ?? duplicate.createdAt,
+            ]),
+          ),
+        }
+        additions.forEach((shipmentId) => {
+          evidenceAt[shipmentId] = now
+        })
+        duplicate.shipmentCandidateIds = [
+          ...new Set([...duplicate.shipmentCandidateIds, ...additions]),
+        ].sort((left, right) => left.localeCompare(right))
+        duplicate.shipmentCandidateEvidenceAt = Object.fromEntries(
+          duplicate.shipmentCandidateIds.map((shipmentId) => [
+            shipmentId,
+            evidenceAt[shipmentId],
+          ]),
+        )
+        duplicate.updatedAt = now
+        duplicate.history.push({
+          id: `${duplicate.id}-h-${String(duplicate.history.length + 1).padStart(2, '0')}`,
+          status: duplicate.status,
+          note: CLAIM_EVIDENCE_WIDENING_NOTE,
+          actorId: user.id,
+          actorRole: user.role,
+          at: now,
+        })
+        this.audit.append(state, {
+          actorId: user.id,
+          actorRole: user.role,
+          action: 'claim.order_level_evidence_widened',
+          targetType: 'claim',
+          targetId: duplicate.id,
+          reason: CLAIM_EVIDENCE_WIDENING_NOTE,
+          at: now,
+          requestId: `req-${duplicate.id}-evidence-${duplicate.history.length}`,
+          before: { shipmentCandidateIds: beforeCandidateIds },
+          after: {
+            shipmentCandidateIds: duplicate.shipmentCandidateIds,
+            shipmentCandidateEvidenceAt: duplicate.shipmentCandidateEvidenceAt,
+            refundCreated: false,
+          },
+        })
+        return {
+          data: customerClaimReceipt(duplicate),
+          changed: true,
+          message: 'The existing open claim was widened with newly eligible neutral delivery evidence.',
+        }
+      }
 
       const evidenceSeed =
         selectedBox?.id ??
@@ -231,6 +310,9 @@ export class ClaimService {
         note,
         shipmentId: input.kind === 'value_floor' ? undefined : selectedShipment?.id,
         shipmentCandidateIds,
+        shipmentCandidateEvidenceAt: shipmentCandidateIds
+          ? Object.fromEntries(shipmentCandidateIds.map((shipmentId) => [shipmentId, now]))
+          : undefined,
         boxId: input.kind === 'value_floor' ? selectedBox!.id : undefined,
         status: 'submitted',
         createdAt: now,

@@ -15,6 +15,16 @@ import {
 import { formatMYR } from '../src/lib/format'
 import { DEMO_ADDRESS } from '../src/data/fixtures'
 import { deriveOrderStatusFromShipments, neutralOrderDeliveryStatus } from '../src/domain/orderStatus'
+import {
+  canWidenClaimEvidence,
+  isOpenClaimStatus,
+  OPEN_CLAIM_STATUSES,
+} from '../src/domain/claimStatus'
+import {
+  shipmentStatusActionEligibility,
+  shipmentTrackingActionEligibility,
+} from '../src/domain/fulfillmentEligibility'
+import { createDemoState } from '../src/data/fixtures'
 
 describe('Series 001 and domain guards', () => {
   it('has exactly 10,000 fixed allocations and every value clears RM100', () => {
@@ -73,6 +83,33 @@ describe('Series 001 and domain guards', () => {
     expect(neutralOrderDeliveryStatus('partially_fulfilled')).toBe('delivery_in_progress')
     expect(neutralOrderDeliveryStatus('fulfilled')).toBe('delivery_complete')
     expect(neutralOrderDeliveryStatus('disputed')).toBe('disputed')
+  })
+
+  it('uses one exact open-claim definition', () => {
+    expect(OPEN_CLAIM_STATUSES).toEqual(['submitted', 'reviewing', 'approved'])
+    expect(isOpenClaimStatus('submitted')).toBe(true)
+    expect(isOpenClaimStatus('reviewing')).toBe(true)
+    expect(isOpenClaimStatus('approved')).toBe(true)
+    expect(isOpenClaimStatus('rejected')).toBe(false)
+    expect(isOpenClaimStatus('resolved')).toBe(false)
+    expect(canWidenClaimEvidence('submitted')).toBe(true)
+    expect(canWidenClaimEvidence('reviewing')).toBe(true)
+    expect(canWidenClaimEvidence('approved')).toBe(false)
+  })
+
+  it('hides all digital fulfilment actions on financial hold but keeps legal physical evidence', () => {
+    const state = createDemoState()
+    const digital = state.shipments.find((shipment) => shipment.id === 'shp-digital')!
+    digital.status = 'shipped'
+    const physical = state.shipments.find((shipment) => shipment.id === 'shp-shipped')!
+
+    for (const hold of ['cancelled', 'refunded', 'disputed'] as const) {
+      expect(shipmentStatusActionEligibility(hold, digital, 'delivered').eligible).toBe(false)
+      expect(shipmentTrackingActionEligibility(hold, digital).eligible).toBe(false)
+    }
+    expect(shipmentStatusActionEligibility('disputed', physical, 'delivered').eligible).toBe(true)
+    expect(shipmentStatusActionEligibility('refunded', physical, 'failed_delivery').eligible).toBe(true)
+    expect(shipmentTrackingActionEligibility('disputed', physical).eligible).toBe(false)
   })
 
   it('accepts fictional input and blocks likely real data', () => {

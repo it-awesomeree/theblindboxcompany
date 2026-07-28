@@ -8,6 +8,12 @@ import {
   transitionPayment,
   sanitizeText,
 } from '../domain/guards'
+import {
+  ACTIVE_PAYMENT_STATUSES,
+  paymentAttemptCreationEligibility,
+  paymentRetryEligibility,
+  paymentWasCaptured,
+} from '../domain/paymentEligibility'
 import { prizeForBox } from '../domain/selectors'
 import type { DemoState, Order, Payment, PaymentEvent, PaymentMethod, PaymentStatus } from '../domain/types'
 import type { MockRepository } from '../data/MockRepository'
@@ -18,12 +24,6 @@ import { ReservationService } from './ReservationService'
 import { FinancialSafetyService } from './FinancialSafetyService'
 
 export type MockPaymentAction = 'approve' | 'decline' | 'cancel' | 'expire' | 'delayed'
-
-const ACTIVE_PAYMENT_STATUSES: PaymentStatus[] = ['created', 'pending', 'processing']
-
-function wasCaptured(payment: Payment) {
-  return payment.events.some((event) => event.type === 'succeeded' && !event.ignoredReason)
-}
 
 class DuplicatePaymentEvent extends Error {
   constructor(readonly payment: Payment) {
@@ -71,14 +71,16 @@ export class MockPaymentGateway {
       .filter(Boolean) as Payment[]
   }
 
-  private assertAttemptAllowed(state: DemoState, order: Order) {
+  private assertAttemptAllowed(
+    state: DemoState,
+    order: Order,
+    retryPayment?: Payment,
+  ) {
     const payments = this.paymentsForOrder(state, order)
-    assert(
-      !payments.some((payment) => ACTIVE_PAYMENT_STATUSES.includes(payment.status)),
-      'An active payment attempt already exists for this order.',
-      'PAYMENT_ACTIVE',
-    )
-    assert(!payments.some(wasCaptured), 'This order already has a captured payment.', 'ORDER_ALREADY_PAID')
+    const eligibility = retryPayment
+      ? paymentRetryEligibility(order, retryPayment, payments)
+      : paymentAttemptCreationEligibility(order, payments)
+    assert(eligibility.eligible, eligibility.reason, eligibility.code)
     return payments
   }
 
@@ -97,7 +99,11 @@ export class MockPaymentGateway {
     return caller
   }
 
-  createAttempt(orderId: string, method: PaymentMethod = 'FPX') {
+  createAttempt(
+    orderId: string,
+    method: PaymentMethod = 'FPX',
+    retryPaymentId?: string,
+  ) {
     return this.repository.update((state) => {
       const user = getSessionUser(state)
       assertRole(user, ['customer'], 'start a demo payment')
@@ -105,8 +111,18 @@ export class MockPaymentGateway {
       this.reservations.expireDue(state, now)
       const order = state.orders.find((entry) => entry.id === orderId && entry.userId === user.id)
       assert(order, 'Demo order was not found.', 'ORDER_MISSING')
-      assert(order.status === 'pending_payment', 'This order no longer accepts payment attempts.', 'ORDER_NOT_PAYABLE')
-      const previous = this.assertAttemptAllowed(state, order)
+      const orderPayments = this.paymentsForOrder(state, order)
+      const retryPayment = retryPaymentId
+        ? orderPayments.find((entry) => entry.id === retryPaymentId)
+        : undefined
+      if (retryPaymentId) {
+        assert(
+          retryPayment,
+          'The retry payment attempt does not belong to this order.',
+          'PAYMENT_ORDER_MISMATCH',
+        )
+      }
+      const previous = this.assertAttemptAllowed(state, order, retryPayment)
       if (!this.reservations.isActive(state, order)) {
         this.reservations.renew(
           state,
@@ -202,7 +218,9 @@ export class MockPaymentGateway {
         )
         if (next === 'succeeded') {
           const orderPayments = this.paymentsForOrder(state, order)
-          const otherCaptured = orderPayments.find((entry) => entry.id !== payment.id && wasCaptured(entry))
+          const otherCaptured = orderPayments.find((entry) =>
+            entry.id !== payment.id && paymentWasCaptured(entry),
+          )
           const otherActive = orderPayments.find((entry) =>
             entry.id !== payment.id && ACTIVE_PAYMENT_STATUSES.includes(entry.status),
           )
@@ -233,7 +251,11 @@ export class MockPaymentGateway {
             processedAt: now,
             ignoredReason: `Out-of-order: ${payment.status} cannot become ${next}`,
           })
-          return { payment, changed: false, message: 'Out-of-order event recorded but did not change anything.' }
+          return {
+            payment,
+            changed: false,
+            message: 'Out-of-order event was recorded without changing payment status.',
+          }
         }
         if (next === 'succeeded') {
           assert(payment.amountSen === order.snapshot.totals.totalSen, 'Payment amount failed the server-like total check.', 'AMOUNT_MISMATCH')
@@ -363,10 +385,9 @@ export class MockPaymentGateway {
       this.reservations.expireDue(state, now)
       const previous = state.payments.find((entry) => entry.id === paymentId)
       assert(previous, 'Payment attempt was not found.', 'PAYMENT_MISSING')
-      assert(['failed', 'cancelled', 'expired'].includes(previous.status), 'Only terminal failed demo attempts can be retried.', 'PAYMENT_ACTIVE')
       const order = state.orders.find((entry) => entry.id === previous.orderId)
-      assert(order?.status === 'pending_payment', 'Order is not payable.', 'ORDER_NOT_PAYABLE')
-      const attempts = this.assertAttemptAllowed(state, order)
+      assert(order, 'Payment order was not found.', 'ORDER_MISSING')
+      const attempts = this.assertAttemptAllowed(state, order, previous)
       if (!this.reservations.isActive(state, order)) {
         this.reservations.renew(
           state,

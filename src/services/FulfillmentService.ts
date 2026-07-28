@@ -10,6 +10,10 @@ import {
   transitionBoxForShipment,
   transitionShipment,
 } from '../domain/guards'
+import {
+  shipmentStatusActionEligibility,
+  shipmentTrackingActionEligibility,
+} from '../domain/fulfillmentEligibility'
 import { prizeForBox } from '../domain/selectors'
 import { deriveOrderStatusFromShipments } from '../domain/orderStatus'
 import type { DemoState, FulfilmentKind, Order, Shipment, ShipmentStatus } from '../domain/types'
@@ -21,12 +25,6 @@ const carrierFor = (kind: FulfilmentKind) => {
   if (kind === 'BULKY') return 'Demo Bulky Freight'
   if (kind === 'SELF_COLLECT') return 'Vault Counter'
   return 'Demo Express'
-}
-
-const FINANCIAL_HOLD_CARRIER_EDGES: Partial<Record<ShipmentStatus, ShipmentStatus[]>> = {
-  failed_delivery: ['shipped'],
-  shipped: ['delivered', 'failed_delivery', 'lost', 'returned'],
-  delivered: ['returned'],
 }
 
 export class FulfillmentService {
@@ -85,16 +83,9 @@ export class FulfillmentService {
       assert(shipment, 'Shipment was not found.', 'SHIPMENT_MISSING')
       const order = state.orders.find((entry) => entry.id === shipment.orderId)
       assert(order, 'Shipment order was not found.', 'ORDER_MISSING')
+      const eligibility = shipmentStatusActionEligibility(order.status, shipment, next)
+      assert(eligibility.eligible, eligibility.reason, eligibility.code)
       const financiallyStopped = ['cancelled', 'refunded', 'disputed'].includes(order.status)
-      if (financiallyStopped) {
-        assert(
-          ['refunded', 'disputed'].includes(order.status) &&
-            shipment.kind !== 'DIGITAL' &&
-            FINANCIAL_HOLD_CARRIER_EDGES[shipment.status]?.includes(next),
-          `Financial hold: the ${order.status} order can only record a graph-legal physical carrier evidence step for an already-shipped delivery; tracking, restarts, fulfilment progress, and financial state remain locked.`,
-          'FINANCIAL_HOLD',
-        )
-      }
       const cleanReason = sanitizeText(reason, 220)
       assert(cleanReason.length >= 6, 'Give a short reason for this shipment change.', 'REASON_REQUIRED')
       const before = shipment.status
@@ -154,16 +145,9 @@ export class FulfillmentService {
       const shipment = state.shipments.find((entry) => entry.id === shipmentId)
       assert(shipment, 'Shipment was not found.', 'SHIPMENT_MISSING')
       const order = state.orders.find((entry) => entry.id === shipment.orderId)
-      assert(
-        order && !['cancelled', 'refunded', 'disputed'].includes(order.status),
-        'Tracking cannot change while the order is on financial hold.',
-        'FINANCIAL_HOLD',
-      )
-      assert(
-        ['unfulfilled', 'picking', 'packed', 'label_created'].includes(shipment.status),
-        'Carrier and tracking lock after shipment.',
-        'TRACKING_LOCKED',
-      )
+      assert(order, 'Shipment order was not found.', 'ORDER_MISSING')
+      const eligibility = shipmentTrackingActionEligibility(order.status, shipment)
+      assert(eligibility.eligible, eligibility.reason, eligibility.code)
       const cleanCarrier = sanitizeText(carrier, 70)
       const cleanTracking = sanitizeText(trackingNumber, 48).toUpperCase()
       const cleanReason = sanitizeText(reason, 220)

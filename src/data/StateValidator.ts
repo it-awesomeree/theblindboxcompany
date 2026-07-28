@@ -25,7 +25,13 @@ import {
   shipmentClaimEligibility,
   valueFloorClaimEligibility,
 } from '../domain/claimEligibility'
+import {
+  canWidenClaimEvidence,
+  CLAIM_EVIDENCE_WIDENING_NOTE,
+  isOpenClaimStatus,
+} from '../domain/claimStatus'
 import { deriveOrderStatusFromShipments } from '../domain/orderStatus'
+import { isValidPrizeDefinition } from '../domain/prizeValidation'
 import type {
   Box,
   BoxStatus,
@@ -286,13 +292,8 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
       assert(Array.isArray(series.publishedPrizes) && series.publishedPrizes.length > 0, 'Published series snapshot is required.')
       unique(series.publishedPrizes.map((prize) => prize.id), 'Published prize')
       assert(
-        series.publishedPrizes.every((prize) =>
-          integer(prize.valueSen, BOX_PRICE_SEN) &&
-          integer(prize.allocation, 1) &&
-          typeof prize.name === 'string' &&
-          prize.name.length > 0 &&
-          FULFILMENT_KINDS.has(prize.fulfilment)),
-        'Published prize counters are invalid.',
+        series.publishedPrizes.every(isValidPrizeDefinition),
+        'Published prize definitions are invalid.',
       )
       assert(
         series.publishedPrizes.reduce((sum, prize) => sum + prize.allocation, 0) === series.allocationTotal,
@@ -314,7 +315,27 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
       const assigned = series.inventory.reduce((sum, counter) => sum + counter.assigned, 0)
       assert(assigned + series.reservedBoxes <= series.allocationTotal, 'Series counters exceed total allocation.')
     } else {
-      assert(Array.isArray(series.draftPrizes), 'Draft prize definitions are required.')
+      assert(
+        Array.isArray(series.draftPrizes) && series.draftPrizes.length > 0,
+        'Draft prize definitions are required.',
+      )
+      unique(series.draftPrizes.map((prize) => prize.id), 'Draft prize')
+      assert(
+        series.draftPrizes.every(isValidPrizeDefinition),
+        'Draft prize definitions are invalid.',
+      )
+      assert(
+        series.draftPrizes.reduce((sum, prize) => sum + prize.allocation, 0) ===
+          series.allocationTotal,
+        'Draft allocation total does not match its definitions.',
+      )
+      assert(
+        series.inventory.length === series.draftPrizes.length &&
+          series.inventory.every((counter) =>
+            counter.assigned === 0 &&
+            series.draftPrizes!.some((prize) => prize.id === counter.prizeId)),
+        'Draft inventory must match its prize definitions without assigned boxes.',
+      )
     }
   }
 
@@ -393,7 +414,12 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
     assert(validIso(order.createdAt) && validIso(order.updatedAt) && validIso(order.reservationExpiresAt), 'Order time is invalid.')
     assert(timestamp(order.updatedAt) >= timestamp(order.createdAt), 'Order updated time cannot precede creation.')
     assert(timestamp(order.reservationExpiresAt) >= timestamp(order.createdAt), 'Order reservation cannot precede creation.')
-    assert(order.timeline.length > 0 && order.timeline.at(-1)?.status === order.status, 'Order timeline must end at current status.')
+    assert(
+      order.timeline.length > 0 &&
+        order.timeline[0].status === 'pending_payment' &&
+        order.timeline.at(-1)?.status === order.status,
+      'Order timeline must begin at pending payment and end at current status.',
+    )
     assert(
       order.timeline.every((entry) =>
         ORDER_STATUSES.has(entry.status) &&
@@ -659,6 +685,10 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
     )
     if (claim.kind === 'value_floor') {
       assert(hasBoxLink && !hasExactShipmentLink && !hasOrderLevelCandidates, 'Value-floor claim link is invalid.')
+      assert(
+        claim.shipmentCandidateEvidenceAt === undefined,
+        'Value-floor claims cannot store shipment candidate evidence.',
+      )
       const box = state.boxes.find((entry) => entry.id === claim.boxId && entry.orderId === claim.orderId && entry.ownerId === claim.userId)
       assert(box?.prizeId && validIso(box.assignedAt), 'Value-floor claim requires an assigned box.')
       assert(
@@ -667,6 +697,10 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
       )
     } else if (hasExactShipmentLink) {
       assert(!hasBoxLink && !hasOrderLevelCandidates, 'Exact shipment claim link is invalid.')
+      assert(
+        claim.shipmentCandidateEvidenceAt === undefined,
+        'Exact shipment claims cannot store order-level candidate evidence.',
+      )
       assert(
         everyOrderBoxRevealedAt(state, claim.orderId, claim.createdAt),
         'Exact shipment claims require every order box to be revealed by claim creation.',
@@ -691,25 +725,117 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
       )
       assert(claim.shipmentCandidateIds.length > 0, 'Order-level shipment candidates cannot be empty.')
       unique(claim.shipmentCandidateIds, `Claim ${claim.id} shipment candidate`)
-      assert(
-        claim.shipmentCandidateIds.every((shipmentId) => {
-          const shipment = state.shipments.find((entry) =>
-            entry.id === shipmentId &&
-            entry.orderId === claim.orderId)
-          return Boolean(
-            shipment &&
-            shipmentClaimEligibility(shipment, deliveryKind, claim.createdAt).eligible,
-          )
-        }),
-        'Every order-level shipment candidate must belong to the order and be eligible at claim creation.',
-      )
       const canonicalCandidates = [...claim.shipmentCandidateIds].sort((left, right) => left.localeCompare(right))
       assert(
-        JSON.stringify(claim.shipmentCandidateIds) === JSON.stringify(canonicalCandidates) &&
-          JSON.stringify(claim.shipmentCandidateIds) ===
-            JSON.stringify(eligibleClaimShipmentIds(state, claim.orderId, deliveryKind, claim.createdAt)),
-        'Order-level shipment candidates must canonically include every eligible physical shipment.',
+        JSON.stringify(claim.shipmentCandidateIds) === JSON.stringify(canonicalCandidates),
+        'Order-level shipment candidates must use canonical order.',
       )
+      if (claim.shipmentCandidateEvidenceAt === undefined) {
+        assert(
+          JSON.stringify(claim.shipmentCandidateIds) ===
+            JSON.stringify(eligibleClaimShipmentIds(
+              state,
+              claim.orderId,
+              deliveryKind,
+              claim.createdAt,
+            )),
+          'Order-level shipment candidates must canonically include every eligible physical shipment.',
+        )
+      } else {
+        assert(
+          record(claim.shipmentCandidateEvidenceAt),
+          'Order-level shipment candidate evidence must be a record.',
+        )
+        const evidenceKeys = Object.keys(claim.shipmentCandidateEvidenceAt)
+          .sort((left, right) => left.localeCompare(right))
+        assert(
+          JSON.stringify(evidenceKeys) === JSON.stringify(canonicalCandidates),
+          'Order-level shipment candidate evidence must exactly match its candidates.',
+        )
+        const evidenceTimes = [...new Set(canonicalCandidates.map((shipmentId) => {
+          const evidenceAt = claim.shipmentCandidateEvidenceAt![shipmentId]
+          assert(validIso(evidenceAt), 'Order-level shipment candidate evidence time is invalid.')
+          assert(
+            timestamp(evidenceAt) >= timestamp(claim.createdAt) &&
+              timestamp(evidenceAt) <= timestamp(claim.updatedAt),
+            'Order-level shipment candidate evidence time is outside the claim history.',
+          )
+          const shipment = state.shipments.find((entry) =>
+            entry.id === shipmentId && entry.orderId === claim.orderId)
+          assert(
+            shipment && shipmentClaimEligibility(shipment, deliveryKind, evidenceAt).eligible,
+            'Every order-level shipment candidate must belong to the order and be eligible at its evidence time.',
+          )
+          return evidenceAt
+        }))].sort((left, right) => left.localeCompare(right))
+        const initialCandidates = canonicalCandidates.filter((shipmentId) =>
+          claim.shipmentCandidateEvidenceAt![shipmentId] === claim.createdAt)
+        assert(
+          initialCandidates.length > 0 &&
+            JSON.stringify(initialCandidates) ===
+              JSON.stringify(eligibleClaimShipmentIds(
+                state,
+                claim.orderId,
+                deliveryKind,
+                claim.createdAt,
+              )),
+          'Mapped order-level evidence must preserve the exact nonempty candidate set from claim creation.',
+        )
+        const accumulatedCandidates = new Set<string>()
+        for (const evidenceAt of evidenceTimes) {
+          eligibleClaimShipmentIds(state, claim.orderId, deliveryKind, evidenceAt)
+            .forEach((shipmentId) => accumulatedCandidates.add(shipmentId))
+          if (evidenceAt === claim.createdAt) continue
+          const beforeCandidateIds = canonicalCandidates.filter((shipmentId) =>
+            timestamp(claim.shipmentCandidateEvidenceAt![shipmentId]) < timestamp(evidenceAt))
+          const afterCandidateIds = canonicalCandidates.filter((shipmentId) =>
+            timestamp(claim.shipmentCandidateEvidenceAt![shipmentId]) <= timestamp(evidenceAt))
+          const widenedAt = state.audits.some((audit) => {
+            const before = audit.before
+            const after = audit.after
+            if (
+              audit.action !== 'claim.order_level_evidence_widened' ||
+              audit.targetType !== 'claim' ||
+              audit.targetId !== claim.id ||
+              audit.actorId !== claim.userId ||
+              audit.actorRole !== 'customer' ||
+              audit.at !== evidenceAt ||
+              audit.reason !== CLAIM_EVIDENCE_WIDENING_NOTE ||
+              !record(before) ||
+              !record(after) ||
+              !Array.isArray(before.shipmentCandidateIds) ||
+              !Array.isArray(after.shipmentCandidateIds)
+            ) return false
+            return (
+              JSON.stringify(before.shipmentCandidateIds) ===
+                JSON.stringify(beforeCandidateIds) &&
+              JSON.stringify(after.shipmentCandidateIds) ===
+                JSON.stringify(afterCandidateIds)
+            )
+          })
+          assert(
+            widenedAt,
+            'Widened order-level shipment candidate evidence requires a matching customer audit.',
+          )
+          const wideningHistoryIndex = claim.history.findIndex((entry, index) =>
+            index > 0 &&
+            entry.at === evidenceAt &&
+            entry.actorId === claim.userId &&
+            entry.actorRole === 'customer' &&
+            entry.note === CLAIM_EVIDENCE_WIDENING_NOTE &&
+            canWidenClaimEvidence(entry.status) &&
+            claim.history[index - 1].status === entry.status)
+          assert(
+            wideningHistoryIndex > 0,
+            'Widened order-level shipment candidate evidence requires matching unchanged-status customer history.',
+          )
+        }
+        assert(
+          JSON.stringify([...accumulatedCandidates].sort((left, right) => left.localeCompare(right))) ===
+            JSON.stringify(canonicalCandidates),
+          'Order-level shipment candidates must preserve the canonical union of eligible evidence snapshots.',
+        )
+      }
     }
     if (claim.shipmentId) assert(state.shipments.some((shipment) => shipment.id === claim.shipmentId && shipment.orderId === claim.orderId), 'Claim shipment reference is invalid.')
     if (claim.boxId) assert(state.boxes.some((box) => box.id === claim.boxId && box.orderId === claim.orderId && box.ownerId === claim.userId), 'Claim box reference is invalid.')
@@ -754,7 +880,7 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
       )
     }
   }
-  const openClaims = state.claims.filter((claim) => ['submitted', 'reviewing', 'approved'].includes(claim.status))
+  const openClaims = state.claims.filter((claim) => isOpenClaimStatus(claim.status))
   unique(
     openClaims.map((claim) => {
       const scope = claim.kind === 'value_floor'

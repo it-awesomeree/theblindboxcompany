@@ -28,6 +28,76 @@ function checkout(services: AppServices, quantity = 1, requestId = nextCheckoutR
   })
 }
 
+function neutralClaimWideningScenario() {
+  let now = '2026-07-28T04:00:00.000Z'
+  const services = new AppServices(new MemoryStorage(), () => now)
+  makeProcessingOrderTwoPhysicalShipments(services)
+  services.auth.oneClick('admin')
+  now = '2026-07-28T05:00:00.000Z'
+  for (const status of ['packed', 'label_created', 'shipped', 'failed_delivery'] as const) {
+    services.fulfilment.advance(
+      'shp-processing',
+      status,
+      `Confirmed first neutral claim evidence ${status}`,
+    )
+  }
+  services.auth.oneClick('customer')
+  now = '2026-07-28T06:00:00.000Z'
+  const first = services.claims.submit({
+    orderId: 'ord-processing',
+    kind: 'non_delivery',
+    orderLevelDelivery: true,
+    note: 'DEMO first neutral order-level delivery evidence',
+  })
+
+  const moveToReviewState = (status: 'reviewing' | 'approved') => {
+    services.auth.oneClick('admin')
+    now = '2026-07-28T06:30:00.000Z'
+    services.claims.review(
+      first.data.id,
+      'acknowledge',
+      'Confirmed fictional review before evidence resubmission.',
+    )
+    if (status === 'approved') {
+      now = '2026-07-28T06:45:00.000Z'
+      services.claims.review(
+        first.data.id,
+        'approve',
+        'Confirmed fictional approval freezing claim evidence.',
+      )
+    }
+  }
+
+  const makeSecondShipmentEligible = () => {
+    services.auth.oneClick('admin')
+    now = '2026-07-28T07:00:00.000Z'
+    for (const status of ['picking', 'packed', 'label_created', 'shipped', 'failed_delivery'] as const) {
+      services.fulfilment.advance(
+        'shp-digital',
+        status,
+        `Confirmed second neutral claim evidence ${status}`,
+      )
+    }
+    services.auth.oneClick('customer')
+    now = '2026-07-28T08:00:00.000Z'
+  }
+
+  const resubmit = () => services.claims.submit({
+    orderId: 'ord-processing',
+    kind: 'non_delivery',
+    orderLevelDelivery: true,
+    note: 'DEMO resubmitted after another delivery became eligible',
+  })
+
+  return {
+    services,
+    first,
+    moveToReviewState,
+    makeSecondShipmentEligible,
+    resubmit,
+  }
+}
+
 describe('customer, payment, allocation and admin services', () => {
   let services: AppServices
 
@@ -445,9 +515,26 @@ describe('customer, payment, allocation and admin services', () => {
     services.payments.act(payment.id, 'decline')
     const result = services.payments.processEvent(payment.id, 'evt-late-success', 'succeeded')
     expect(result.changed).toBe(false)
+    expect(result.message).toBe('Out-of-order event was recorded without changing payment status.')
     expect(services.repository.getSnapshot().boxes.find((box) => order.boxIds.includes(box.id))?.prizeId).toBeUndefined()
     expect(services.repository.getSnapshot().payments.find((entry) => entry.id === payment.id)?.events.at(-1)?.ignoredReason).toMatch(/out-of-order/i)
     expect(() => validateDemoState(services.repository.getSnapshot())).not.toThrow()
+  })
+
+  it('keeps a disputed payment unchanged when a customer tries a finance-only resolution', () => {
+    services.auth.oneClick('admin')
+    services.payments.dispute(
+      'pay-unopened',
+      'Confirmed protected customer dispute action test',
+      'evt-protected-customer-dispute',
+    )
+    services.auth.oneClick('customer')
+    const before = structuredClone(services.repository.getSnapshot())
+
+    expect(() => services.payments.act('pay-unopened', 'approve')).toThrow(
+      /protected finance review/i,
+    )
+    expect(services.repository.getSnapshot()).toEqual(before)
   })
 
   it('shares the active-attempt guard between customer retry and admin retry', () => {
@@ -459,6 +546,28 @@ describe('customer, payment, allocation and admin services', () => {
     services.auth.oneClick('admin')
     expect(() => services.payments.adminRetry(first.id, 'Attempted conflicting admin retry')).toThrow(/active payment attempt/i)
     expect(services.repository.getSnapshot().payments.filter((payment) => payment.orderId === order.id)).toHaveLength(2)
+  })
+
+  it('defends specific old-attempt retries when another attempt is active or captured', () => {
+    const order = checkout(services)
+    const first = services.payments.createAttempt(order.id)
+    services.payments.act(first.id, 'decline')
+    const second = services.payments.createAttempt(order.id)
+    let before = structuredClone(services.repository.getSnapshot())
+
+    expect(() => services.payments.createAttempt(order.id, 'FPX', first.id)).toThrow(
+      /active payment attempt/i,
+    )
+    expect(services.repository.getSnapshot()).toEqual(before)
+
+    services.payments.act(second.id, 'approve')
+    services.auth.oneClick('admin')
+    before = structuredClone(services.repository.getSnapshot())
+    expect(() => services.payments.adminRetry(
+      first.id,
+      'Confirmed blocked retry after another capture',
+    )).toThrow(/no longer accepts payment attempts|captured payment/i)
+    expect(services.repository.getSnapshot()).toEqual(before)
   })
 
   it('ignores a second distinct success event across attempts without duplicate side effects', () => {
@@ -1334,6 +1443,58 @@ describe('customer, payment, allocation and admin services', () => {
     expect(() => validateDemoState(snapshot)).not.toThrow()
   })
 
+  it('widens reviewing neutral evidence when a new physical shipment becomes eligible', () => {
+    const scenario = neutralClaimWideningScenario()
+    expect(scenario.services.repository.getSnapshot().claims.at(-1)?.shipmentCandidateIds)
+      .toEqual(['shp-processing'])
+    scenario.moveToReviewState('reviewing')
+    scenario.makeSecondShipmentEligible()
+
+    const widened = scenario.resubmit()
+    const snapshot = scenario.services.repository.getSnapshot()
+    const stored = snapshot.claims.find((claim) => claim.id === scenario.first.data.id)!
+
+    expect(widened).toMatchObject({ changed: true, data: { id: scenario.first.data.id } })
+    expect(widened.data).not.toHaveProperty('shipmentCandidateIds')
+    expect(widened.data).not.toHaveProperty('shipmentCandidateEvidenceAt')
+    expect(stored.status).toBe('reviewing')
+    expect(stored.shipmentCandidateIds).toEqual(['shp-digital', 'shp-processing'])
+    expect(stored.shipmentCandidateEvidenceAt).toEqual({
+      'shp-digital': '2026-07-28T08:00:00.000Z',
+      'shp-processing': '2026-07-28T06:00:00.000Z',
+    })
+    expect(stored.history.at(-1)?.note).toBe(
+      'Neutral order-level delivery evidence widened after customer resubmission.',
+    )
+    expect(snapshot.audits.at(-1)).toMatchObject({
+      action: 'claim.order_level_evidence_widened',
+      targetId: scenario.first.data.id,
+      before: { shipmentCandidateIds: ['shp-processing'] },
+      after: { shipmentCandidateIds: ['shp-digital', 'shp-processing'] },
+    })
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+  })
+
+  it('returns an approved neutral claim unchanged when later evidence becomes eligible', () => {
+    const scenario = neutralClaimWideningScenario()
+    scenario.moveToReviewState('approved')
+    scenario.makeSecondShipmentEligible()
+    const before = structuredClone(scenario.services.repository.getSnapshot())
+
+    const result = scenario.resubmit()
+
+    expect(result).toMatchObject({
+      changed: false,
+      data: {
+        id: scenario.first.data.id,
+        status: 'approved',
+      },
+    })
+    expect(result.data).not.toHaveProperty('shipmentCandidateIds')
+    expect(result.data).not.toHaveProperty('shipmentCandidateEvidenceAt')
+    expect(scenario.services.repository.getSnapshot()).toEqual(before)
+  })
+
   it('returns an existing order-level claim when a later exact shipment scope overlaps it', () => {
     let now = FIXED_NOW
     const scoped = new AppServices(new MemoryStorage(), () => now)
@@ -1634,6 +1795,42 @@ describe('customer, payment, allocation and admin services', () => {
     expect(services.admin.dashboard().paidVolumeSen).toBe(capturedGrossSen)
   })
 
+  it('counts only submitted, reviewing, and approved claims as open dashboard work', () => {
+    services.auth.oneClick('customer')
+    const rejected = services.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'damage',
+      shipmentId: 'shp-delivered',
+      note: 'DEMO rejected open-claim metric check',
+    }).data
+    const resolved = services.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'value_floor',
+      boxId: 'box-delivered-01',
+      note: 'DEMO resolved open-claim metric check',
+    }).data
+    services.auth.oneClick('admin')
+    expect(services.admin.dashboard().openClaims).toBe(2)
+
+    services.claims.review(rejected.id, 'reject', 'Confirmed rejected claim is terminal')
+    expect(services.admin.dashboard().openClaims).toBe(1)
+    services.claims.review(resolved.id, 'acknowledge', 'Confirmed resolved metric acknowledgement')
+    services.claims.review(resolved.id, 'approve', 'Confirmed resolved metric approval')
+    expect(services.admin.dashboard().openClaims).toBe(1)
+    services.claims.review(
+      resolved.id,
+      'resolve',
+      'Confirmed resolved metric fictional replacement',
+      { outcome: 'replacement_authorized', reference: `DEMO-${resolved.id.toUpperCase()}` },
+    )
+    expect(services.admin.dashboard().openClaims).toBe(0)
+    expect(() => services.admin.changeOrderStatus(
+      'ord-delivered',
+      'closed',
+      'Confirmed closure after terminal claim outcomes',
+    )).not.toThrow()
+  })
+
   it('guards fictional carrier/tracking entry and audits the confirmed change', () => {
     services.auth.oneClick('admin')
     const shipment = services.repository.getSnapshot().shipments.find((entry) => entry.id === 'shp-processing')!
@@ -1657,11 +1854,23 @@ describe('customer, payment, allocation and admin services', () => {
     services.auth.oneClick('admin')
     const publishedBefore = structuredClone(services.repository.getSnapshot().series[0])
     services.admin.copyPublishedToDraft()
+    const originalShortName = services.repository.getSnapshot().series
+      .find((entry) => entry.status === 'draft')!.draftPrizes![0].shortName
     services.admin.editDraftPrize('maggi', 'Draft Maggi Demo', 14_000)
     const snapshot = services.repository.getSnapshot()
     expect(snapshot.series.find((entry) => entry.status === 'published')).toEqual(publishedBefore)
     expect(snapshot.series.find((entry) => entry.status === 'draft')?.draftPrizes?.[0].name).toBe('Draft Maggi Demo')
+    expect(snapshot.series.find((entry) => entry.status === 'draft')?.draftPrizes?.[0].shortName)
+      .toBe(originalShortName)
     expect(() => services.admin.editDraftPrize('maggi', 'Bad floor', 9_999)).toThrow(/RM100 floor/i)
+
+    for (const name of ['', '   ', '\n\t']) {
+      const before = structuredClone(services.repository.getSnapshot())
+      expect(() => services.admin.editDraftPrize('maggi', name, 14_000)).toThrow(
+        /name cannot be blank/i,
+      )
+      expect(services.repository.getSnapshot()).toEqual(before)
+    }
   })
 
   it('allocates and fulfils from the frozen published snapshot after defaults change', () => {

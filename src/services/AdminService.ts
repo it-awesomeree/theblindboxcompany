@@ -1,4 +1,5 @@
 import { ADMIN_SECTION_PERMISSIONS, type AdminSection } from '../domain/constants'
+import { isOpenClaimStatus } from '../domain/claimStatus'
 import {
   assert,
   assertAdmin,
@@ -9,6 +10,7 @@ import {
   transitionOrder,
 } from '../domain/guards'
 import { publishedPrizesFor } from '../domain/selectors'
+import { isValidPrizeDefinition } from '../domain/prizeValidation'
 import type { DemoState, OrderStatus } from '../domain/types'
 import type { MockRepository } from '../data/MockRepository'
 import { AuditService } from './AuditService'
@@ -48,7 +50,7 @@ export class AdminService {
       assigned,
       remaining: (published?.allocationTotal ?? 0) - assigned - (published?.reservedBoxes ?? 0),
       reserved: published?.reservedBoxes ?? 0,
-      claims: state.claims.filter((claim) => claim.status !== 'resolved').length,
+      openClaims: state.claims.filter((claim) => isOpenClaimStatus(claim.status)).length,
     }
   }
 
@@ -133,7 +135,9 @@ export class AdminService {
         'SERVICE_OWNED_TRANSITION',
       )
       const relatedShipments = state.shipments.filter((shipment) => shipment.orderId === order.id)
-      const openClaims = state.claims.some((claim) => claim.orderId === order.id && !['rejected', 'resolved'].includes(claim.status))
+      const openClaims = state.claims.some((claim) =>
+        claim.orderId === order.id && isOpenClaimStatus(claim.status),
+      )
       assert(relatedShipments.length > 0 && relatedShipments.every((shipment) => shipment.status === 'delivered'), 'All shipments must be delivered before closing.', 'FULFILMENT_INCOMPLETE')
       assert(!openClaims, 'Resolve or reject open claims before closing.', 'CLAIM_OPEN')
       order.status = transitionOrder(order.status, status)
@@ -202,10 +206,12 @@ export class AdminService {
       const prize = draft.draftPrizes.find((entry) => entry.id === prizeId)
       assert(prize, 'Draft prize was not found.', 'PRIZE_MISSING')
       assert(Number.isInteger(valueSen) && valueSen >= 10_000, 'Every draft prize must keep the RM100 floor.', 'FLOOR_VIOLATION')
+      const cleanName = sanitizeText(name, 120)
+      assert(cleanName.length > 0, 'Draft prize name cannot be blank.', 'INVALID_PRIZE_NAME')
       const before = structuredClone(prize)
-      prize.name = sanitizeText(name, 120)
-      prize.shortName = prize.name
+      prize.name = cleanName
       prize.valueSen = valueSen
+      assert(isValidPrizeDefinition(prize), 'Draft prize definition is invalid.', 'INVALID_PRIZE_DEFINITION')
       const now = this.now()
       this.audit.append(state, {
         actorId: actor.id,

@@ -11,8 +11,9 @@ import {
 } from './helpers'
 import { VaultCanvas } from '../src/components/VaultCanvas'
 import { Notice } from '../src/components/Notice'
-import { DEMO_ADDRESS } from '../src/data/fixtures'
+import { createDemoState, DEMO_ADDRESS } from '../src/data/fixtures'
 import { STORAGE_KEY } from '../src/data/MockRepository'
+import { sealedCustomerTimeline } from '../src/domain/orderTimeline'
 
 function renderApp(storage = new MemoryStorage()) {
   window.history.replaceState({}, '', '#/')
@@ -256,8 +257,136 @@ describe('app components', () => {
     }
   })
 
+  it('remounts the customer route before switching a revealed box to a sealed box', async () => {
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    services.auth.oneClick('customer')
+    window.history.replaceState({}, '', '#/open/box-refunded-01')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+    expect(screen.getByRole('heading', { name: /beras 10kg/i })).toBeVisible()
+    expect(screen.getByText(/value manifest \/ immutable record/i)).toBeVisible()
+
+    act(() => {
+      window.location.hash = '#/open/box-unopened-01'
+      window.dispatchEvent(new HashChangeEvent('hashchange'))
+    })
+
+    expect(await screen.findByRole('button', { name: /break demo seal/i })).toBeVisible()
+    expect(screen.queryByRole('heading', { name: /beras 10kg/i })).not.toBeInTheDocument()
+    expect(screen.queryByText(/value manifest \/ immutable record/i)).not.toBeInTheDocument()
+    expect(screen.queryByText(/air fryer 5l/i)).not.toBeInTheDocument()
+  })
+
+  it('clears the reveal timer before switching to another sealed box', () => {
+    vi.useFakeTimers()
+    const setTimeoutSpy = vi.spyOn(window, 'setTimeout')
+    const clearTimeoutSpy = vi.spyOn(window, 'clearTimeout')
+    try {
+      const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+      services.auth.oneClick('customer')
+      window.history.replaceState({}, '', '#/open/box-unopened-01')
+      render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+      fireEvent.click(screen.getByRole('button', { name: /break demo seal/i }))
+      const revealTimerIndex = setTimeoutSpy.mock.calls.findIndex(([, delay]) => delay === 1700)
+      expect(revealTimerIndex).toBeGreaterThanOrEqual(0)
+      const revealTimer = setTimeoutSpy.mock.results[revealTimerIndex].value
+
+      act(() => {
+        window.location.hash = '#/open/box-processing-02'
+        window.dispatchEvent(new HashChangeEvent('hashchange'))
+      })
+      expect(clearTimeoutSpy).toHaveBeenCalledWith(revealTimer)
+      act(() => {
+        vi.advanceTimersByTime(1700)
+      })
+
+      expect(screen.getByText(/paid box \/ box-processing-02/i)).toBeVisible()
+      expect(screen.getByRole('button', { name: /break demo seal/i })).toBeVisible()
+      expect(screen.queryByText(/air fryer 5l/i)).not.toBeInTheDocument()
+      expect(screen.queryByText(/tng reload rm100/i)).not.toBeInTheDocument()
+      expect(screen.queryByText(/value manifest \/ immutable record/i)).not.toBeInTheDocument()
+    } finally {
+      setTimeoutSpy.mockRestore()
+      clearTimeoutSpy.mockRestore()
+      vi.useRealTimers()
+    }
+  })
+
+  it.each([
+    '#/open/%E0%A4%A',
+    '#/order/%E0%A4%A',
+    '#/payment-return/%E0%A4%A',
+    '#/pay/%E0%A4%A/new',
+    '#/pay/ord-unopened/%E0%A4%A',
+  ])('shows friendly not-found for malformed encoded route %s', (route) => {
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    services.auth.oneClick('customer')
+    window.history.replaceState({}, '', route)
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+    expect(screen.getByRole('heading', { name: /nothing is sealed here/i })).toBeVisible()
+  })
+
+  it('keeps a non-FPX method selected after new payment navigation remounts', async () => {
+    const user = userEvent.setup()
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    services.auth.oneClick('customer')
+    const order = services.orders.create({
+      requestId: 'checkout_0000000000000000000000000000b001',
+      quantity: 1,
+      shippingMethod: 'standard',
+      address: DEMO_ADDRESS,
+      acknowledged: true,
+      displayedTotalSen: 11_200,
+    })
+    window.history.replaceState({}, '', `#/pay/${order.id}/new`)
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+
+    const card = screen.getByRole('radio', { name: /card no card number/i })
+    await user.click(card)
+    await user.click(screen.getByRole('button', { name: /create pending demo attempt/i }))
+
+    const selectedCard = await screen.findByRole('radio', { name: /card no card number/i })
+    expect(selectedCard).toBeChecked()
+    expect(selectedCard).toBeDisabled()
+    expect(services.repository.getSnapshot().payments.at(-1)?.method).toBe('CARD')
+  })
+
+  it('shows a disputed customer payment as finance-only with no provider actions', () => {
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    services.auth.oneClick('admin')
+    services.payments.dispute(
+      'pay-unopened',
+      'Confirmed customer disputed-payment terminal display',
+      'evt-customer-dispute-terminal',
+    )
+    services.auth.oneClick('customer')
+    window.history.replaceState({}, '', '#/pay/ord-unopened/pay-unopened')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+
+    expect(screen.getByText(/under dispute.+protected finance review.+cannot be retried/i)).toBeVisible()
+    for (const action of [
+      /approve \+ valid mock webhook/i,
+      /delayed pending return/i,
+      /^decline$/i,
+      /^cancel$/i,
+      /^expire$/i,
+      /retry attempt/i,
+    ]) {
+      expect(screen.queryByRole('button', { name: action })).not.toBeInTheDocument()
+    }
+    expect(screen.getByRole('link', { name: /view order/i })).toBeVisible()
+  })
+
   it('switches a running WebGL canvas to the visible fallback after context loss', () => {
     window.history.replaceState({}, '', '/#/')
+    const shaders = [{ kind: 'vertex' }, { kind: 'fragment' }]
+    const program = { kind: 'program' }
+    const buffer = { kind: 'buffer' }
+    const bindBuffer = vi.fn()
+    const useProgram = vi.fn()
+    const detachShader = vi.fn()
+    const deleteBuffer = vi.fn()
+    const deleteProgram = vi.fn()
+    const deleteShader = vi.fn()
     const gl = {
       VERTEX_SHADER: 1,
       FRAGMENT_SHADER: 2,
@@ -267,17 +396,20 @@ describe('app components', () => {
       STATIC_DRAW: 6,
       FLOAT: 7,
       TRIANGLES: 8,
-      createShader: () => ({}),
+      createShader: vi.fn()
+        .mockReturnValueOnce(shaders[0])
+        .mockReturnValueOnce(shaders[1]),
       shaderSource: () => {},
       compileShader: () => {},
       getShaderParameter: () => true,
-      createProgram: () => ({}),
+      createProgram: () => program,
       attachShader: () => {},
+      detachShader,
       linkProgram: () => {},
       getProgramParameter: () => true,
-      useProgram: () => {},
-      createBuffer: () => ({}),
-      bindBuffer: () => {},
+      useProgram,
+      createBuffer: () => buffer,
+      bindBuffer,
       bufferData: () => {},
       getAttribLocation: () => 0,
       enableVertexAttribArray: () => {},
@@ -287,6 +419,9 @@ describe('app components', () => {
       uniform2f: () => {},
       uniform1f: () => {},
       drawArrays: () => {},
+      deleteBuffer,
+      deleteProgram,
+      deleteShader,
     }
     const context = vi.spyOn(HTMLCanvasElement.prototype, 'getContext')
       .mockReturnValue(gl as unknown as WebGLRenderingContext)
@@ -303,6 +438,100 @@ describe('app components', () => {
     expect(fallback).toBeVisible()
     expect(fallback).toHaveAttribute('role', 'button')
     expect(fallback).toHaveAttribute('aria-label', 'Live demo vault')
+    expect(bindBuffer).toHaveBeenLastCalledWith(gl.ARRAY_BUFFER, null)
+    expect(useProgram).toHaveBeenLastCalledWith(null)
+    expect(detachShader).toHaveBeenCalledWith(program, shaders[0])
+    expect(detachShader).toHaveBeenCalledWith(program, shaders[1])
+    expect(deleteBuffer).toHaveBeenCalledWith(buffer)
+    expect(deleteProgram).toHaveBeenCalledWith(program)
+    expect(deleteShader).toHaveBeenCalledWith(shaders[0])
+    expect(deleteShader).toHaveBeenCalledWith(shaders[1])
+    context.mockRestore()
+  })
+
+  it('deletes WebGL shaders, program, and buffer on setup failure and unmount', () => {
+    window.history.replaceState({}, '', '/#/')
+    const shaders = [{ kind: 'vertex' }, { kind: 'fragment' }]
+    const program = { kind: 'program' }
+    const buffer = { kind: 'buffer' }
+    const attachShader = vi.fn()
+    const detachShader = vi.fn()
+    const useProgram = vi.fn()
+    const bindBuffer = vi.fn()
+    const deleteShader = vi.fn()
+    const deleteProgram = vi.fn()
+    const deleteBuffer = vi.fn()
+    const gl = {
+      VERTEX_SHADER: 1,
+      FRAGMENT_SHADER: 2,
+      COMPILE_STATUS: 3,
+      LINK_STATUS: 4,
+      ARRAY_BUFFER: 5,
+      STATIC_DRAW: 6,
+      FLOAT: 7,
+      TRIANGLES: 8,
+      createShader: vi.fn()
+        .mockReturnValueOnce(shaders[0])
+        .mockReturnValueOnce(shaders[1]),
+      shaderSource: () => {},
+      compileShader: () => {},
+      getShaderParameter: () => true,
+      createProgram: () => program,
+      attachShader,
+      detachShader,
+      linkProgram: () => {},
+      getProgramParameter: () => true,
+      useProgram,
+      createBuffer: () => buffer,
+      bindBuffer,
+      bufferData: () => {},
+      getAttribLocation: () => -1,
+      enableVertexAttribArray: () => {},
+      vertexAttribPointer: () => {},
+      getUniformLocation: () => ({}),
+      viewport: () => {},
+      uniform2f: () => {},
+      uniform1f: () => {},
+      drawArrays: () => {},
+      deleteBuffer,
+      deleteProgram,
+      deleteShader,
+    }
+    const context = vi.spyOn(HTMLCanvasElement.prototype, 'getContext')
+      .mockReturnValue(gl as unknown as WebGLRenderingContext)
+    const failed = render(<VaultCanvas />)
+    expect(screen.getByTestId('webgl-fallback')).toBeVisible()
+    expect(bindBuffer).toHaveBeenLastCalledWith(gl.ARRAY_BUFFER, null)
+    expect(useProgram).toHaveBeenLastCalledWith(null)
+    expect(detachShader).toHaveBeenCalledWith(program, shaders[0])
+    expect(detachShader).toHaveBeenCalledWith(program, shaders[1])
+    expect(deleteBuffer).toHaveBeenCalledWith(buffer)
+    expect(deleteProgram).toHaveBeenCalledWith(program)
+    expect(deleteShader).toHaveBeenCalledWith(shaders[0])
+    expect(deleteShader).toHaveBeenCalledWith(shaders[1])
+    failed.unmount()
+
+    deleteBuffer.mockClear()
+    deleteProgram.mockClear()
+    deleteShader.mockClear()
+    attachShader.mockClear()
+    detachShader.mockClear()
+    useProgram.mockClear()
+    bindBuffer.mockClear()
+    gl.createShader.mockReset()
+      .mockReturnValueOnce(shaders[0])
+      .mockReturnValueOnce(shaders[1])
+    gl.getAttribLocation = () => 0
+    const live = render(<VaultCanvas />)
+    expect(screen.getByTestId('webgl-fallback')).not.toBeVisible()
+    live.unmount()
+    expect(bindBuffer).toHaveBeenLastCalledWith(gl.ARRAY_BUFFER, null)
+    expect(useProgram).toHaveBeenLastCalledWith(null)
+    expect(detachShader).toHaveBeenCalledWith(program, shaders[0])
+    expect(detachShader).toHaveBeenCalledWith(program, shaders[1])
+    expect(deleteBuffer).toHaveBeenCalledWith(buffer)
+    expect(deleteProgram).toHaveBeenCalledWith(program)
+    expect(deleteShader).toHaveBeenCalledTimes(2)
     context.mockRestore()
   })
 
@@ -382,6 +611,22 @@ describe('app components', () => {
     render(<AppStateProvider providedServices={inventoryServices}><App /></AppStateProvider>)
     await user.click(screen.getByRole('button', { name: /copy published series to draft/i }))
     expect(screen.getByText('Draft copy save failed safely.')).toBeVisible()
+  })
+
+  it('blocks a blank draft prize name in the inventory form before saving', async () => {
+    const user = userEvent.setup()
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    services.auth.oneClick('admin')
+    services.admin.copyPublishedToDraft()
+    const before = structuredClone(services.repository.getSnapshot())
+    window.history.replaceState({}, '', '#/admin/inventory')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+
+    await user.clear(screen.getByLabelText(/draft maggi name/i))
+
+    expect(screen.getByText(/prize name cannot be blank/i)).toBeVisible()
+    expect(screen.getByRole('button', { name: /save draft-only edit/i })).toBeDisabled()
+    expect(services.repository.getSnapshot()).toEqual(before)
   })
 
   it('hides opening controls after a full refund while keeping an honest hold explanation', async () => {
@@ -599,6 +844,61 @@ describe('app components', () => {
     expect(screen.getByRole('link', { name: /view order/i })).toBeVisible()
   })
 
+  it('shows retry only for a genuinely retryable lone failed attempt across customer and admin', () => {
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    services.auth.oneClick('customer')
+    const createOrder = (requestId: string) => services.orders.create({
+      requestId,
+      quantity: 1,
+      shippingMethod: 'standard',
+      address: DEMO_ADDRESS,
+      acknowledged: true,
+      displayedTotalSen: 11_200,
+    })
+
+    const activeOrder = createOrder('checkout_0000000000000000000000000000b011')
+    const activeOld = services.payments.createAttempt(activeOrder.id)
+    services.payments.act(activeOld.id, 'decline')
+    services.payments.createAttempt(activeOrder.id)
+
+    const capturedOrder = createOrder('checkout_0000000000000000000000000000b012')
+    const capturedOld = services.payments.createAttempt(capturedOrder.id)
+    services.payments.act(capturedOld.id, 'decline')
+    const capturedCurrent = services.payments.createAttempt(capturedOrder.id)
+    services.payments.act(capturedCurrent.id, 'approve')
+
+    const loneOrder = createOrder('checkout_0000000000000000000000000000b013')
+    const loneFailed = services.payments.createAttempt(loneOrder.id)
+    services.payments.act(loneFailed.id, 'decline')
+
+    for (const [orderId, paymentId, retryVisible] of [
+      [activeOrder.id, activeOld.id, false],
+      [capturedOrder.id, capturedOld.id, false],
+      [loneOrder.id, loneFailed.id, true],
+    ] as const) {
+      window.history.replaceState({}, '', `#/pay/${orderId}/${paymentId}`)
+      render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+      const retry = screen.queryByRole('button', { name: /create idempotent retry attempt/i })
+      if (retryVisible) expect(retry).toBeVisible()
+      else expect(retry).not.toBeInTheDocument()
+      cleanup()
+    }
+
+    services.auth.oneClick('admin')
+    window.history.replaceState({}, '', '#/admin/payments')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+    for (const [paymentId, retryVisible] of [
+      [activeOld.id, false],
+      [capturedOld.id, false],
+      [loneFailed.id, true],
+    ] as const) {
+      const record = screen.getByText(paymentId, { selector: 'summary b' }).closest('details')!
+      const retry = within(record).queryByRole('button', { name: /retry attempt/i })
+      if (retryVisible) expect(retry).toBeInTheDocument()
+      else expect(retry).not.toBeInTheDocument()
+    }
+  })
+
   it('shows guarded order cancellation and closure controls and completes a valid closure', async () => {
     const user = userEvent.setup()
     const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
@@ -688,6 +988,54 @@ describe('app components', () => {
     expect(await screen.findByText('pay-unopened')).toBeVisible()
   })
 
+  it.each(['disputed', 'refunded'] as const)(
+    'hides impossible digital fulfilment controls during a %s hold while retaining physical carrier evidence',
+    (hold) => {
+      const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+      services.auth.oneClick('admin')
+      for (const [shipmentId, path] of [
+        ['shp-processing', ['packed', 'label_created', 'shipped']],
+        ['shp-digital', ['picking', 'packed', 'label_created', 'shipped']],
+      ] as const) {
+        for (const status of path) {
+          services.fulfilment.advance(
+            shipmentId,
+            status,
+            `Confirmed held fulfilment UI setup ${status}`,
+          )
+        }
+      }
+      const payment = services.repository.getSnapshot().payments
+        .find((entry) => entry.id === 'pay-processing')!
+      if (hold === 'disputed') {
+        services.payments.dispute(
+          payment.id,
+          'Confirmed digital action visibility dispute hold',
+          'evt-digital-action-visibility-dispute',
+        )
+      } else {
+        services.payments.refund(
+          payment.id,
+          payment.amountSen,
+          'Confirmed digital action visibility refund hold',
+          'req-digital-action-visibility-refund',
+        )
+      }
+      window.history.replaceState({}, '', '#/admin/fulfilment')
+      render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+
+      const physical = screen.getByText('BULKY / shp-processing').closest('article')!
+      expect(within(physical).getByRole('button', { name: /mark delivered/i })).toBeVisible()
+      expect(within(physical).getByRole('button', { name: /delivery exception/i })).toBeVisible()
+      expect(within(physical).getByRole('button', { name: /mark lost/i })).toBeVisible()
+      expect(within(physical).getByRole('button', { name: /mark returned/i })).toBeVisible()
+      expect(within(physical).queryByRole('button', { name: /edit carrier/i })).not.toBeInTheDocument()
+
+      const digital = screen.getByText('DIGITAL / shp-digital').closest('article')!
+      expect(within(digital).queryAllByRole('button')).toHaveLength(0)
+    },
+  )
+
   it('shows structured claim resolution evidence to admin and customer', () => {
     const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
     services.auth.oneClick('customer')
@@ -760,6 +1108,35 @@ describe('app components', () => {
     expect(screen.getByText('DEMO-P-SHIPPED')).toBeVisible()
     expect(screen.getByText('Demo Express')).toBeVisible()
     expect(screen.getByText(/signature required/i)).toBeVisible()
+  })
+
+  it('shows only sanitized creation and payment history for a sealed order with sequential section numbers', () => {
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    services.auth.oneClick('customer')
+    window.history.replaceState({}, '', '#/order/ord-processing')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+
+    const timeline = screen.getByRole('heading', { name: /order events/i })
+      .closest<HTMLElement>('.panel')!
+    expect(within(timeline).getByText('Demo order created')).toBeVisible()
+    expect(within(timeline).getByText('Mock payment confirmed')).toBeVisible()
+    expect(within(timeline).queryByText('Order processing')).not.toBeInTheDocument()
+    expect(within(timeline).getByText(/only sanitized order and payment history is shown/i)).toBeVisible()
+    expect(screen.getByText('03 / BOXES')).toBeVisible()
+    expect(screen.getByText('04 / CLAIMS')).toBeVisible()
+    expect(screen.getByText('05 / FULFILMENT')).toBeVisible()
+
+    const unsafeOrder = structuredClone(
+      createDemoState().orders.find((order) => order.id === 'ord-processing')!,
+    )
+    unsafeOrder.timeline[0].status = 'processing'
+    unsafeOrder.timeline[0].label = 'Unsafe stored creation detail'
+    expect(sealedCustomerTimeline(unsafeOrder)[0]).toEqual({
+      id: unsafeOrder.timeline[0].id,
+      status: 'pending_payment',
+      label: 'Demo order created',
+      at: unsafeOrder.timeline[0].at,
+    })
   })
 
   it('keeps mixed-order shipment claim clues sealed while allowing revealed-box value-floor claims', async () => {
@@ -897,7 +1274,7 @@ describe('app components', () => {
       .mockReturnValueOnce({
         payment,
         changed: false,
-        message: 'Out-of-order event recorded but did not change anything.',
+        message: 'Out-of-order event was recorded without changing payment status.',
       })
     services.auth.oneClick('admin')
     window.history.replaceState({}, '', '#/admin/payments')
@@ -912,7 +1289,7 @@ describe('app components', () => {
 
     await user.click(within(record).getByRole('button', { name: /reconcile succeeded/i }))
     await user.click(screen.getByRole('button', { name: /confirm and audit/i }))
-    expect(await screen.findByText('Out-of-order event recorded but did not change anything.')).toBeVisible()
+    expect(await screen.findByText('Out-of-order event was recorded without changing payment status.')).toBeVisible()
     expect(screen.queryByText(/reconcile action completed and audited/i)).not.toBeInTheDocument()
     expect(processEvent).toHaveBeenCalledTimes(2)
   })

@@ -3,8 +3,11 @@ import { Link, Navigate } from '../lib/router'
 import { useNavigate, useParams } from '../lib/router-core'
 import { Notice } from '../components/Notice'
 import { StatusBadge } from '../components/StatusBadge'
+import {
+  canCustomerSubmitPaymentStatus,
+  paymentRetryEligibility,
+} from '../domain/paymentEligibility'
 import type { PaymentMethod } from '../domain/types'
-import { canTransitionPayment } from '../domain/guards'
 import { formatMYR } from '../lib/format'
 import { useAppState } from '../state/AppStateContext'
 
@@ -20,12 +23,14 @@ export function MockPaymentPage() {
   const { state, services } = useAppState()
   const { orderId = '', paymentId = 'new' } = useParams()
   const navigate = useNavigate()
-  const [method, setMethod] = useState<PaymentMethod>('FPX')
-  const [message, setMessage] = useState('')
-  const [error, setError] = useState('')
   const user = state.users.find((entry) => entry.id === state.sessionUserId)
   const order = state.orders.find((entry) => entry.id === orderId)
-  const payment = paymentId === 'new' ? undefined : state.payments.find((entry) => entry.id === paymentId)
+  const payment = paymentId === 'new'
+    ? undefined
+    : state.payments.find((entry) => entry.id === paymentId)
+  const [method, setMethod] = useState<PaymentMethod>(() => payment?.method ?? 'FPX')
+  const [message, setMessage] = useState('')
+  const [error, setError] = useState('')
 
   if (!user) return <Navigate to="/auth" replace state={{ from: `/pay/${orderId}/${paymentId}` }} />
   if (!order || order.userId !== user.id) return <Navigate to="/not-found" replace />
@@ -54,8 +59,9 @@ export function MockPaymentPage() {
   }
 
   const retry = () => {
+    if (!payment) return
     try {
-      const created = services.payments.createAttempt(order.id, method)
+      const created = services.payments.createAttempt(order.id, method, payment.id)
       navigate(`/pay/${order.id}/${created.id}`, { replace: true })
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : 'Retry was blocked.')
@@ -67,20 +73,12 @@ export function MockPaymentPage() {
     { action: 'decline' as const, status: 'failed' as const, label: 'Decline' },
     { action: 'cancel' as const, status: 'cancelled' as const, label: 'Cancel' },
     { action: 'expire' as const, status: 'expired' as const, label: 'Expire' },
-  ].filter((item) => canTransitionPayment(payment.status, item.status)) : []
+  ].filter((item) => canCustomerSubmitPaymentStatus(payment, item.status)) : []
   const orderPayments = order.paymentIds
     .map((id) => state.payments.find((entry) => entry.id === id))
-    .filter(Boolean)
+    .filter((entry) => entry !== undefined)
   const canRetry = Boolean(
-    payment &&
-    ['failed', 'cancelled', 'expired'].includes(payment.status) &&
-    order.status === 'pending_payment' &&
-    !orderPayments.some((entry) =>
-      entry && (
-        ['created', 'pending', 'processing'].includes(entry.status) ||
-        entry.events.some((event) => event.type === 'succeeded' && !event.ignoredReason)
-      ),
-    ),
+    payment && paymentRetryEligibility(order, payment, orderPayments).eligible,
   )
   const terminalMessage = payment && ({
     failed: 'This demo attempt failed. The order may retry only while it remains unpaid and has no active or captured attempt.',

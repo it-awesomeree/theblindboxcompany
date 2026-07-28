@@ -29,7 +29,14 @@ import {
 function match(pathname: string, pattern: RegExp, keys: string[]) {
   const result = pathname.match(pattern)
   if (!result) return null
-  return Object.fromEntries(keys.map((key, index) => [key, decodeURIComponent(result[index + 1])]))
+  try {
+    return Object.fromEntries(keys.map((key, index) => [
+      key,
+      decodeURIComponent(result[index + 1]),
+    ]))
+  } catch {
+    return null
+  }
 }
 
 function CustomerRoutes({ pathname }: { pathname: string }) {
@@ -60,7 +67,7 @@ function CustomerRoutes({ pathname }: { pathname: string }) {
     else if (pathname === '/claim/new') page = <ClaimPage />
     else if (pathname === '/unauthorized') page = <UnauthorizedPage />
     else if (pathname === '/not-found') page = <NotFoundPage />
-    else return null
+    else return <NotFoundPage />
   }
   return <ParamsProvider params={params}>{page}</ParamsProvider>
 }
@@ -80,11 +87,10 @@ function AdminRoutes({ pathname }: { pathname: string }) {
 }
 
 function AppRoutes() {
-  const { pathname } = useLocation()
-  const customer = CustomerRoutes({ pathname })
+  const { pathname, search } = useLocation()
   const page = pathname === '/admin' || pathname.startsWith('/admin/')
     ? <AdminRoutes pathname={pathname} />
-    : customer ?? <NotFoundPage />
+    : <CustomerRoutes key={`${pathname}${search}`} pathname={pathname} />
   return <Layout>{page}</Layout>
 }
 

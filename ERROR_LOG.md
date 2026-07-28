@@ -1,5 +1,40 @@
 # Error log
 
+## 2026-07-29 — Whole-branch follow-up resolved locally
+
+- Full customer route identity now remounts parameter/query-bound state.
+  Malformed encoded routes show not-found, and reveal timers cannot carry a
+  result into another sealed box.
+- Customer/admin payment controls and services share all-attempt retry rules.
+  Disputed payments show a terminal finance-only explanation and reject
+  customer provider actions without changing state.
+- Financial-hold fulfilment actions now come from one rule used by both the
+  admin interface and service: impossible digital actions are hidden and
+  rejected, while permitted physical carrier evidence remains available.
+- Blank or invalid draft prizes are rejected atomically by the screen, service
+  and stored-state validator without forcing the short name to equal the name.
+- Open claims use one status definition. A repeated sealed neutral order-level
+  claim can privately add newly eligible shipment evidence with matching
+  history, audit and corruption validation only while submitted or reviewing.
+  Approved claim evidence is frozen.
+- Sealed customers now see sanitized creation/payment history, section numbering
+  is sequential, and order creation history must begin at pending payment.
+  Ignored out-of-order payment wording is accurate.
+- WebGL cleanup unbinds the buffer/current program and detaches attached shaders
+  before deleting resources on setup failure, context loss and unmount.
+- Focused regression tests passed 277/277. The final full run passed all 5
+  Vitest files and 283/283 tests. The earlier known scan covered 89 files; the
+  final scanner self-test and 90-file scan passed after the timeline helper was
+  added. Lint, typecheck, production build and `git diff --check` passed.
+- Installed Chrome `npm run e2e` collected 110 tests: 44 passed, 66 intentional
+  skips and 0 failed. CI-style Chromium `npm run e2e:ci` collected 110 tests:
+  39 passed, 71 intentional skips and 0 failed. All newly added desktop
+  regressions executed and passed.
+- Manual personal Chrome comparison at 360, 390, 430, 768 and 1440 confirmed
+  black/gold/cyan parity, and the work tab was closed.
+- Local `npm audit` remains blocked by the restricted-network approval
+  boundary. The changes are uncommitted and remote GitHub CI remains pending.
+
 ## 2026-07-28 — Current local release candidate verification
 
 - `npm run verify` passed end-to-end.
@@ -25,8 +60,9 @@
 - The current local release candidate now passes bundled Chromium with the
   faithful static black/gold fallback while installed local Chrome retains live
   WebGL.
-- The new GitHub result is pending the next push. CI is not claimed green, and
-  no deployment is claimed.
+- Commit `0ee805e1ce12fa7e9bdca6a7dab66dfc5ba4ebfe` passed GitHub Actions CI run
+  #8 on 2026-07-28: both the `verify` and `e2e` jobs succeeded.
+- The draft PR remains unmerged, and no Pages deployment occurred.
 
 ## 2026-07-28 — Release repair resolved locally
 

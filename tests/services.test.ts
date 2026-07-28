@@ -1,0 +1,957 @@
+import { beforeEach, describe, expect, it } from 'vitest'
+import { BOX_PRICE_SEN, DEMO_ADMIN_ID, PRIZES, type AdminSection } from '../src/domain/constants'
+import type { Role } from '../src/domain/types'
+import { DEMO_ADDRESS } from '../src/data/fixtures'
+import { validateDemoState } from '../src/data/StateValidator'
+import { AppServices } from '../src/services/AppServices'
+import { CountingStorage, MemoryStorage, FIXED_NOW } from './helpers'
+
+let checkoutSequence = 0
+const nextCheckoutRequestId = () => `checkout_f${(++checkoutSequence).toString(16).padStart(31, '0')}`
+
+function checkout(services: AppServices, quantity = 1, requestId = nextCheckoutRequestId()) {
+  services.auth.oneClick('customer')
+  services.orders.setCartQuantity(quantity)
+  return services.orders.create({
+    requestId,
+    quantity,
+    shippingMethod: 'standard',
+    address: DEMO_ADDRESS,
+    acknowledged: true,
+    displayedTotalSen: quantity * BOX_PRICE_SEN + 1200,
+  })
+}
+
+describe('customer, payment, allocation and admin services', () => {
+  let services: AppServices
+
+  beforeEach(() => {
+    services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+  })
+
+  it('recalculates totals and snapshots cart/order data', () => {
+    const order = checkout(services, 2)
+    expect(order.snapshot.totals).toEqual({
+      itemSubtotalSen: 20_000,
+      shippingSen: 1200,
+      totalSen: 21_200,
+    })
+    expect(order.boxIds).toHaveLength(2)
+    expect(services.repository.getSnapshot().series[0].reservedBoxes).toBe(2)
+    expect(services.repository.getSnapshot().cart).toHaveLength(0)
+  })
+
+  it('rejects a tampered displayed total before creating anything', () => {
+    services.auth.oneClick('customer')
+    const before = services.repository.getSnapshot().orders.length
+    expect(() => services.orders.create({
+      requestId: nextCheckoutRequestId(),
+      quantity: 1,
+      shippingMethod: 'standard',
+      address: DEMO_ADDRESS,
+      acknowledged: true,
+      displayedTotalSen: 1,
+    })).toThrow(/server-like recalculation/i)
+    expect(services.repository.getSnapshot().orders.length).toBe(before)
+  })
+
+  it('returns one owned order for an exact checkout replay without another write', () => {
+    services.auth.oneClick('customer')
+    const requestId = nextCheckoutRequestId()
+    const input = {
+      requestId,
+      quantity: 2,
+      shippingMethod: 'standard' as const,
+      address: DEMO_ADDRESS,
+      acknowledged: true,
+      displayedTotalSen: 21_200,
+    }
+    const first = services.orders.create(input)
+    const afterFirst = services.repository.getSnapshot()
+    const evidence = {
+      revision: afterFirst.revision,
+      orders: afterFirst.orders.length,
+      boxes: afterFirst.boxes.length,
+      reserved: afterFirst.series[0].reservedBoxes,
+      audits: afterFirst.audits.length,
+    }
+    const replay = services.orders.create(input)
+    const afterReplay = services.repository.getSnapshot()
+    expect(replay.id).toBe(first.id)
+    expect({
+      revision: afterReplay.revision,
+      orders: afterReplay.orders.length,
+      boxes: afterReplay.boxes.length,
+      reserved: afterReplay.series[0].reservedBoxes,
+      audits: afterReplay.audits.length,
+    }).toEqual(evidence)
+  })
+
+  it('rejects mismatched and cross-owner checkout request reuse', () => {
+    const requestId = nextCheckoutRequestId()
+    const order = checkout(services, 1, requestId)
+    expect(() => services.orders.create({
+      requestId,
+      quantity: 2,
+      shippingMethod: 'standard',
+      address: DEMO_ADDRESS,
+      acknowledged: true,
+      displayedTotalSen: 21_200,
+    })).toThrow(/does not match the original intent/i)
+    services.repository.update((state) => {
+      state.users.push({
+        id: 'usr-other-customer',
+        name: 'Other Demo',
+        email: 'other@example.test',
+        role: 'customer',
+        status: 'active',
+        createdAt: FIXED_NOW,
+      })
+      state.sessionUserId = 'usr-other-customer'
+    })
+    expect(() => services.orders.create({
+      requestId,
+      quantity: order.snapshot.quantity,
+      shippingMethod: order.snapshot.shippingMethod,
+      address: order.snapshot.address,
+      acknowledged: true,
+      displayedTotalSen: order.snapshot.totals.totalSen,
+    })).toThrow(/belongs to another fictional account/i)
+  })
+
+  it('success event allocates once, decrements remaining once and creates fulfilment', () => {
+    const order = checkout(services, 2)
+    const payment = services.payments.createAttempt(order.id, 'FPX')
+    const assignedBefore = services.repository.getSnapshot().series[0].inventory.reduce((sum, entry) => sum + entry.assigned, 0)
+    const first = services.payments.processEvent(payment.id, 'evt-success-exact', 'succeeded')
+    const after = services.repository.getSnapshot()
+    expect(first.changed).toBe(true)
+    expect(after.orders.find((entry) => entry.id === order.id)?.status).toBe('confirmed')
+    expect(after.boxes.filter((box) => order.boxIds.includes(box.id)).every((box) => box.prizeId && box.status === 'paid_unopened')).toBe(true)
+    expect(after.series[0].inventory.reduce((sum, entry) => sum + entry.assigned, 0)).toBe(assignedBefore + 2)
+    expect(after.shipments.some((shipment) => shipment.orderId === order.id)).toBe(true)
+
+    const duplicate = services.payments.processEvent(payment.id, 'evt-success-exact', 'succeeded')
+    const distinctRepeat = services.payments.processEvent(payment.id, 'evt-success-distinct', 'succeeded')
+    const afterDuplicate = services.repository.getSnapshot()
+    expect(duplicate.changed).toBe(false)
+    expect(distinctRepeat.changed).toBe(false)
+    expect(afterDuplicate.series[0].inventory.reduce((sum, entry) => sum + entry.assigned, 0)).toBe(assignedBefore + 2)
+    expect(afterDuplicate.boxes.filter((box) => order.boxIds.includes(box.id))).toHaveLength(2)
+  })
+
+  it('makes an exact duplicate event a fully side-effect-free authorized read', () => {
+    let clock = FIXED_NOW
+    const storage = new CountingStorage()
+    const isolated = new AppServices(storage, () => clock)
+    const order = checkout(isolated)
+    const payment = isolated.payments.createAttempt(order.id)
+    const eventId = payment.events[0].id
+    const before = structuredClone(isolated.repository.getSnapshot())
+    const writesBefore = storage.writes
+    let listenerCalls = 0
+    const unsubscribe = isolated.repository.subscribe(() => { listenerCalls += 1 })
+
+    clock = '2026-07-28T05:00:00.000Z'
+    const duplicate = isolated.payments.processEvent(payment.id, eventId, 'succeeded')
+    unsubscribe()
+
+    const after = isolated.repository.getSnapshot()
+    expect(duplicate).toMatchObject({
+      changed: false,
+      message: 'Duplicate event ignored safely.',
+    })
+    expect(after).toEqual(before)
+    expect(after.revision).toBe(before.revision)
+    expect(after.audits).toEqual(before.audits)
+    expect(after.payments.find((entry) => entry.id === payment.id)?.events).toEqual(
+      before.payments.find((entry) => entry.id === payment.id)?.events,
+    )
+    expect(after.orders.find((entry) => entry.id === order.id)?.status).toBe('pending_payment')
+    expect(after.series[0].reservedBoxes).toBe(before.series[0].reservedBoxes)
+    expect(storage.writes).toBe(writesBefore)
+    expect(listenerCalls).toBe(0)
+  })
+
+  it('authorizes duplicate events before revealing their idempotent result', () => {
+    const order = checkout(services)
+    const payment = services.payments.createAttempt(order.id)
+    const eventId = payment.events[0].id
+
+    const beforeSourceSpoof = structuredClone(services.repository.getSnapshot())
+    expect(() => services.payments.processEvent(
+      payment.id,
+      eventId,
+      'succeeded',
+      'admin_reconcile',
+    )).toThrow(/cannot reconcile demo payments/i)
+    expect(services.repository.getSnapshot()).toEqual(beforeSourceSpoof)
+
+    services.repository.update((state) => {
+      state.users.push({
+        id: 'usr-duplicate-other',
+        name: 'Duplicate Other',
+        email: 'duplicate.other@example.test',
+        role: 'customer',
+        status: 'active',
+        createdAt: FIXED_NOW,
+      })
+      state.sessionUserId = 'usr-duplicate-other'
+    })
+    const beforeOwnershipCheck = structuredClone(services.repository.getSnapshot())
+    expect(() => services.payments.processEvent(payment.id, eventId, 'succeeded')).toThrow(
+      /belongs to another fictional user/i,
+    )
+    expect(services.repository.getSnapshot()).toEqual(beforeOwnershipCheck)
+  })
+
+  it('handles failure, cancellation, expiry and retry without paying the order', () => {
+    const failureOrder = checkout(services)
+    const failed = services.payments.createAttempt(failureOrder.id)
+    services.payments.act(failed.id, 'decline')
+    expect(services.repository.getSnapshot().payments.find((entry) => entry.id === failed.id)?.status).toBe('failed')
+    const retry = services.payments.createAttempt(failureOrder.id)
+    expect(retry.attempt).toBe(2)
+
+    services.payments.act(retry.id, 'cancel')
+    const retryAfterCancel = services.payments.createAttempt(failureOrder.id)
+    services.payments.act(retryAfterCancel.id, 'expire')
+    expect(services.repository.getSnapshot().payments.find((entry) => entry.id === retryAfterCancel.id)?.status).toBe('expired')
+    expect(services.repository.getSnapshot().orders.find((entry) => entry.id === failureOrder.id)?.status).toBe('pending_payment')
+  })
+
+  it('releases one reservation once across distinct repeated terminal events and late old events', () => {
+    const order = checkout(services, 2)
+    const payment = services.payments.createAttempt(order.id)
+    const reservedBefore = services.repository.getSnapshot().series[0].reservedBoxes
+
+    const first = services.payments.processEvent(payment.id, 'evt-cancel-first', 'cancelled')
+    const afterFirst = services.repository.getSnapshot()
+    expect(first.changed).toBe(true)
+    expect(afterFirst.series[0].reservedBoxes).toBe(reservedBefore - 2)
+    expect(afterFirst.boxes.filter((box) => order.boxIds.includes(box.id)).every((box) => box.status === 'void')).toBe(true)
+
+    const repeatedCancel = services.payments.processEvent(payment.id, 'evt-cancel-distinct', 'cancelled')
+    const repeatedExpire = services.payments.processEvent(payment.id, 'evt-expire-distinct', 'expired')
+    expect(repeatedCancel.changed).toBe(false)
+    expect(repeatedExpire.changed).toBe(false)
+    expect(services.repository.getSnapshot().series[0].reservedBoxes).toBe(reservedBefore - 2)
+    expect(services.repository.getSnapshot().audits.filter((entry) => entry.action === 'order.reservation_released' && entry.targetId === order.id)).toHaveLength(1)
+
+    const retry = services.payments.createAttempt(order.id)
+    expect(retry.attempt).toBe(2)
+    expect(services.repository.getSnapshot().series[0].reservedBoxes).toBe(reservedBefore)
+    expect(services.repository.getSnapshot().boxes.filter((box) => order.boxIds.includes(box.id)).every((box) => box.status === 'reserved')).toBe(true)
+
+    services.payments.processEvent(payment.id, 'evt-cancel-after-renewal', 'cancelled')
+    expect(services.repository.getSnapshot().series[0].reservedBoxes).toBe(reservedBefore)
+    expect(services.repository.getSnapshot().boxes.filter((box) => order.boxIds.includes(box.id)).every((box) => box.status === 'reserved')).toBe(true)
+  })
+
+  it('expires unpaid reservations from an injected clock exactly at the stored deadline', () => {
+    let clock = '2026-07-28T04:00:00.000Z'
+    const timed = new AppServices(new MemoryStorage(), () => clock)
+    const order = checkout(timed)
+    const payment = timed.payments.createAttempt(order.id)
+    const reservedBefore = timed.repository.getSnapshot().series[0].reservedBoxes
+
+    clock = '2026-07-28T04:14:59.999Z'
+    expect(timed.orders.expireReservations()).toMatchObject({ changed: false, count: 0 })
+    expect(timed.repository.getSnapshot().series[0].reservedBoxes).toBe(reservedBefore)
+
+    clock = order.reservationExpiresAt
+    expect(timed.orders.expireReservations()).toMatchObject({ changed: true, count: 1, orderIds: [order.id] })
+    let snapshot = timed.repository.getSnapshot()
+    expect(snapshot.series[0].reservedBoxes).toBe(reservedBefore - 1)
+    expect(snapshot.payments.find((entry) => entry.id === payment.id)?.status).toBe('expired')
+    expect(snapshot.payments.find((entry) => entry.id === payment.id)?.events.at(-1)?.source).toBe('reservation_clock')
+    expect(snapshot.boxes.find((box) => order.boxIds.includes(box.id))?.status).toBe('void')
+
+    expect(timed.orders.expireReservations()).toMatchObject({ changed: false, count: 0 })
+    expect(timed.repository.getSnapshot().series[0].reservedBoxes).toBe(reservedBefore - 1)
+    const lateSuccess = timed.payments.processEvent(payment.id, 'evt-success-after-deadline', 'succeeded')
+    expect(lateSuccess.changed).toBe(false)
+    expect(timed.repository.getSnapshot().boxes.find((box) => order.boxIds.includes(box.id))?.prizeId).toBeUndefined()
+
+    clock = '2026-07-28T04:16:00.000Z'
+    timed.payments.createAttempt(order.id)
+    snapshot = timed.repository.getSnapshot()
+    expect(snapshot.series[0].reservedBoxes).toBe(reservedBefore)
+    expect(snapshot.boxes.find((box) => order.boxIds.includes(box.id))?.status).toBe('reserved')
+    expect(snapshot.orders.find((entry) => entry.id === order.id)?.reservationExpiresAt).toBe('2026-07-28T04:31:00.000Z')
+  })
+
+  it('guards admin cancellation of unpaid orders and releases stock once', () => {
+    const blockedOrder = checkout(services)
+    services.payments.createAttempt(blockedOrder.id)
+    services.auth.oneClick('admin')
+    expect(() => services.admin.changeOrderStatus(blockedOrder.id, 'cancelled', 'Cancel with active payment')).toThrow(/active payment/i)
+
+    services.auth.oneClick('customer')
+    const cancellable = checkout(services)
+    const reservedBefore = services.repository.getSnapshot().series[0].reservedBoxes
+    services.auth.oneClick('admin')
+    services.admin.changeOrderStatus(cancellable.id, 'cancelled', 'Confirmed unpaid admin cancellation')
+    const snapshot = services.repository.getSnapshot()
+    expect(snapshot.orders.find((entry) => entry.id === cancellable.id)?.status).toBe('cancelled')
+    expect(snapshot.series[0].reservedBoxes).toBe(reservedBefore - 1)
+    expect(snapshot.boxes.find((box) => cancellable.boxIds.includes(box.id))?.status).toBe('void')
+    expect(snapshot.audits.filter((entry) => entry.action === 'order.reservation_released' && entry.targetId === cancellable.id)).toHaveLength(1)
+  })
+
+  it('records an out-of-order event without allocations', () => {
+    const order = checkout(services)
+    const payment = services.payments.createAttempt(order.id)
+    services.payments.act(payment.id, 'decline')
+    const result = services.payments.processEvent(payment.id, 'evt-late-success', 'succeeded')
+    expect(result.changed).toBe(false)
+    expect(services.repository.getSnapshot().boxes.find((box) => order.boxIds.includes(box.id))?.prizeId).toBeUndefined()
+    expect(services.repository.getSnapshot().payments.find((entry) => entry.id === payment.id)?.events.at(-1)?.ignoredReason).toMatch(/out-of-order/i)
+  })
+
+  it('shares the active-attempt guard between customer retry and admin retry', () => {
+    const order = checkout(services)
+    const first = services.payments.createAttempt(order.id)
+    services.payments.act(first.id, 'decline')
+    const second = services.payments.createAttempt(order.id)
+    expect(second.attempt).toBe(2)
+    services.auth.oneClick('admin')
+    expect(() => services.payments.adminRetry(first.id, 'Attempted conflicting admin retry')).toThrow(/active payment attempt/i)
+    expect(services.repository.getSnapshot().payments.filter((payment) => payment.orderId === order.id)).toHaveLength(2)
+  })
+
+  it('ignores a second distinct success event across attempts without duplicate side effects', () => {
+    const order = checkout(services, 2)
+    const first = services.payments.createAttempt(order.id)
+    services.payments.act(first.id, 'decline')
+    const second = services.payments.createAttempt(order.id)
+    services.payments.processEvent(second.id, 'evt-attempt-two-success', 'succeeded')
+    const before = structuredClone(services.repository.getSnapshot())
+    const forced = services.payments.processEvent(first.id, 'evt-attempt-one-forced-success', 'succeeded')
+    const after = services.repository.getSnapshot()
+    expect(forced.changed).toBe(false)
+    expect(after.payments.find((payment) => payment.id === first.id)?.events.at(-1)?.ignoredReason).toMatch(/already captured/i)
+    expect(after.boxes.filter((box) => order.boxIds.includes(box.id))).toEqual(before.boxes.filter((box) => order.boxIds.includes(box.id)))
+    expect(after.shipments.filter((shipment) => shipment.orderId === order.id)).toEqual(before.shipments.filter((shipment) => shipment.orderId === order.id))
+    expect(after.series[0].inventory).toEqual(before.series[0].inventory)
+    expect(after.audits).toEqual(before.audits)
+    expect(after.payments.filter((payment) => payment.orderId === order.id && payment.events.some((event) => event.type === 'succeeded' && !event.ignoredReason))).toHaveLength(1)
+  })
+
+  it('opens exactly once and refresh-equivalent reads return the immutable reveal', () => {
+    const order = checkout(services)
+    const payment = services.payments.createAttempt(order.id)
+    services.payments.act(payment.id, 'approve')
+    const boxId = order.boxIds[0]
+    const first = services.openBox(boxId)
+    const firstPrize = first.box.prizeId
+    const second = services.openBox(boxId)
+    expect(first.changed).toBe(true)
+    expect(second.changed).toBe(false)
+    expect(second.box.prizeId).toBe(firstPrize)
+    expect(services.repository.getSnapshot().boxes.find((box) => box.id === boxId)?.revealedAt).toBeTruthy()
+  })
+
+  it('keeps reveal exactly-once and shipment state intact when one box opens before delivery and one after', () => {
+    const order = checkout(services, 2)
+    const payment = services.payments.createAttempt(order.id)
+    services.payments.act(payment.id, 'approve')
+    const [openedFirstId, openedLaterId] = order.boxIds
+    const firstReveal = services.openBox(openedFirstId)
+    const firstRevealAt = firstReveal.box.revealedAt
+    const shipments = services.repository.getSnapshot().shipments.filter((entry) => entry.orderId === order.id)
+
+    services.auth.oneClick('admin')
+    for (const shipment of shipments) {
+      for (const status of ['picking', 'packed', 'label_created', 'shipped', 'delivered'] as const) {
+        services.fulfilment.advance(shipment.id, status, `Confirmed test ${status} transition`)
+      }
+    }
+    let snapshot = services.repository.getSnapshot()
+    expect(snapshot.shipments.filter((entry) => entry.orderId === order.id).every((entry) => entry.status === 'delivered')).toBe(true)
+    expect(snapshot.boxes.find((box) => box.id === openedFirstId)).toMatchObject({ status: 'fulfilled', revealedAt: firstRevealAt })
+    expect(snapshot.boxes.find((box) => box.id === openedLaterId)?.status).toBe('fulfilled')
+    expect(snapshot.boxes.find((box) => box.id === openedLaterId)?.revealedAt).toBeUndefined()
+
+    services.auth.oneClick('customer')
+    const laterFirst = services.openBox(openedLaterId)
+    const laterRepeat = services.openBox(openedLaterId)
+    snapshot = services.repository.getSnapshot()
+    expect(laterFirst.changed).toBe(true)
+    expect(laterRepeat.changed).toBe(false)
+    expect(laterRepeat.box.prizeId).toBe(laterFirst.box.prizeId)
+    expect(snapshot.boxes.find((box) => box.id === openedLaterId)?.status).toBe('fulfilled')
+    expect(snapshot.shipments.filter((entry) => entry.orderId === order.id).every((entry) => entry.status === 'delivered')).toBe(true)
+  })
+
+  it('puts boxes on hold for every failed, lost or returned shipment exception', () => {
+    for (const exception of ['failed_delivery', 'lost', 'returned'] as const) {
+      const isolated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+      const order = checkout(isolated)
+      const payment = isolated.payments.createAttempt(order.id)
+      isolated.payments.act(payment.id, 'approve')
+      const shipment = isolated.repository.getSnapshot().shipments.find((entry) => entry.orderId === order.id)!
+      isolated.auth.oneClick('admin')
+      for (const status of ['picking', 'packed', 'label_created', 'shipped'] as const) {
+        isolated.fulfilment.advance(shipment.id, status, `Confirmed ${status} before ${exception}`)
+      }
+      isolated.fulfilment.advance(shipment.id, exception, `Confirmed ${exception} fixture exception`)
+      const snapshot = isolated.repository.getSnapshot()
+      expect(snapshot.shipments.find((entry) => entry.id === shipment.id)?.status).toBe(exception)
+      expect(snapshot.boxes.find((entry) => entry.id === order.boxIds[0])?.status).toBe('on_hold')
+      expect(snapshot.orders.find((entry) => entry.id === order.id)?.status).toBe('processing')
+    }
+  })
+
+  it('keeps repeated legal shipment cycles collision-proof with a fixed clock', () => {
+    services.auth.oneClick('admin')
+    services.fulfilment.advance('shp-shipped', 'failed_delivery', 'Confirmed first fixed-clock delivery exception')
+    services.fulfilment.advance('shp-shipped', 'shipped', 'Confirmed fixed-clock delivery retry')
+    services.fulfilment.advance('shp-shipped', 'failed_delivery', 'Confirmed repeated fixed-clock delivery exception')
+
+    const snapshot = services.repository.getSnapshot()
+    const shipment = snapshot.shipments.find((entry) => entry.id === 'shp-shipped')!
+    const order = snapshot.orders.find((entry) => entry.id === shipment.orderId)!
+    expect(shipment.timeline.slice(-3).map((entry) => entry.status)).toEqual(['failed_delivery', 'shipped', 'failed_delivery'])
+    expect(new Set(shipment.timeline.map((entry) => entry.id)).size).toBe(shipment.timeline.length)
+    expect(new Set(order.timeline.map((entry) => entry.id)).size).toBe(order.timeline.length)
+    expect(snapshot.nextSequence).toBe(1003)
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+  })
+
+  it('records a post-delivery return and reopens a fulfilled order without money or claim side effects', () => {
+    services.auth.oneClick('admin')
+    const before = services.repository.getSnapshot()
+    const refundedBefore = before.payments.reduce((sum, payment) => sum + payment.refundedSen, 0)
+    const claimsBefore = before.claims.length
+    services.fulfilment.advance('shp-delivered', 'returned', 'Confirmed post-delivery return record')
+    const snapshot = services.repository.getSnapshot()
+    expect(snapshot.shipments.find((entry) => entry.id === 'shp-delivered')?.status).toBe('returned')
+    expect(snapshot.orders.find((entry) => entry.id === 'ord-delivered')?.status).toBe('processing')
+    expect(snapshot.boxes.find((entry) => entry.id === 'box-delivered-01')?.status).toBe('on_hold')
+    expect(snapshot.payments.reduce((sum, payment) => sum + payment.refundedSen, 0)).toBe(refundedBefore)
+    expect(snapshot.claims).toHaveLength(claimsBefore)
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+  })
+
+  it('derives a mixed delivered and returned order as partially fulfilled', () => {
+    services.auth.oneClick('admin')
+    for (const shipmentId of ['shp-processing', 'shp-digital']) {
+      const shipment = services.repository.getSnapshot().shipments.find((entry) => entry.id === shipmentId)!
+      const path = shipment.status === 'picking'
+        ? ['packed', 'label_created', 'shipped', 'delivered'] as const
+        : ['picking', 'packed', 'label_created', 'shipped', 'delivered'] as const
+      for (const status of path) {
+        services.fulfilment.advance(shipmentId, status, `Confirmed mixed-order ${status}`)
+      }
+    }
+    expect(services.repository.getSnapshot().orders.find((entry) => entry.id === 'ord-processing')?.status).toBe('fulfilled')
+    services.fulfilment.advance('shp-processing', 'returned', 'Confirmed one mixed shipment returned')
+    const snapshot = services.repository.getSnapshot()
+    expect(snapshot.orders.find((entry) => entry.id === 'ord-processing')?.status).toBe('partially_fulfilled')
+    expect(snapshot.shipments.find((entry) => entry.id === 'shp-processing')?.status).toBe('returned')
+    expect(snapshot.shipments.find((entry) => entry.id === 'shp-digital')?.status).toBe('delivered')
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+  })
+
+  it('reopens a closed order for a confirmed post-delivery return', () => {
+    services.auth.oneClick('admin')
+    services.admin.changeOrderStatus('ord-delivered', 'closed', 'Confirmed closure before return test')
+    services.fulfilment.advance('shp-delivered', 'returned', 'Confirmed return after order closure')
+    const snapshot = services.repository.getSnapshot()
+    expect(snapshot.orders.find((entry) => entry.id === 'ord-delivered')?.status).toBe('processing')
+    expect(snapshot.orders.find((entry) => entry.id === 'ord-delivered')?.timeline.map((entry) => entry.status)).toEqual([
+      'pending_payment',
+      'confirmed',
+      'processing',
+      'fulfilled',
+      'closed',
+      'processing',
+    ])
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+  })
+
+  it('full refund after reveal retains prize slot and does not reroll', () => {
+    const order = checkout(services)
+    const payment = services.payments.createAttempt(order.id)
+    services.payments.act(payment.id, 'approve')
+    const boxId = order.boxIds[0]
+    const opened = services.openBox(boxId).box
+    const assignedBefore = services.repository.getSnapshot().series[0].inventory.reduce((sum, entry) => sum + entry.assigned, 0)
+    services.auth.oneClick('admin')
+    services.payments.refund(payment.id, payment.amountSen, 'Test full refund retaining allocation', 'req-refund-once')
+    const snapshot = services.repository.getSnapshot()
+    expect(snapshot.orders.find((entry) => entry.id === order.id)?.status).toBe('refunded')
+    expect(snapshot.boxes.find((box) => box.id === boxId)?.prizeId).toBe(opened.prizeId)
+    expect(snapshot.series[0].inventory.reduce((sum, entry) => sum + entry.assigned, 0)).toBe(assignedBefore)
+    const duplicate = services.payments.refund(payment.id, payment.amountSen, 'duplicate', 'req-refund-once')
+    expect(duplicate.changed).toBe(false)
+    services.auth.oneClick('customer')
+    const retainedReveal = services.openBox(boxId)
+    expect(retainedReveal.changed).toBe(false)
+    expect(retainedReveal.box.prizeId).toBe(opened.prizeId)
+    expect(retainedReveal.box.revealedAt).toBe(opened.revealedAt)
+  })
+
+  it('full refund atomically cancels unshipped fulfilment, holds unopened boxes and blocks reveal', () => {
+    const order = checkout(services)
+    const payment = services.payments.createAttempt(order.id)
+    services.payments.act(payment.id, 'approve')
+    const shipmentId = services.repository.getSnapshot().shipments.find((shipment) => shipment.orderId === order.id)!.id
+    services.auth.oneClick('admin')
+    services.payments.refund(payment.id, payment.amountSen, 'Confirmed complete refund and fulfilment stop', 'req-full-stop')
+    let snapshot = services.repository.getSnapshot()
+    expect(snapshot.orders.find((entry) => entry.id === order.id)?.status).toBe('refunded')
+    expect(snapshot.shipments.find((entry) => entry.id === shipmentId)?.status).toBe('cancelled')
+    expect(snapshot.boxes.find((box) => box.id === order.boxIds[0])?.status).toBe('on_hold')
+    expect(() => services.fulfilment.advance(shipmentId, 'unfulfilled', 'Attempted invalid restart')).toThrow(/stopped|financial hold/i)
+    services.auth.oneClick('customer')
+    expect(() => services.openBox(order.boxIds[0])).toThrow(/financial hold/i)
+    snapshot = services.repository.getSnapshot()
+    expect(snapshot.boxes.find((box) => box.id === order.boxIds[0])?.revealedAt).toBeUndefined()
+  })
+
+  it('restores a dispute-stopped single picking shipment as confirmed when it resumes unfulfilled', () => {
+    services.auth.oneClick('admin')
+    services.fulfilment.advance('shp-unopened', 'picking', 'Confirmed picking before dispute')
+    let snapshot = services.repository.getSnapshot()
+    expect(snapshot.orders.find((entry) => entry.id === 'ord-unopened')?.status).toBe('processing')
+    expect(snapshot.shipments.find((entry) => entry.id === 'shp-unopened')?.status).toBe('picking')
+
+    services.payments.dispute(
+      'pay-unopened',
+      'Confirmed fictional dispute stopping picking',
+      'evt-single-picking-dispute',
+    )
+    snapshot = services.repository.getSnapshot()
+    expect(snapshot.shipments.find((entry) => entry.id === 'shp-unopened')?.status).toBe('cancelled')
+
+    const resolved = services.payments.resolveDispute(
+      'pay-unopened',
+      'merchant_won',
+      'Confirmed merchant win restarting fulfilment',
+      'evt-single-picking-dispute-win',
+    )
+    snapshot = services.repository.getSnapshot()
+    expect(resolved.changed).toBe(true)
+    expect(snapshot.payments.find((entry) => entry.id === 'pay-unopened')?.status).toBe('succeeded')
+    expect(snapshot.orders.find((entry) => entry.id === 'ord-unopened')?.status).toBe('confirmed')
+    expect(snapshot.shipments.find((entry) => entry.id === 'shp-unopened')?.status).toBe('unfulfilled')
+    expect(snapshot.boxes.find((entry) => entry.id === 'box-unopened-01')?.status).toBe('paid_unopened')
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+  })
+
+  it('preserves shipped history during dispute and resumes only after explicit resolution', () => {
+    const order = checkout(services)
+    const payment = services.payments.createAttempt(order.id)
+    services.payments.act(payment.id, 'approve')
+    const shipment = services.repository.getSnapshot().shipments.find((entry) => entry.orderId === order.id)!
+    services.auth.oneClick('admin')
+    for (const status of ['picking', 'packed', 'label_created', 'shipped'] as const) {
+      services.fulfilment.advance(shipment.id, status, `Confirmed dispute setup ${status}`)
+    }
+    services.payments.dispute(payment.id, 'Confirmed fictional payment dispute hold', 'evt-dispute-hold')
+    let snapshot = services.repository.getSnapshot()
+    expect(snapshot.orders.find((entry) => entry.id === order.id)?.status).toBe('disputed')
+    expect(snapshot.shipments.find((entry) => entry.id === shipment.id)?.status).toBe('shipped')
+    expect(snapshot.boxes.find((box) => box.id === order.boxIds[0])?.status).toBe('on_hold')
+    expect(() => services.fulfilment.advance(shipment.id, 'delivered', 'Attempt delivery during dispute')).toThrow(/stopped/i)
+    services.payments.resolveDispute(payment.id, 'merchant_won', 'Confirmed dispute resolution restoring fulfilment', 'evt-dispute-resolved')
+    snapshot = services.repository.getSnapshot()
+    expect(snapshot.orders.find((entry) => entry.id === order.id)?.status).toBe('processing')
+    expect(snapshot.boxes.find((box) => box.id === order.boxIds[0])?.status).toBe('fulfillment_pending')
+    services.fulfilment.advance(shipment.id, 'delivered', 'Confirmed delivery after dispute resolution')
+    services.auth.oneClick('customer')
+    expect(services.openBox(order.boxIds[0]).changed).toBe(true)
+  })
+
+  it('resumes only shipments stopped by that dispute and keeps earlier cancellations held', () => {
+    services.auth.oneClick('admin')
+    services.fulfilment.advance('shp-digital', 'cancelled', 'Cancelled earlier for an unrelated fulfilment reason')
+    services.payments.dispute(
+      'pay-processing',
+      'Confirmed fictional dispute while another shipment was already cancelled',
+      'evt-selective-dispute-hold',
+    )
+    let snapshot = services.repository.getSnapshot()
+    expect(snapshot.shipments.find((entry) => entry.id === 'shp-processing')?.timeline.at(-1)?.financialHold).toBe('disputed')
+    expect(snapshot.shipments.find((entry) => entry.id === 'shp-digital')?.timeline.at(-1)?.financialHold).toBeUndefined()
+
+    services.payments.resolveDispute(
+      'pay-processing',
+      'merchant_won',
+      'Confirmed resolution only restarts dispute-stopped work',
+      'evt-selective-dispute-resolved',
+    )
+    snapshot = services.repository.getSnapshot()
+    expect(snapshot.orders.find((entry) => entry.id === 'ord-processing')?.status).toBe('processing')
+    expect(snapshot.shipments.find((entry) => entry.id === 'shp-processing')?.status).toBe('unfulfilled')
+    expect(snapshot.shipments.find((entry) => entry.id === 'shp-digital')?.status).toBe('cancelled')
+    expect(snapshot.boxes.find((entry) => entry.id === 'box-processing-02')?.status).toBe('on_hold')
+  })
+
+  it('preserves an earlier partial refund when a later dispute is resolved for the merchant', () => {
+    services.auth.oneClick('admin')
+    const payment = services.repository.getSnapshot().payments.find((entry) => entry.id === 'pay-unopened')!
+    services.payments.refund(payment.id, 1000, 'Confirmed RM10 partial refund before dispute', 'req-partial-before-dispute')
+    services.payments.dispute(payment.id, 'Confirmed later fictional payment dispute', 'evt-partial-dispute')
+    services.payments.resolveDispute(
+      payment.id,
+      'merchant_won',
+      'Confirmed merchant win while preserving earlier partial refund',
+      'evt-partial-dispute-win',
+    )
+    const snapshot = services.repository.getSnapshot()
+    expect(snapshot.payments.find((entry) => entry.id === payment.id)).toMatchObject({
+      status: 'partially_refunded',
+      refundedSen: 1000,
+    })
+    expect(snapshot.orders.find((entry) => entry.id === 'ord-unopened')?.status).toBe('confirmed')
+    expect(snapshot.shipments.find((entry) => entry.id === 'shp-unopened')?.status).toBe('unfulfilled')
+  })
+
+  it('allows guarded post-close dispute and refund while preserving delivered history', () => {
+    services.auth.oneClick('admin')
+    services.admin.changeOrderStatus('ord-delivered', 'closed', 'Confirmed completion before late finance event')
+    services.payments.dispute('pay-delivered', 'Confirmed late fictional dispute after closure', 'evt-closed-dispute')
+    services.payments.resolveDispute(
+      'pay-delivered',
+      'merchant_won',
+      'Confirmed merchant win restoring the prior closed state',
+      'evt-closed-dispute-win',
+    )
+    let snapshot = services.repository.getSnapshot()
+    expect(snapshot.orders.find((entry) => entry.id === 'ord-delivered')?.status).toBe('closed')
+    expect(snapshot.shipments.find((entry) => entry.id === 'shp-delivered')?.status).toBe('delivered')
+
+    const payment = snapshot.payments.find((entry) => entry.id === 'pay-delivered')!
+    services.payments.refund(
+      payment.id,
+      payment.amountSen,
+      'Confirmed full refund after closed order review',
+      'req-closed-full-refund',
+    )
+    snapshot = services.repository.getSnapshot()
+    expect(snapshot.orders.find((entry) => entry.id === 'ord-delivered')?.status).toBe('refunded')
+    expect(snapshot.shipments.find((entry) => entry.id === 'shp-delivered')?.status).toBe('delivered')
+    expect(snapshot.boxes.find((entry) => entry.id === 'box-delivered-01')?.revealedAt).toBeTruthy()
+  })
+
+  it('manual order transitions cannot bypass payment, box, reservation or shipment services', () => {
+    const order = checkout(services)
+    const payment = services.payments.createAttempt(order.id)
+    services.payments.act(payment.id, 'approve')
+    services.auth.oneClick('admin')
+    expect(() => services.admin.changeOrderStatus(order.id, 'processing', 'Manual processing override attempt')).toThrow(/services own/i)
+    expect(() => services.admin.changeOrderStatus(order.id, 'cancelled', 'Manual paid cancellation attempt')).toThrow(/services own/i)
+    expect(services.repository.getSnapshot().orders.find((entry) => entry.id === order.id)?.status).toBe('confirmed')
+  })
+
+  it('validates claim eligibility, returns duplicate open claims idempotently and uses unique deterministic IDs', () => {
+    services.auth.oneClick('customer')
+    expect(() => services.claims.submit({
+      orderId: 'ord-shipped',
+      kind: 'damage',
+      shipmentId: 'shp-shipped',
+      note: 'DEMO shipped box damage claim',
+    })).toThrow(/delivered shipment/i)
+    const damage = services.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'damage',
+      shipmentId: 'shp-delivered',
+      note: 'DEMO delivered carton is damaged',
+    })
+    const duplicate = services.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'damage',
+      shipmentId: 'shp-delivered',
+      note: 'DEMO duplicate delivered carton report',
+    })
+    const valueFloor = services.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'value_floor',
+      boxId: 'box-delivered-01',
+      note: 'DEMO value-floor evidence review',
+    })
+    const nonDelivery = services.claims.submit({
+      orderId: 'ord-shipped',
+      kind: 'non_delivery',
+      shipmentId: 'shp-shipped',
+      note: 'DEMO shipment is overdue and missing',
+    })
+    expect(damage.changed).toBe(true)
+    expect(duplicate).toMatchObject({ changed: false, data: { id: damage.data.id } })
+    expect(new Set([damage.data.id, valueFloor.data.id, nonDelivery.data.id]).size).toBe(3)
+    expect(damage.data.id).toMatch(/^clm-[a-z0-9]{8}-[a-z0-9]{7}$/)
+    expect(damage.data.requestId).toMatch(/^req-claim-/)
+  })
+
+  it('runs protected claim review from acknowledge through resolve without an implicit refund', () => {
+    services.auth.oneClick('customer')
+    const claim = services.claims.submit({
+      orderId: 'ord-shipped',
+      kind: 'non_delivery',
+      shipmentId: 'shp-shipped',
+      note: 'DEMO overdue shipment review request',
+    }).data
+    const refundsBefore = services.repository.getSnapshot().payments.reduce((sum, payment) => sum + payment.refundedSen, 0)
+    services.auth.oneClick('admin')
+    services.claims.review(claim.id, 'acknowledge', 'Support acknowledged fictional evidence')
+    services.claims.review(claim.id, 'approve', 'Support approved fictional eligibility')
+    services.claims.review(claim.id, 'resolve', 'Support resolved fictional replacement path')
+    const snapshot = services.repository.getSnapshot()
+    const resolved = snapshot.claims.find((entry) => entry.id === claim.id)!
+    expect(resolved.status).toBe('resolved')
+    expect(resolved.history.map((entry) => entry.status)).toEqual(['submitted', 'reviewing', 'approved', 'resolved'])
+    expect(snapshot.audits.filter((entry) => entry.targetId === claim.id).map((entry) => entry.action)).toEqual([
+      'claim.submitted',
+      'claim.acknowledge',
+      'claim.approve',
+      'claim.resolve',
+    ])
+    expect(snapshot.payments.reduce((sum, payment) => sum + payment.refundedSen, 0)).toBe(refundsBefore)
+    expect(() => services.claims.review(claim.id, 'resolve', 'Duplicate invalid resolution attempt')).toThrow(/cannot resolve/i)
+  })
+
+  it('treats a refund request identity as global across payments', () => {
+    services.auth.oneClick('admin')
+    const [first, second] = services.repository.getSnapshot().payments.filter((payment) => payment.status === 'succeeded')
+    const secondBefore = second.refundedSen
+    services.payments.refund(first.id, 1000, 'First global request use', 'req-global-refund-once')
+    const replay = services.payments.refund(second.id, 1000, 'Replayed on another payment', 'req-global-refund-once')
+    expect(replay.changed).toBe(false)
+    expect(services.repository.getSnapshot().payments.find((payment) => payment.id === second.id)?.refundedSen).toBe(secondBefore)
+  })
+
+  it('sanitizes and bounds refund and admin retry reasons, rejecting short reasons before writes', () => {
+    services.auth.oneClick('admin')
+    const beforeShortRefund = structuredClone(services.repository.getSnapshot())
+    expect(() => services.payments.refund('pay-unopened', 1000, ' <b>x</b> ', 'req-short-refund')).toThrow(/at least 8 characters/i)
+    expect(services.repository.getSnapshot()).toEqual(beforeShortRefund)
+
+    const longRefundReason = `<b>Confirmed refund review</b> ${'safe words '.repeat(40)}`
+    services.payments.refund('pay-unopened', 1000, longRefundReason, 'req-clean-refund')
+    const refundAudit = services.repository.getSnapshot().audits.find((entry) => entry.requestId === 'req-clean-refund')!
+    expect(refundAudit.reason).not.toMatch(/[<>]/)
+    expect(refundAudit.reason.length).toBeLessThanOrEqual(240)
+    expect(refundAudit.reason.length).toBeGreaterThanOrEqual(8)
+
+    const order = checkout(services)
+    const failed = services.payments.createAttempt(order.id)
+    services.payments.act(failed.id, 'decline')
+    services.auth.oneClick('admin')
+    const beforeShortRetry = structuredClone(services.repository.getSnapshot())
+    expect(() => services.payments.adminRetry(failed.id, 'short')).toThrow(/at least 8 characters/i)
+    expect(services.repository.getSnapshot()).toEqual(beforeShortRetry)
+    services.payments.adminRetry(failed.id, `<i>Confirmed admin retry</i> ${'review '.repeat(50)}`)
+    const retryAudit = services.repository.getSnapshot().audits.find((entry) => entry.action === 'payment.admin_retry' && entry.before && (entry.before as { paymentId?: string }).paymentId === failed.id)!
+    expect(retryAudit.reason).not.toMatch(/[<>]/)
+    expect(retryAudit.reason.length).toBeLessThanOrEqual(240)
+  })
+
+  it('protects prize summaries by authentication, ownership and reveal state', () => {
+    expect(() => services.payments.prizeSummary('pay-delivered')).toThrow(/sign in is required/i)
+    services.auth.oneClick('customer')
+    expect(services.payments.prizeSummary('pay-unopened')).toEqual([])
+    expect(services.payments.prizeSummary('pay-delivered').map((prize) => prize?.id)).toEqual(['water'])
+    services.repository.update((state) => {
+      state.users.push({
+        id: 'usr-summary-other',
+        name: 'Summary Other',
+        email: 'summary@example.test',
+        role: 'customer',
+        status: 'active',
+        createdAt: FIXED_NOW,
+      })
+      state.sessionUserId = 'usr-summary-other'
+    })
+    expect(() => services.payments.prizeSummary('pay-delivered')).toThrow(/another fictional user/i)
+    services.auth.oneClick('admin')
+    expect(services.payments.prizeSummary('pay-unopened').map((prize) => prize?.id)).toEqual(['air-fryer'])
+  })
+
+  it('creates split shipments by fulfilment kind', () => {
+    const state = structuredClone(services.repository.getSnapshot())
+    const order = state.orders.find((entry) => entry.id === 'ord-processing')!
+    state.shipments = state.shipments.filter((entry) => entry.orderId !== order.id)
+    state.boxes.filter((box) => order.boxIds.includes(box.id)).forEach((box) => { box.shipmentId = undefined })
+    services.fulfilment.createForPaidOrder(state, order, FIXED_NOW)
+    const kinds = state.shipments.filter((entry) => entry.orderId === order.id).map((entry) => entry.kind)
+    expect(kinds.sort()).toEqual(['BULKY', 'DIGITAL'])
+  })
+
+  it('enforces admin authorization and prohibits self-suspension', () => {
+    services.auth.oneClick('customer')
+    expect(() => services.admin.dashboard()).toThrow(/cannot view dashboard/i)
+    services.auth.oneClick('admin')
+    expect(services.admin.dashboard().users).toBeGreaterThan(1)
+    expect(() => services.admin.setUserStatus(DEMO_ADMIN_ID, 'suspended', 'Trying to suspend self')).toThrow(/cannot suspend themselves/i)
+  })
+
+  it('counts captured disputes and keeps paid volume gross through partial and full refunds', () => {
+    services.auth.oneClick('admin')
+    const capturedGrossSen = services.repository.getSnapshot().payments
+      .filter((payment) => payment.events.some((event) => event.type === 'succeeded' && !event.ignoredReason))
+      .reduce((sum, payment) => sum + payment.amountSen, 0)
+
+    expect(services.admin.dashboard().paidVolumeSen).toBe(capturedGrossSen)
+    services.payments.dispute(
+      'pay-unopened',
+      'Confirmed captured dispute volume regression',
+      'evt-paid-volume-dispute',
+    )
+    expect(services.repository.getSnapshot().payments.find((payment) => payment.id === 'pay-unopened')?.status).toBe('disputed')
+    expect(services.admin.dashboard().paidVolumeSen).toBe(capturedGrossSen)
+
+    const refundable = services.repository.getSnapshot().payments.find((payment) => payment.id === 'pay-delivered')!
+    services.payments.refund(
+      refundable.id,
+      1000,
+      'Confirmed partial refund gross-volume regression',
+      'req-paid-volume-partial',
+    )
+    expect(services.admin.dashboard().paidVolumeSen).toBe(capturedGrossSen)
+    services.payments.refund(
+      refundable.id,
+      refundable.amountSen - 1000,
+      'Confirmed full refund gross-volume regression',
+      'req-paid-volume-full',
+    )
+    expect(services.admin.dashboard().paidVolumeSen).toBe(capturedGrossSen)
+  })
+
+  it('guards fictional carrier/tracking entry and audits the confirmed change', () => {
+    services.auth.oneClick('admin')
+    const shipment = services.repository.getSnapshot().shipments.find((entry) => entry.id === 'shp-processing')!
+    services.fulfilment.setTracking(shipment.id, 'Demo North Freight', 'DEMO-TRACK-9001', 'Confirmed tracking test update')
+    const snapshot = services.repository.getSnapshot()
+    expect(snapshot.shipments.find((entry) => entry.id === shipment.id)).toMatchObject({
+      carrier: 'Demo North Freight',
+      trackingNumber: 'DEMO-TRACK-9001',
+    })
+    expect(snapshot.audits.at(-1)).toMatchObject({
+      action: 'shipment.tracking_updated',
+      targetId: shipment.id,
+      before: { carrier: 'Demo Bulky Freight' },
+      after: { trackingNumber: 'DEMO-TRACK-9001' },
+    })
+    expect(() => services.fulfilment.setTracking('shp-digital', 'Real Courier', 'REAL-1234', 'Unsafe tracking test')).toThrow(/clearly fictional/i)
+    expect(() => services.fulfilment.setTracking('shp-shipped', 'Demo Express', 'DEMO-LOCKED-1', 'Locked tracking test')).toThrow(/lock after shipment/i)
+  })
+
+  it('keeps published inventory immutable while allowing a floor-safe draft edit', () => {
+    services.auth.oneClick('admin')
+    const publishedBefore = structuredClone(services.repository.getSnapshot().series[0])
+    services.admin.copyPublishedToDraft()
+    services.admin.editDraftPrize('maggi', 'Draft Maggi Demo', 14_000)
+    const snapshot = services.repository.getSnapshot()
+    expect(snapshot.series.find((entry) => entry.status === 'published')).toEqual(publishedBefore)
+    expect(snapshot.series.find((entry) => entry.status === 'draft')?.draftPrizes?.[0].name).toBe('Draft Maggi Demo')
+    expect(() => services.admin.editDraftPrize('maggi', 'Bad floor', 9_999)).toThrow(/RM100 floor/i)
+  })
+
+  it('allocates and fulfils from the frozen published snapshot after defaults change', () => {
+    const defaults = structuredClone(PRIZES)
+    try {
+      PRIZES.forEach((prize) => {
+        prize.allocation = 0
+        prize.fulfilment = 'DIGITAL'
+        prize.name = `Changed default ${prize.id}`
+      })
+      const order = checkout(services)
+      const payment = services.payments.createAttempt(order.id)
+      services.payments.act(payment.id, 'approve')
+      const snapshot = services.repository.getSnapshot()
+      const box = snapshot.boxes.find((entry) => entry.id === order.boxIds[0])!
+      const frozen = snapshot.series[0].publishedPrizes!.find((prize) => prize.id === box.prizeId)!
+      const shipment = snapshot.shipments.find((entry) => entry.orderId === order.id)!
+      expect(frozen.name).not.toMatch(/Changed default/)
+      expect(frozen.allocation).toBeGreaterThan(0)
+      expect(shipment.kind).toBe(frozen.fulfilment)
+    } finally {
+      PRIZES.splice(0, PRIZES.length, ...defaults)
+    }
+  })
+
+  it('enforces the complete role-to-section permission matrix in services', () => {
+    const sections: AdminSection[] = ['overview', 'users', 'orders', 'payments', 'inventory', 'fulfilment', 'claims', 'audit']
+    const expected: Record<Role, AdminSection[]> = {
+      customer: [],
+      support: ['users', 'claims'],
+      fulfilment: ['fulfilment'],
+      finance: ['payments'],
+      catalog: ['inventory'],
+      admin: sections,
+      super_admin: sections,
+    }
+    const userForRole: Record<Role, string> = {
+      customer: 'usr-demo-customer',
+      support: 'usr-support',
+      fulfilment: 'usr-fulfilment',
+      finance: 'usr-finance',
+      catalog: 'usr-catalog',
+      admin: 'usr-demo-admin',
+      super_admin: 'usr-demo-admin',
+    }
+    const roles: Role[] = ['customer', 'support', 'fulfilment', 'finance', 'catalog', 'admin', 'super_admin']
+    for (const role of roles) {
+      services.repository.update((state) => {
+        const user = state.users.find((entry) => entry.id === userForRole[role])!
+        user.role = role
+        state.sessionUserId = user.id
+      })
+      for (const section of sections) {
+        if (expected[role].includes(section)) expect(() => services.admin.viewForRole(section)).not.toThrow()
+        else expect(() => services.admin.viewForRole(section)).toThrow()
+      }
+      if (!['admin', 'super_admin'].includes(role)) expect(() => services.admin.snapshot()).toThrow()
+    }
+  })
+
+  it('blocks lower staff from invoking another department service action', () => {
+    const pendingOrder = checkout(services)
+    const switchTo = (userId: string) => services.repository.update((state) => { state.sessionUserId = userId })
+
+    switchTo('usr-support')
+    expect(() => services.admin.changeOrderStatus(
+      pendingOrder.id,
+      'cancelled',
+      'Support attempted a combined order action',
+    )).toThrow(/cannot change order state/i)
+
+    switchTo('usr-fulfilment')
+    expect(() => services.payments.refund(
+      'pay-unopened',
+      1000,
+      'Fulfilment attempted finance action',
+      'req-wrong-department-refund',
+    )).toThrow(/cannot refund/i)
+
+    switchTo('usr-finance')
+    expect(() => services.fulfilment.advance(
+      'shp-unopened',
+      'picking',
+      'Finance attempted fulfilment action',
+    )).toThrow(/cannot change fulfilment/i)
+
+    switchTo('usr-catalog')
+    expect(() => services.claims.queue()).toThrow(/cannot view the claims queue/i)
+  })
+
+  it('keeps audit append-only for sensitive actions', () => {
+    services.auth.oneClick('admin')
+    const before = services.repository.getSnapshot().audits.length
+    services.admin.setUserStatus('usr-suspended', 'active', 'Confirmed test reactivation')
+    const audits = services.repository.getSnapshot().audits
+    expect(audits).toHaveLength(before + 1)
+    expect(audits.at(-1)).toMatchObject({
+      actorId: DEMO_ADMIN_ID,
+      action: 'user.reactivated',
+      targetId: 'usr-suspended',
+    })
+  })
+
+  it('uses all exact prize values and allocation names', () => {
+    expect(PRIZES.map((prize) => prize.valueSen)).toEqual([13000, 12000, 12000, 15000, 14000, 10000, 29900, 82900, 204900, 399900, 599900])
+  })
+})

@@ -142,7 +142,7 @@ export function Layout({ children }: PropsWithChildren) {
         onConfirm={reset}
         onCancel={closeReset}
       >
-        <p>This removes this tab’s fictional session changes and restores the safe starting fixtures. No real account, order, payment, or shipment is affected.</p>
+        <p>This replaces this browser’s fictional demo data and restores the safe starting fixtures. No real account, order, payment, or shipment is affected.</p>
         {resetError && <div className="notice notice-danger" role="alert">{resetError}</div>}
       </ConfirmDialog>
     </div>

@@ -45,6 +45,18 @@ class FaultStorage extends MemoryStorage {
   }
 }
 
+class MutateThenFailOnceStorage extends MemoryStorage {
+  failAfterNextWrite = false
+
+  setItem(key: string, value: string) {
+    super.setItem(key, value)
+    if (this.failAfterNextWrite) {
+      this.failAfterNextWrite = false
+      throw new Error('write failed after mutation')
+    }
+  }
+}
+
 function servicesWithClaim(
   kind: 'damage' | 'non_delivery' | 'value_floor',
   now: () => string = () => FIXED_NOW,
@@ -314,20 +326,160 @@ describe('MockRepository recovery and persistence', () => {
     expect(JSON.parse(storage.getItem(STORAGE_KEY)!).schemaVersion).toBe(6)
   })
 
-  it('recovers corrupt data without throwing', () => {
+  it('keeps corrupt bytes untouched and requires an explicit confirmed reset', () => {
     const storage = new MemoryStorage()
-    storage.seed(STORAGE_KEY, '{not-json')
+    const raw = '{not-json'
+    storage.seed(STORAGE_KEY, raw)
     const repository = new MockRepository(storage)
     expect(repository.getSnapshot().orders.length).toBeGreaterThan(0)
-    expect(repository.recoveryNotice).toMatch(/recovered/i)
+    expect(repository.recoveryNotice).toMatch(/exact original browser bytes.+memory only.+not saved.+explicit confirmed reset/i)
+    expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+    expect(() => repository.update((state) => {
+      state.cart = []
+    })).toThrow(expect.objectContaining({ code: 'CONFIRMED_RESET_REQUIRED' }))
   })
 
-  it('recovers an older schema version', () => {
+  it('keeps an unsupported older schema untouched instead of silently replacing it', () => {
     const storage = new MemoryStorage()
-    storage.seed(STORAGE_KEY, JSON.stringify({ schemaVersion: 2, users: [] }))
+    const raw = '{ "schemaVersion": 2, "revision": 14, "users": [] }'
+    storage.seed(STORAGE_KEY, raw)
     const repository = new MockRepository(storage)
     expect(repository.getSnapshot().schemaVersion).toBe(6)
-    expect(repository.recoveryNotice).toMatch(/current safe version/i)
+    expect(repository.recoveryNotice).toMatch(/unsupported old version 2.+left unchanged.+explicit confirmed reset/i)
+    expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+  })
+
+  it.each([
+    {
+      label: 'empty invalid storage',
+      raw: '',
+      expectedRevision: 2,
+      notice: /damaged.+exact original browser bytes.+memory only.+not saved.+explicit confirmed reset/i,
+    },
+    {
+      label: 'corrupt JSON',
+      raw: '{ "schemaVersion": 6, broken',
+      expectedRevision: 2,
+      notice: /damaged.+exact original browser bytes.+memory only.+not saved.+explicit confirmed reset/i,
+    },
+    {
+      label: 'invalid current schema',
+      raw: (() => {
+        const invalid = createDemoState() as Partial<DemoState>
+        invalid.revision = 41
+        delete invalid.cart
+        return JSON.stringify(invalid)
+      })(),
+      expectedRevision: 42,
+      notice: /version 6.+failed the safety checks.+exact original browser bytes.+explicit confirmed reset/i,
+    },
+    {
+      label: 'future schema',
+      raw: '{ "schemaVersion": 99, "revision": 87, "opaque": "KEEP EXACTLY" }',
+      expectedRevision: 88,
+      notice: /newer unsupported version 99.+not silently downgraded.+exact original browser bytes.+explicit confirmed reset/i,
+    },
+  ])(
+    'protects $label bytes, blocks ordinary updates, and resets monotonically only after confirmation',
+    ({ raw, expectedRevision, notice }) => {
+      const storage = new CountingStorage()
+      storage.seed(STORAGE_KEY, raw)
+      const repository = new MockRepository(storage)
+      const published = repository.getSnapshot()
+      const mutator = vi.fn((state: DemoState) => {
+        state.sessionUserId = 'usr-demo-customer'
+      })
+      const listener = vi.fn()
+      repository.subscribe(listener)
+
+      expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+      expect(storage.writes).toBe(0)
+      expect(repository.recoveryNotice).toMatch(notice)
+      expect(() => repository.update(mutator)).toThrow(
+        expect.objectContaining({ code: 'CONFIRMED_RESET_REQUIRED' }),
+      )
+      expect(mutator).not.toHaveBeenCalled()
+      expect(repository.getSnapshot()).toBe(published)
+      expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+      expect(storage.writes).toBe(0)
+      expect(listener).not.toHaveBeenCalled()
+
+      repository.reset()
+
+      expect(repository.getSnapshot()).toMatchObject({
+        schemaVersion: 6,
+        revision: expectedRevision,
+        sessionUserId: null,
+        cart: [{ quantity: 1 }],
+      })
+      expect(() => validateDemoState(repository.getSnapshot())).not.toThrow()
+      expect(JSON.parse(storage.getItem(STORAGE_KEY)!)).toEqual(repository.getSnapshot())
+      expect(storage.writes).toBe(1)
+      expect(repository.recoveryNotice).toBeNull()
+      expect(listener).toHaveBeenCalledOnce()
+    },
+  )
+
+  it('rejects authority-disabled updates and resets before mutators, storage, or listeners', () => {
+    const storage = new CountingStorage()
+    const raw = JSON.stringify(createDemoState())
+    storage.seed(STORAGE_KEY, raw)
+    const repository = new MockRepository(storage, { writeAuthority: false })
+    const published = repository.getSnapshot()
+    const mutator = vi.fn((state: DemoState) => {
+      state.sessionUserId = 'usr-demo-customer'
+    })
+    const listener = vi.fn()
+    repository.subscribe(listener)
+
+    expect(repository.hasWriteAuthority()).toBe(false)
+    expect(() => repository.update(mutator)).toThrow(
+      expect.objectContaining({ code: 'WRITE_AUTHORITY_REQUIRED' }),
+    )
+    expect(() => repository.reset()).toThrow(
+      expect.objectContaining({ code: 'WRITE_AUTHORITY_REQUIRED' }),
+    )
+    expect(mutator).not.toHaveBeenCalled()
+    expect(repository.getSnapshot()).toBe(published)
+    expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+    expect(storage.writes).toBe(0)
+    expect(listener).not.toHaveBeenCalled()
+
+    repository.grantWriteAuthority()
+    expect(repository.hasWriteAuthority()).toBe(true)
+    repository.revokeWriteAuthority()
+    expect(repository.hasWriteAuthority()).toBe(false)
+  })
+
+  it('does not initialize missing storage until disabled authority is granted', () => {
+    const storage = new CountingStorage()
+    const repository = new MockRepository(storage, { writeAuthority: false })
+
+    expect(repository.hasWriteAuthority()).toBe(false)
+    expect(storage.getItem(STORAGE_KEY)).toBeNull()
+    expect(storage.writes).toBe(0)
+
+    repository.grantWriteAuthority()
+
+    expect(repository.hasWriteAuthority()).toBe(true)
+    expect(storage.writes).toBe(1)
+    expect(JSON.parse(storage.getItem(STORAGE_KEY)!)).toEqual(repository.getSnapshot())
+  })
+
+  it('lets a second disabled repository adopt first-tab initialization before taking authority', () => {
+    const storage = new CountingStorage()
+    const first = new MockRepository(storage, { writeAuthority: false })
+    const waiting = new MockRepository(storage, { writeAuthority: false })
+
+    first.grantWriteAuthority()
+    first.revokeWriteAuthority()
+    expect(storage.writes).toBe(1)
+
+    expect(waiting.syncFromStorage()).toBe(false)
+    expect(() => waiting.grantWriteAuthority()).not.toThrow()
+    expect(waiting.hasWriteAuthority()).toBe(true)
+    expect(storage.writes).toBe(1)
+    expect(waiting.getSnapshot()).toEqual(first.getSnapshot())
   })
 
   it('does not rewrite an already-valid loaded snapshot', () => {
@@ -339,6 +491,44 @@ describe('MockRepository recovery and persistence', () => {
     expect(repository.getSnapshot()).toEqual(createDemoState())
     expect(storage.writes).toBe(0)
     expect(repository.recoveryNotice).toBeNull()
+  })
+
+  it('defers a valid version 5 migration write until authority is granted', () => {
+    const legacy = toVersion5(createDemoState())
+    legacy.revision = 19
+    const raw = JSON.stringify(legacy)
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, raw)
+
+    const repository = new MockRepository(storage, { writeAuthority: false })
+
+    expect(repository.getSnapshot()).toMatchObject({ schemaVersion: 6, revision: 19 })
+    expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+    expect(storage.writes).toBe(0)
+
+    repository.grantWriteAuthority()
+
+    expect(repository.hasWriteAuthority()).toBe(true)
+    expect(storage.writes).toBe(1)
+    expect(JSON.parse(storage.getItem(STORAGE_KEY)!)).toEqual(repository.getSnapshot())
+  })
+
+  it('restores exact version 5 bytes when a deferred migration write mutates then fails', () => {
+    const legacy = toVersion5(createDemoState())
+    legacy.revision = 23
+    const raw = JSON.stringify(legacy)
+    const storage = new MutateThenFailOnceStorage()
+    storage.seed(STORAGE_KEY, raw)
+    const repository = new MockRepository(storage, { writeAuthority: false })
+    storage.failAfterNextWrite = true
+
+    expect(() => repository.grantWriteAuthority()).toThrow(
+      expect.objectContaining({ code: 'STORAGE_WRITE_FAILED' }),
+    )
+
+    expect(repository.hasWriteAuthority()).toBe(false)
+    expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+    expect(repository.recoveryNotice).toMatch(/original version 5 bytes were restored exactly/i)
   })
 
   it('migrates valid custom version 5 business data once and then loads version 6 without writes', () => {
@@ -530,27 +720,42 @@ describe('MockRepository recovery and persistence', () => {
     expect(JSON.parse(storage.getItem(STORAGE_KEY)!)).toEqual(writerB.getSnapshot())
   })
 
-  it('blocks a stale reset with the same A/B precondition and leaves everything untouched', () => {
+  it('lets a stale authorized repository reset above storage and a current repository sync it', () => {
     const storage = new CountingStorage()
     storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
-    const writerA = new MockRepository(storage)
-    const writerB = new MockRepository(storage)
-    const staleIdentity = writerB.getSnapshot()
-    const listener = vi.fn()
-    writerB.subscribe(listener)
+    const current = new MockRepository(storage)
+    const staleResetter = new MockRepository(storage)
+    const currentListener = vi.fn()
+    current.subscribe(currentListener)
 
-    writerA.update((state) => { state.sessionUserId = 'usr-demo-customer' })
-    const storedAfterA = storage.getItem(STORAGE_KEY)
-    const writesAfterA = storage.writes
+    current.update((state) => {
+      state.sessionUserId = 'usr-demo-customer'
+      state.cart[0].quantity = 4
+    })
+    expect(current.getSnapshot().revision).toBe(2)
+    expect(staleResetter.getSnapshot().revision).toBe(1)
 
-    expect(() => writerB.reset()).toThrow(
-      expect.objectContaining({ code: 'STATE_CONFLICT' }),
-    )
-    expect(storage.writes).toBe(writesAfterA)
-    expect(storage.getItem(STORAGE_KEY)).toBe(storedAfterA)
-    expect(writerB.getSnapshot()).toBe(staleIdentity)
-    expect(writerB.getSnapshot().revision).toBe(staleIdentity.revision)
-    expect(listener).not.toHaveBeenCalled()
+    staleResetter.reset()
+
+    expect(staleResetter.getSnapshot()).toMatchObject({
+      revision: 3,
+      sessionUserId: null,
+      cart: [{ quantity: 1 }],
+    })
+    expect(JSON.parse(storage.getItem(STORAGE_KEY)!)).toEqual(staleResetter.getSnapshot())
+
+    expect(current.syncFromStorage()).toBe(true)
+    expect(current.getSnapshot()).toEqual(staleResetter.getSnapshot())
+    expect(currentListener).toHaveBeenCalledTimes(2)
+
+    current.update((state) => {
+      state.sessionUserId = 'usr-demo-admin'
+    })
+    expect(current.getSnapshot()).toMatchObject({
+      revision: 4,
+      sessionUserId: 'usr-demo-admin',
+      cart: [{ quantity: 1 }],
+    })
   })
 
   it('rejects older and invalid storage during sync without changing the published snapshot', () => {
@@ -671,12 +876,8 @@ describe('MockRepository recovery and persistence', () => {
     expect(listener).toHaveBeenCalledOnce()
   })
 
-  it.each([
-    ['missing', undefined],
-    ['corrupt', '{not-json'],
-  ])('survives a throwing initial write for %s data and keeps safe fixtures in memory', (_label, seeded) => {
+  it('survives a throwing initial write for missing data and keeps safe fixtures in memory', () => {
     const storage = new FaultStorage()
-    if (seeded) storage.seed(STORAGE_KEY, seeded)
     storage.throwOnWrite = true
     const repository = new MockRepository(storage)
     expect(repository.getSnapshot()).toEqual(createDemoState())
@@ -722,7 +923,38 @@ describe('MockRepository recovery and persistence', () => {
     expect(listener).toHaveBeenCalledOnce()
   })
 
-  it('keeps failed startup reservation cleanup atomic, visible, and retryable on the same storage', () => {
+  it('restores exact browser bytes when an update write mutates storage and then throws', () => {
+    const storage = new MutateThenFailOnceStorage()
+    const raw = JSON.stringify(createDemoState())
+    storage.seed(STORAGE_KEY, raw)
+    const repository = new MockRepository(storage)
+    const published = repository.getSnapshot()
+    const listener = vi.fn()
+    repository.subscribe(listener)
+    storage.failAfterNextWrite = true
+
+    expect(() => repository.update((state) => {
+      state.sessionUserId = 'usr-demo-customer'
+    })).toThrow(expect.objectContaining({
+      code: 'STORAGE_WRITE_FAILED',
+      message: expect.stringMatching(/previous browser data was restored exactly.+nothing changed/i),
+    }))
+
+    expect(repository.getSnapshot()).toBe(published)
+    expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+    expect(repository.hasWriteAuthority()).toBe(true)
+    expect(listener).not.toHaveBeenCalled()
+
+    repository.update((state) => {
+      state.sessionUserId = 'usr-demo-customer'
+    })
+    expect(repository.getSnapshot()).toMatchObject({
+      revision: published.revision + 1,
+      sessionUserId: 'usr-demo-customer',
+    })
+  })
+
+  it('leaves reservation expiry to the guarded action and keeps a failed action retryable', () => {
     const preparedStorage = new MemoryStorage()
     const prepared = new AppServices(preparedStorage, () => '2026-07-28T03:00:00.000Z')
     prepared.auth.oneClick('customer')
@@ -748,12 +980,21 @@ describe('MockRepository recovery and persistence', () => {
     expect(services.repository.getSnapshot()).toEqual(stateBefore)
     expect(services.repository.getSnapshot().revision).toBe(stateBefore.revision)
     expect(storage.getItem(STORAGE_KEY)).toBe(storedBefore)
+    expect(storage.writeAttempts).toBe(0)
+    expect(storage.successfulWrites).toBe(0)
+    expect(listener).not.toHaveBeenCalled()
+    expect(services.repository.recoveryNotice).toBeNull()
+    expect(services.repository.getSnapshot().orders.find((order) => order.id === dueOrder.id)?.status)
+      .toBe('pending_payment')
+
+    expect(() => services.orders.expireReservations()).toThrow(
+      expect.objectContaining({ code: 'STORAGE_WRITE_FAILED' }),
+    )
+    expect(services.repository.getSnapshot()).toEqual(stateBefore)
+    expect(storage.getItem(STORAGE_KEY)).toBe(storedBefore)
     expect(storage.writeAttempts).toBe(1)
     expect(storage.successfulWrites).toBe(0)
     expect(listener).not.toHaveBeenCalled()
-    expect(services.repository.recoveryNotice).toMatch(
-      /automatic cleanup was not saved.+nothing changed.+safe to retry or refresh/i,
-    )
 
     const retried = services.orders.expireReservations()
     expect(retried).toMatchObject({ changed: true, count: 1, orderIds: [dueOrder.id] })
@@ -765,12 +1006,14 @@ describe('MockRepository recovery and persistence', () => {
     expect(listener).toHaveBeenCalledOnce()
   })
 
-  it('rethrows invalid clocks and unexpected startup failures', () => {
-    expect(() => new AppServices(new MemoryStorage(), () => 'not-an-iso-time')).toThrow(
+  it('defers invalid clocks and clock failures until a guarded action needs time', () => {
+    const invalidClock = new AppServices(new MemoryStorage(), () => 'not-an-iso-time')
+    expect(() => invalidClock.orders.expireReservations()).toThrow(
       expect.objectContaining({ code: 'INVALID_TIME' }),
     )
     const unexpected = new Error('unexpected clock failure')
-    expect(() => new AppServices(new MemoryStorage(), () => { throw unexpected })).toThrow(unexpected)
+    const throwingClock = new AppServices(new MemoryStorage(), () => { throw unexpected })
+    expect(() => throwingClock.orders.expireReservations()).toThrow(unexpected)
   })
 
   it('rolls back a failed reset write and keeps storage active for a successful retry', () => {
@@ -797,9 +1040,40 @@ describe('MockRepository recovery and persistence', () => {
     expect(listener).not.toHaveBeenCalled()
 
     repository.reset()
-    expect(repository.getSnapshot()).toEqual(createDemoState())
-    expect(JSON.parse(storage.getItem(STORAGE_KEY)!)).toEqual(createDemoState())
+    expect(repository.getSnapshot()).toEqual({
+      ...createDemoState(),
+      revision: before.revision + 1,
+    })
+    expect(JSON.parse(storage.getItem(STORAGE_KEY)!)).toEqual(repository.getSnapshot())
     expect(listener).toHaveBeenCalledOnce()
+  })
+
+  it('restores exact browser bytes when a reset write mutates storage and then throws', () => {
+    const storage = new MutateThenFailOnceStorage()
+    const repository = new MockRepository(storage)
+    repository.update((state) => {
+      state.cart[0].quantity = 4
+    })
+    const published = repository.getSnapshot()
+    const raw = storage.getItem(STORAGE_KEY)
+    const listener = vi.fn()
+    repository.subscribe(listener)
+    storage.failAfterNextWrite = true
+
+    expect(() => repository.reset()).toThrow(
+      expect.objectContaining({ code: 'STORAGE_WRITE_FAILED' }),
+    )
+
+    expect(repository.getSnapshot()).toBe(published)
+    expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+    expect(repository.hasWriteAuthority()).toBe(true)
+    expect(listener).not.toHaveBeenCalled()
+
+    repository.reset()
+    expect(repository.getSnapshot()).toMatchObject({
+      revision: published.revision + 1,
+      cart: [{ quantity: 1 }],
+    })
   })
 
   it('rolls back cyclic tampering with an old audit before touching storage or listeners', () => {
@@ -833,7 +1107,7 @@ describe('MockRepository recovery and persistence', () => {
     ['oversized evidence', (state: DemoState) => {
       state.audits[0].after = 'x'.repeat(AUDIT_EVIDENCE_MAX_BYTES + 1)
     }],
-  ] as const)('rejects persisted %s independently and recovers safely', (_label, tamper) => {
+  ] as const)('rejects persisted %s and uses an unsaved memory-only fixture', (_label, tamper) => {
     const state = createDemoState()
     tamper(state)
     expect(() => validateDemoState(state)).toThrow(/audit/i)
@@ -843,8 +1117,11 @@ describe('MockRepository recovery and persistence', () => {
     const repository = new MockRepository(storage)
 
     expect(repository.getSnapshot()).toEqual(createDemoState())
-    expect(repository.recoveryNotice).toMatch(/replaced/i)
-    expect(storage.writes).toBe(1)
+    expect(repository.recoveryNotice).toMatch(
+      /exact original browser bytes.+left unchanged.+memory only.+not saved.+explicit confirmed reset/i,
+    )
+    expect(storage.writes).toBe(0)
+    expect(storage.getItem(STORAGE_KEY)).toBe(JSON.stringify(state))
   })
 
   it('updates and resets normally when storage was intentionally omitted', () => {
@@ -856,7 +1133,10 @@ describe('MockRepository recovery and persistence', () => {
     expect(repository.getSnapshot().cart).toEqual([])
     repository.reset()
 
-    expect(repository.getSnapshot()).toEqual(createDemoState())
+    expect(repository.getSnapshot()).toEqual({
+      ...createDemoState(),
+      revision: 3,
+    })
     expect(listener).toHaveBeenCalledTimes(2)
   })
 
@@ -921,7 +1201,7 @@ describe('MockRepository recovery and persistence', () => {
       audit.requestId = ''
       audit.eventId = '<event>'
     }],
-  ] as const)('rejects and recovers %s', (_label, mutate) => {
+  ] as const)('rejects %s and uses an unsaved memory-only fixture', (_label, mutate) => {
     const malformed = stateWithTwoAudits()
     mutate(malformed)
     expect(() => validateDemoState(malformed)).toThrow()
@@ -929,7 +1209,9 @@ describe('MockRepository recovery and persistence', () => {
     const storage = new MemoryStorage()
     storage.seed(STORAGE_KEY, JSON.stringify(malformed))
     const repository = new MockRepository(storage)
-    expect(repository.recoveryNotice).toMatch(/replaced/i)
+    expect(repository.recoveryNotice).toMatch(
+      /exact original browser bytes.+left unchanged.+memory only.+not saved.+explicit confirmed reset/i,
+    )
     expect(repository.getSnapshot()).toEqual(createDemoState())
   })
 
@@ -1184,11 +1466,13 @@ describe('MockRepository recovery and persistence', () => {
       state.claims[0].history[0].note = state.claims[0].note
       return state
     }],
-  ] as const)('recovers historically ineligible claim data: %s', (_label, makeState) => {
+  ] as const)('protects historically ineligible claim data bytes: %s', (_label, makeState) => {
     const storage = new MemoryStorage()
     storage.seed(STORAGE_KEY, JSON.stringify(makeState()))
     const repository = new MockRepository(storage)
-    expect(repository.recoveryNotice).toMatch(/replaced/i)
+    expect(repository.recoveryNotice).toMatch(
+      /exact original browser bytes.+left unchanged.+memory only.+not saved.+explicit confirmed reset/i,
+    )
     expect(repository.getSnapshot()).toEqual(createDemoState())
   })
 
@@ -1369,7 +1653,7 @@ describe('MockRepository recovery and persistence', () => {
     ['invalid insurance flag', (state: DemoState) => {
       state.series.find((entry) => entry.status === 'draft')!.draftPrizes![0].insured = 'yes' as never
     }],
-  ] as const)('recovers corrupted persisted draft prize definition: %s', (_label, mutate) => {
+  ] as const)('protects corrupted persisted draft prize bytes: %s', (_label, mutate) => {
     const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
     services.auth.oneClick('admin')
     services.admin.copyPublishedToDraft()
@@ -1380,11 +1664,13 @@ describe('MockRepository recovery and persistence', () => {
 
     const repository = new MockRepository(storage)
 
-    expect(repository.recoveryNotice).toMatch(/replaced/i)
+    expect(repository.recoveryNotice).toMatch(
+      /exact original browser bytes.+left unchanged.+memory only.+not saved.+explicit confirmed reset/i,
+    )
     expect(repository.getSnapshot()).toEqual(createDemoState())
   })
 
-  it('recovers persisted published odds that drift from allocation truth', () => {
+  it('protects persisted published odds that drift from allocation truth', () => {
     const malformed = createDemoState()
     malformed.series[0].publishedPrizes!
       .find((prize) => prize.id === 'iphone17')!.odds = '1 in 3,333'
@@ -1393,7 +1679,9 @@ describe('MockRepository recovery and persistence', () => {
 
     const repository = new MockRepository(storage)
 
-    expect(repository.recoveryNotice).toMatch(/replaced/i)
+    expect(repository.recoveryNotice).toMatch(
+      /exact original browser bytes.+left unchanged.+memory only.+not saved.+explicit confirmed reset/i,
+    )
     expect(repository.getSnapshot().series[0].publishedPrizes!
       .find((prize) => prize.id === 'iphone17')?.odds).toBe('3 in 10,000')
   })
@@ -1716,13 +2004,15 @@ describe('MockRepository recovery and persistence', () => {
     }],
   ]
 
-  it.each(malformedCases)('recovers current-schema corruption: %s', (_label, mutate) => {
+  it.each(malformedCases)('protects current-schema corruption bytes: %s', (_label, mutate) => {
     const storage = new MemoryStorage()
     const malformed = createDemoState()
     mutate(malformed)
     storage.seed(STORAGE_KEY, JSON.stringify(malformed))
     const repository = new MockRepository(storage)
-    expect(repository.recoveryNotice).toMatch(/replaced/i)
+    expect(repository.recoveryNotice).toMatch(
+      /exact original browser bytes.+left unchanged.+memory only.+not saved.+explicit confirmed reset/i,
+    )
     expect(repository.getSnapshot()).toEqual(createDemoState())
   })
 
@@ -1743,7 +2033,7 @@ describe('MockRepository recovery and persistence', () => {
       claim.resolutionOutcome = 'refund_recorded'
       claim.resolutionReference = 'evt-ord-refunded-refund'
     }],
-  ] as const)('recovers current-schema claim resolution corruption: %s', (_label, mutate) => {
+  ] as const)('protects current-schema claim resolution corruption bytes: %s', (_label, mutate) => {
     const services = servicesWithClaim('damage')
     const claim = services.repository.getSnapshot().claims[0]
     services.auth.oneClick('admin')
@@ -1760,7 +2050,9 @@ describe('MockRepository recovery and persistence', () => {
     const storage = new MemoryStorage()
     storage.seed(STORAGE_KEY, JSON.stringify(malformed))
     const repository = new MockRepository(storage)
-    expect(repository.recoveryNotice).toMatch(/replaced/i)
+    expect(repository.recoveryNotice).toMatch(
+      /exact original browser bytes.+left unchanged.+memory only.+not saved.+explicit confirmed reset/i,
+    )
     expect(repository.getSnapshot()).toEqual(createDemoState())
   })
 })

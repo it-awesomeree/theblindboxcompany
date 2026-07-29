@@ -29,6 +29,13 @@ interface LoadedState {
   notice: string | null
   needsPersist: boolean
   migratedFromRaw?: string
+  protectedRaw?: string
+  requiresConfirmedReset?: boolean
+  storageWasMissing?: boolean
+}
+
+export interface MockRepositoryOptions {
+  writeAuthority?: boolean
 }
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -155,21 +162,36 @@ export class MockRepository {
   private state: DemoState
   private listeners = new Set<() => void>()
   private activeStorage?: StorageLike
+  private writeAuthority: boolean
+  private requiresConfirmedReset = false
+  private protectedRaw?: string
+  private pendingPersist = false
+  private migratedFromRaw?: string
+  private storageWasMissing = false
   recoveryNotice: string | null = null
 
-  constructor(storage?: StorageLike) {
+  constructor(storage?: StorageLike, options: MockRepositoryOptions = {}) {
     this.activeStorage = storage
+    this.writeAuthority = options.writeAuthority ?? true
     const loaded = this.load()
     this.state = deepFreeze(loaded.state)
     this.recoveryNotice = loaded.notice
-    if (loaded.needsPersist && this.activeStorage) {
+    this.requiresConfirmedReset = loaded.requiresConfirmedReset ?? false
+    this.protectedRaw = loaded.protectedRaw
+    this.pendingPersist = loaded.needsPersist
+    this.migratedFromRaw = loaded.migratedFromRaw
+    this.storageWasMissing = loaded.storageWasMissing ?? false
+    if (this.pendingPersist && this.activeStorage && this.writeAuthority) {
       try {
-        this.persistCandidate(this.state)
+        this.persistPendingLoadedState()
       } catch {
         const preserved = loaded.migratedFromRaw
           ? this.preserveOriginalMigrationBytes(loaded.migratedFromRaw)
           : false
         this.activeStorage = undefined
+        this.pendingPersist = false
+        this.migratedFromRaw = undefined
+        this.storageWasMissing = false
         this.recoveryNotice = loaded.migratedFromRaw
           ? `${loaded.notice ?? 'Demo data was upgraded in memory.'} Browser storage could not save the upgrade. ${
               preserved
@@ -194,11 +216,12 @@ export class MockRepository {
         needsPersist: false,
       }
     }
-    if (!raw) {
+    if (raw === null) {
       return {
         state: createDemoState(),
         notice: 'Demo data was missing, so a fresh safe copy was loaded.',
         needsPersist: true,
+        storageWasMissing: true,
       }
     }
     try {
@@ -215,28 +238,56 @@ export class MockRepository {
             migratedFromRaw: raw,
           }
         } catch {
-          // Invalid version 5 data follows the same safe fixture recovery path below.
+          return this.protectedRecovery(
+            raw,
+            'Stored version 5 demo data failed the migration safety checks.',
+          )
         }
       }
-      return {
-        state: createDemoState(),
-        notice: 'Old or incomplete demo data was replaced with the current safe version.',
-        needsPersist: true,
+      if (record(parsed) && typeof parsed.schemaVersion === 'number') {
+        const version = parsed.schemaVersion
+        if (version > SCHEMA_VERSION) {
+          return this.protectedRecovery(
+            raw,
+            `Stored demo data uses newer unsupported version ${version}. It was not silently downgraded.`,
+          )
+        }
+        if (version === SCHEMA_VERSION) {
+          return this.protectedRecovery(
+            raw,
+            `Stored version ${SCHEMA_VERSION} demo data failed the safety checks.`,
+          )
+        }
+        return this.protectedRecovery(
+          raw,
+          `Stored demo data uses unsupported old version ${version}.`,
+        )
       }
+      return this.protectedRecovery(raw, 'Stored demo data is incomplete or has no supported schema version.')
     } catch {
-      return {
-        state: createDemoState(),
-        notice: 'Damaged demo data was recovered automatically.',
-        needsPersist: true,
-      }
+      return this.protectedRecovery(raw, 'Stored demo data is damaged and cannot be read.')
     }
   }
 
-  private preserveOriginalMigrationBytes(originalRaw: string) {
+  private protectedRecovery(raw: string, reason: string): LoadedState {
+    return {
+      state: createDemoState(),
+      notice: `${reason} The exact original browser bytes were left unchanged. Safe fixtures are shown in memory only and are not saved. An explicit confirmed Reset demo data action is required before the stored bytes can be replaced.`,
+      needsPersist: false,
+      protectedRaw: raw,
+      requiresConfirmedReset: true,
+    }
+  }
+
+  private restoreStoredBytes(originalRaw: string | null) {
     if (!this.activeStorage) return false
     try {
       if (this.activeStorage.getItem(STORAGE_KEY) !== originalRaw) {
-        this.activeStorage.setItem(STORAGE_KEY, originalRaw)
+        if (originalRaw === null) {
+          this.activeStorage.removeItem(STORAGE_KEY)
+        } else {
+          this.activeStorage.setItem(STORAGE_KEY, originalRaw)
+        }
       }
       return this.activeStorage.getItem(STORAGE_KEY) === originalRaw
     } catch {
@@ -244,18 +295,121 @@ export class MockRepository {
     }
   }
 
+  private preserveOriginalMigrationBytes(originalRaw: string) {
+    return this.restoreStoredBytes(originalRaw)
+  }
+
   private persistCandidate(candidate: DemoState) {
     if (!this.activeStorage) return
+    let originalRaw: string | null
+    try {
+      originalRaw = this.activeStorage.getItem(STORAGE_KEY)
+    } catch {
+      throw new DomainError(
+        'Browser storage could not be checked before saving. Nothing changed; please try again.',
+        'STORAGE_READ_FAILED',
+      )
+    }
     try {
       const serialized = JSON.stringify(candidate)
       if (typeof serialized !== 'string') throw new Error('Demo state did not serialize.')
       this.activeStorage.setItem(STORAGE_KEY, serialized)
+      if (this.activeStorage.getItem(STORAGE_KEY) !== serialized) {
+        throw new Error('Browser storage did not preserve the exact saved bytes.')
+      }
     } catch {
+      if (!this.restoreStoredBytes(originalRaw)) {
+        this.writeAuthority = false
+        throw new DomainError(
+          'Browser storage could not save or safely restore the previous data. This writer is blocked; reload before making another change.',
+          'STORAGE_WRITE_UNCERTAIN',
+        )
+      }
       throw new DomainError(
-        'Browser storage could not save this change. Nothing changed; please try again.',
+        'Browser storage could not save this change. The previous browser data was restored exactly, so nothing changed; please try again.',
         'STORAGE_WRITE_FAILED',
       )
     }
+  }
+
+  private persistPendingLoadedState() {
+    if (!this.activeStorage || !this.pendingPersist) return
+    let currentRaw: string | null
+    try {
+      currentRaw = this.activeStorage.getItem(STORAGE_KEY)
+    } catch {
+      throw new DomainError(
+        'Browser storage could not be re-read safely. Nothing changed; please try again.',
+        'STORAGE_READ_FAILED',
+      )
+    }
+    if (this.migratedFromRaw !== undefined && currentRaw !== this.migratedFromRaw) {
+      throw new DomainError(
+        'Demo data changed before the safe upgrade could be saved. Nothing changed; please try again.',
+        'STATE_CONFLICT',
+      )
+    }
+    if (this.storageWasMissing && currentRaw !== null) {
+      throw new DomainError(
+        'Demo data appeared in another tab before this tab became active. Nothing changed; please try again.',
+        'STATE_CONFLICT',
+      )
+    }
+    this.persistCandidate(this.state)
+    this.pendingPersist = false
+    this.migratedFromRaw = undefined
+    this.storageWasMissing = false
+  }
+
+  private assertWriteAuthority() {
+    if (!this.writeAuthority) {
+      throw new DomainError(
+        'This tab does not have write authority. Wait until it becomes the active demo tab before changing data.',
+        'WRITE_AUTHORITY_REQUIRED',
+      )
+    }
+  }
+
+  private assertOrdinaryUpdatesAllowed() {
+    if (this.requiresConfirmedReset) {
+      throw new DomainError(
+        'Stored demo data is protected and memory-only. Confirm Reset demo data before making any other change.',
+        'CONFIRMED_RESET_REQUIRED',
+      )
+    }
+  }
+
+  grantWriteAuthority() {
+    if (this.writeAuthority) return
+    this.syncFromStorage()
+    const originalMigrationRaw = this.migratedFromRaw
+    try {
+      this.persistPendingLoadedState()
+    } catch (caught) {
+      if (originalMigrationRaw !== undefined) {
+        const preserved = this.preserveOriginalMigrationBytes(originalMigrationRaw)
+        this.recoveryNotice =
+          `Demo data was upgraded in memory, but browser storage could not save the upgrade. ${
+            preserved
+              ? 'The original version 5 bytes were restored exactly.'
+              : 'The original version 5 bytes could not be verified, so this tab remains blocked.'
+          }`
+      }
+      throw caught
+    }
+    this.writeAuthority = true
+  }
+
+  revokeWriteAuthority() {
+    this.writeAuthority = false
+  }
+
+  hasWriteAuthority() {
+    return this.writeAuthority
+  }
+
+  hasPersistentStorage() {
+    return Boolean(this.activeStorage)
   }
 
   getSnapshot = () => this.state
@@ -278,11 +432,16 @@ export class MockRepository {
         'STORAGE_READ_FAILED',
       )
     }
-    if (!raw) {
+    if (raw === null && this.storageWasMissing) return undefined
+    if (raw === null) {
       throw new DomainError(
         'Stored demo data is missing. Nothing changed; refresh to recover safely.',
         'STORED_STATE_INVALID',
       )
+    }
+    if (this.requiresConfirmedReset && raw === this.protectedRaw) return undefined
+    if (this.pendingPersist && this.migratedFromRaw !== undefined && raw === this.migratedFromRaw) {
+      return undefined
     }
     try {
       const parsed: unknown = JSON.parse(raw)
@@ -343,6 +502,8 @@ export class MockRepository {
   }
 
   update<T>(mutator: (draft: DemoState) => T): T {
+    this.assertWriteAuthority()
+    this.assertOrdinaryUpdatesAllowed()
     this.assertCurrentStoredStateMatchesSnapshot()
     const draft = cloneState(this.state)
     const result = mutator(draft)
@@ -371,19 +532,67 @@ export class MockRepository {
           'STATE_SYNC_REJECTED',
         )
       }
+      this.clearRecoveryState()
       return false
     }
     this.state = deepFreeze(stored)
+    this.clearRecoveryState()
     this.listeners.forEach((listener) => listener())
     return true
   }
 
+  private clearRecoveryState() {
+    this.requiresConfirmedReset = false
+    this.protectedRaw = undefined
+    this.pendingPersist = false
+    this.migratedFromRaw = undefined
+    this.storageWasMissing = false
+    this.recoveryNotice = null
+  }
+
+  private readStoredRevisionForReset() {
+    if (!this.activeStorage) return undefined
+    let raw: string | null
+    try {
+      raw = this.activeStorage.getItem(STORAGE_KEY)
+    } catch {
+      throw new DomainError(
+        'Browser storage could not be re-read safely. Nothing changed; please try again.',
+        'STORAGE_READ_FAILED',
+      )
+    }
+    if (raw === null) return undefined
+    try {
+      const parsed: unknown = JSON.parse(raw)
+      if (
+        record(parsed) &&
+        Number.isSafeInteger(parsed.revision) &&
+        (parsed.revision as number) >= 0
+      ) {
+        return parsed.revision as number
+      }
+    } catch {
+      // Corrupt bytes have no revision that can be derived safely.
+    }
+    return undefined
+  }
+
   reset() {
-    this.assertCurrentStoredStateMatchesSnapshot()
+    this.assertWriteAuthority()
+    const storedRevision = this.readStoredRevisionForReset()
+    const nextRevision = Math.max(this.state.revision, storedRevision ?? 0) + 1
+    if (!Number.isSafeInteger(nextRevision)) {
+      throw new DomainError(
+        'Stored demo data has no safe next revision. Nothing changed.',
+        'STORED_REVISION_INVALID',
+      )
+    }
     const candidate = createDemoState()
+    candidate.revision = nextRevision
     validateDemoState(candidate)
     this.persistCandidate(candidate)
     this.state = deepFreeze(candidate)
+    this.clearRecoveryState()
     this.listeners.forEach((listener) => listener())
   }
 

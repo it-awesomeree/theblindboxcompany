@@ -314,7 +314,10 @@ describe('app components', () => {
     await user.click(screen.getByRole('button', { name: /reset demo data/i }))
     const dialog = screen.getByRole('dialog', { name: /reset all demo data/i })
     expect(dialog).toBeVisible()
-    expect(dialog).toHaveTextContent(/restores the safe starting fixtures/i)
+    expect(dialog).toHaveTextContent(
+      /replaces this browser’s fictional demo data.+restores the safe starting fixtures/i,
+    )
+    expect(dialog).not.toHaveTextContent(/this tab’s fictional session changes/i)
     expect(services.repository.getSnapshot().sessionUserId).toBe('usr-demo-customer')
 
     await user.click(within(dialog).getByRole('button', { name: /go back/i }))
@@ -778,7 +781,7 @@ describe('app components', () => {
     context.mockRestore()
   })
 
-  it('shows failed startup cleanup recovery in the rendered shell', () => {
+  it('does not expire reservations or show false cleanup wording while the shell starts', () => {
     const preparedStorage = new MemoryStorage()
     const prepared = new AppServices(preparedStorage, () => '2026-07-28T03:00:00.000Z')
     prepared.auth.oneClick('customer')
@@ -791,22 +794,17 @@ describe('app components', () => {
       acknowledged: true,
       displayedTotalSen: 11_200,
     })
-    class FailOnceStorage extends MemoryStorage {
-      fail = true
-      setItem(key: string, value: string) {
-        if (this.fail) {
-          this.fail = false
-          throw new Error('startup cleanup write failed')
-        }
-        super.setItem(key, value)
-      }
-    }
-    const storage = new FailOnceStorage()
-    storage.seed(STORAGE_KEY, preparedStorage.getItem(STORAGE_KEY)!)
+    const storedBefore = preparedStorage.getItem(STORAGE_KEY)!
+    const storage = new MemoryStorage()
+    storage.seed(STORAGE_KEY, storedBefore)
     const services = new AppServices(storage, () => FIXED_NOW)
     window.history.replaceState({}, '', '#/')
     render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
-    expect(screen.getByText(/automatic cleanup was not saved.+nothing changed.+safe to retry or refresh/i)).toBeVisible()
+
+    expect(screen.queryByText(/automatic cleanup/i)).not.toBeInTheDocument()
+    expect(services.repository.recoveryNotice).toBeNull()
+    expect(storage.getItem(STORAGE_KEY)).toBe(storedBefore)
+    expect(services.repository.getSnapshot().orders.at(-1)?.status).toBe('pending_payment')
   })
 
   it('shows friendly errors for guarded home, cart, logout, and draft-copy handlers', async () => {

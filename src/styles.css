@@ -22,6 +22,7 @@
   --display: "Arial Black", "Helvetica Neue", Helvetica, Impact, system-ui, sans-serif;
   --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
   --body: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --site-header-height: 66px;
   font-family: var(--body);
   color: var(--text);
   background: var(--room);
@@ -175,6 +176,7 @@ canvas {
   position: sticky;
   top: 0;
   z-index: 90;
+  height: var(--site-header-height);
   border-bottom: 1px solid var(--hair);
   background: rgba(8, 9, 8, .9);
   -webkit-backdrop-filter: blur(14px);
@@ -183,7 +185,7 @@ canvas {
 
 .nav-inner {
   width: min(1180px, calc(100% - 40px));
-  min-height: 66px;
+  height: 100%;
   margin-inline: auto;
   display: flex;
   align-items: center;
@@ -2364,6 +2366,50 @@ legend {
   background: rgba(6, 8, 8, .83);
 }
 
+.browser-safety-screen {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background:
+    radial-gradient(circle at 50% 35%, rgba(114, 217, 237, .08), transparent 32%),
+    var(--room);
+}
+
+.browser-safety-screen > div {
+  width: min(620px, 100%);
+  padding: clamp(28px, 6vw, 52px);
+  border: 1px solid var(--cyan-line);
+  background: rgba(6, 8, 8, .94);
+  text-align: center;
+}
+
+.browser-safety-screen span,
+.browser-safety-screen small {
+  color: var(--cyan);
+  font: 700 .7rem/1.5 var(--mono);
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+
+.browser-safety-screen h1 {
+  margin: 14px 0;
+  font: clamp(1.7rem, 6vw, 3.2rem)/1 var(--display);
+  text-transform: uppercase;
+}
+
+.browser-safety-screen p {
+  color: var(--muted);
+}
+
+.browser-safety-warning > div {
+  border-color: rgba(209, 69, 46, .55);
+}
+
+.browser-safety-warning span {
+  color: #ff8d79;
+}
+
 .admin-nav nav {
   display: grid;
   gap: 3px;
@@ -2955,7 +3001,7 @@ legend {
   }
 
   .nav-inner {
-    min-height: 62px;
+    height: 100%;
   }
 
   .brand-name {
@@ -3073,7 +3119,7 @@ legend {
 
   .admin-nav {
     position: sticky;
-    top: 62px;
+    top: var(--site-header-height);
     z-index: 30;
     min-height: 0;
     padding: 7px 14px;
@@ -3135,6 +3181,10 @@ legend {
 }
 
 @media (max-width: 620px) {
+  :root {
+    --site-header-height: 104px;
+  }
+
   .content,
   .content.narrow,
   .nav-inner {
@@ -3162,7 +3212,7 @@ legend {
   }
 
   .nav-inner {
-    min-height: 104px;
+    height: 100%;
     display: grid;
     grid-template-columns: auto minmax(0, 1fr);
     gap: 0 8px;
@@ -3531,7 +3581,6 @@ legend {
   }
 
   .admin-nav {
-    top: 60px;
     padding-inline: 8px;
   }
 
@@ -3609,10 +3658,6 @@ legend {
   select,
   textarea {
     font-size: 16px !important;
-  }
-
-  .admin-nav {
-    top: 104px;
   }
 
   .admin-record > summary {

@@ -381,6 +381,39 @@ test('admin mobile keeps fulfilment actions', async ({ page, isMobile }) => {
   await expectResponsiveInterfaceFloors(page)
 })
 
+test('66px and 104px sticky site headers keep admin navigation below them after scrolling', async ({ page }) => {
+  const width = page.viewportSize()?.width
+  test.skip(
+    width !== 320 && width !== 390 && width !== 768,
+    'This overlap regression covers narrow mobile and tablet header heights.',
+  )
+  await page.addInitScript(() => localStorage.clear())
+  await page.goto('#/auth')
+  await page.getByRole('button', { name: /one-click vault admin/i }).click()
+  await page.getByRole('link', { name: 'Inventory' }).click()
+  await expect(page.getByRole('heading', { name: 'Inventory' })).toBeVisible()
+
+  await page.evaluate(() => window.scrollTo({ top: 900, behavior: 'instant' }))
+  await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(0)
+
+  const rectangles = await page.evaluate(() => {
+    const site = document.querySelector<HTMLElement>('.site-nav')!.getBoundingClientRect()
+    const admin = document.querySelector<HTMLElement>('.admin-nav')!.getBoundingClientRect()
+    return {
+      site: { top: site.top, bottom: site.bottom, height: site.height },
+      admin: { top: admin.top, bottom: admin.bottom, height: admin.height },
+    }
+  })
+  expect(rectangles.site.height).toBe(width === 768 ? 66 : 104)
+  expect(rectangles.admin.top).toBeGreaterThanOrEqual(rectangles.site.bottom - 1)
+  expect(rectangles.admin.height).toBeGreaterThanOrEqual(44)
+
+  await page.getByRole('link', { name: 'Payments' }).click()
+  await expect(page.getByRole('heading', { name: 'Payments' })).toBeVisible()
+  await expect(page.getByRole('navigation', { name: 'Admin navigation' })).toBeVisible()
+  await expectNoRootOverflow(page)
+})
+
 test('every mobile viewport completes checkout, payment, order, reveal, account and admin flows', async ({ page, isMobile }) => {
   test.skip(!isMobile, 'The complete mobile journey runs at 320, 360, 390, 430 and 768 widths.')
   await page.addInitScript(() => localStorage.clear())

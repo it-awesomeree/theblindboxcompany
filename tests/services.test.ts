@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { BOX_PRICE_SEN, DEMO_ADMIN_ID, PRIZES, type AdminSection } from '../src/domain/constants'
+import { AUDIT_EVIDENCE_MAX_BYTES } from '../src/domain/auditEvidence'
 import type { Role } from '../src/domain/types'
 import { createDemoState, DEMO_ADDRESS } from '../src/data/fixtures'
 import { STORAGE_KEY } from '../src/data/MockRepository'
@@ -98,6 +99,35 @@ function neutralClaimWideningScenario() {
   }
 }
 
+const INVALID_AUDIT_EVIDENCE_CASES: Array<[string, () => unknown, string]> = [
+  ['supplied undefined', (): unknown => undefined, 'AUDIT_EVIDENCE_INVALID'],
+  ['bigint', (): unknown => 1n, 'AUDIT_EVIDENCE_INVALID'],
+  ['function', (): unknown => () => 'unsupported', 'AUDIT_EVIDENCE_INVALID'],
+  ['symbol', (): unknown => Symbol('unsupported'), 'AUDIT_EVIDENCE_INVALID'],
+  ['cycle', (): unknown => {
+    const evidence: Record<string, unknown> = {}
+    evidence.self = evidence
+    return evidence
+  }, 'AUDIT_EVIDENCE_INVALID'],
+  ['non-finite number', (): unknown => Number.POSITIVE_INFINITY, 'AUDIT_EVIDENCE_INVALID'],
+  ['sparse array', (): unknown => Array(2), 'AUDIT_EVIDENCE_INVALID'],
+  [
+    'custom class',
+    (): unknown => new (class Evidence { value = 1 })(),
+    'AUDIT_EVIDENCE_INVALID',
+  ],
+  [
+    'dangerous key',
+    (): unknown => JSON.parse('{"constructor":"unsafe"}'),
+    'AUDIT_EVIDENCE_INVALID',
+  ],
+  [
+    'oversized value',
+    (): unknown => 'x'.repeat(AUDIT_EVIDENCE_MAX_BYTES + 1),
+    'AUDIT_EVIDENCE_TOO_LARGE',
+  ],
+]
+
 describe('customer, payment, allocation and admin services', () => {
   let services: AppServices
 
@@ -116,6 +146,92 @@ describe('customer, payment, allocation and admin services', () => {
     expect(services.repository.getSnapshot().series[0].reservedBoxes).toBe(2)
     expect(services.repository.getSnapshot().cart).toHaveLength(0)
   })
+
+  it('stores deterministic, cloned, JSON-round-trip-safe audit evidence', () => {
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const isolated = new AppServices(storage, () => FIXED_NOW)
+    const before = {
+      z: 'last',
+      nested: { z: 2, a: 1 },
+      a: 'first',
+    }
+    const after: unknown[] = [-0, null, true, { z: 'last', a: 'first' }]
+
+    isolated.repository.update((state) => {
+      isolated.audit.append(state, {
+        actorId: 'system',
+        actorRole: 'super_admin',
+        action: 'audit.evidence_test',
+        targetType: 'demo_state',
+        targetId: 'evidence-test',
+        reason: 'Confirmed deterministic fictional evidence',
+        at: FIXED_NOW,
+        before,
+        after,
+        requestId: 'audit-evidence-accepted',
+      })
+    })
+
+    const stored = isolated.repository.getSnapshot().audits.at(-1)!
+    before.a = 'changed after append'
+    after[3] = { changed: 'outside stored evidence' }
+
+    expect(Object.keys(stored.before as object)).toEqual(['a', 'nested', 'z'])
+    expect(Object.keys((stored.before as Record<string, unknown>).nested as object)).toEqual([
+      'a',
+      'z',
+    ])
+    expect(stored.before).toEqual({
+      a: 'first',
+      nested: { a: 1, z: 2 },
+      z: 'last',
+    })
+    expect(stored.after).toEqual([0, null, true, { a: 'first', z: 'last' }])
+    expect(JSON.parse(JSON.stringify(stored.before))).toEqual(stored.before)
+    expect(JSON.parse(JSON.stringify(stored.after))).toEqual(stored.after)
+    expect(storage.writes).toBe(1)
+    expect(() => validateDemoState(isolated.repository.getSnapshot())).not.toThrow()
+  })
+
+  it.each(INVALID_AUDIT_EVIDENCE_CASES)(
+    'rejects %s audit evidence with a fully atomic failed write',
+    (
+    _label,
+    evidence,
+    code,
+  ) => {
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const isolated = new AppServices(storage, () => FIXED_NOW)
+    const published = isolated.repository.getSnapshot()
+    const storedBefore = storage.getItem(STORAGE_KEY)
+    const listener = vi.fn()
+    isolated.repository.subscribe(listener)
+
+    expect(() => isolated.repository.update((state) => {
+      state.cart = []
+      isolated.audit.append(state, {
+        actorId: 'system',
+        actorRole: 'super_admin',
+        action: 'audit.evidence_rejected',
+        targetType: 'demo_state',
+        targetId: 'evidence-test',
+        reason: 'Confirmed rejected fictional evidence',
+        at: FIXED_NOW,
+        before: evidence(),
+        requestId: 'audit-evidence-rejected',
+      })
+    })).toThrow(expect.objectContaining({ code }))
+
+    expect(isolated.repository.getSnapshot()).toBe(published)
+    expect(isolated.repository.getSnapshot().revision).toBe(published.revision)
+    expect(isolated.repository.getSnapshot().audits).toEqual(published.audits)
+    expect(storage.getItem(STORAGE_KEY)).toBe(storedBefore)
+    expect(storage.writes).toBe(0)
+    expect(listener).not.toHaveBeenCalled()
+    },
+  )
 
   it('rejects a tampered displayed total before creating anything', () => {
     services.auth.oneClick('customer')
@@ -247,6 +363,75 @@ describe('customer, payment, allocation and admin services', () => {
     expect(after.series[0].reservedBoxes).toBe(before.series[0].reservedBoxes)
     expect(storage.writes).toBe(writesBefore)
     expect(listenerCalls).toBe(0)
+  })
+
+  it('audits a stored ignored admin payment event and keeps its exact replay write-free', () => {
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const isolated = new AppServices(storage, () => FIXED_NOW)
+    isolated.auth.oneClick('admin')
+    const eventId = 'evt-admin-out-of-order-ignored'
+    const before = isolated.repository.getSnapshot()
+    const writesBefore = storage.writes
+
+    const ignored = isolated.payments.processEvent(
+      'pay-unopened',
+      eventId,
+      'failed',
+      'admin_reconcile',
+      'Confirmed fictional out-of-order finance event',
+    )
+    const afterIgnored = isolated.repository.getSnapshot()
+    const event = afterIgnored.payments
+      .find((payment) => payment.id === 'pay-unopened')!
+      .events.find((entry) => entry.id === eventId)
+    const audit = afterIgnored.audits.find((entry) => entry.eventId === eventId)
+
+    expect(ignored).toMatchObject({ changed: false })
+    expect(event).toMatchObject({
+      type: 'failed',
+      source: 'admin_reconcile',
+      ignoredReason: expect.stringMatching(/out-of-order/i),
+    })
+    expect(audit).toMatchObject({
+      outcome: 'ignored',
+      action: 'payment.event_ignored',
+      targetType: 'payment',
+      targetId: 'pay-unopened',
+      requestId: event?.requestId,
+      eventId,
+      before: { status: 'succeeded' },
+      after: {
+        status: 'succeeded',
+        attemptedStatus: 'failed',
+        ignoredReason: event?.ignoredReason,
+      },
+    })
+    expect(afterIgnored.auditCount).toBe(before.auditCount + 1)
+    expect(afterIgnored.auditHeadId).toBe(audit?.id)
+    expect(afterIgnored.revision).toBe(before.revision + 1)
+    expect(storage.writes).toBe(writesBefore + 1)
+    expect(() => validateDemoState(afterIgnored)).not.toThrow()
+
+    const writesAfterIgnored = storage.writes
+    const revisionAfterIgnored = afterIgnored.revision
+    const auditsAfterIgnored = structuredClone(afterIgnored.audits)
+    const duplicate = isolated.payments.processEvent(
+      'pay-unopened',
+      eventId,
+      'failed',
+      'admin_reconcile',
+      'Confirmed fictional out-of-order finance event',
+    )
+
+    expect(duplicate).toMatchObject({
+      changed: false,
+      message: 'Duplicate event ignored safely.',
+    })
+    expect(isolated.repository.getSnapshot()).toBe(afterIgnored)
+    expect(isolated.repository.getSnapshot().revision).toBe(revisionAfterIgnored)
+    expect(isolated.repository.getSnapshot().audits).toEqual(auditsAfterIgnored)
+    expect(storage.writes).toBe(writesAfterIgnored)
   })
 
   it('rejects changed event intent, changed source, and cross-payment reuse without writes or listeners', () => {
@@ -1433,11 +1618,11 @@ describe('customer, payment, allocation and admin services', () => {
     expect(snapshot.audits.at(-1)).toMatchObject({
       action: 'claim.submitted',
       after: {
-        shipmentId: undefined,
         shipmentCandidateIds: ['shp-digital', 'shp-processing'],
         refundCreated: false,
       },
     })
+    expect(snapshot.audits.at(-1)?.after).not.toHaveProperty('shipmentId')
     expect(multi.claims.listMine().at(-1)).not.toHaveProperty('shipmentCandidateIds')
     expect(snapshot.payments.reduce((sum, payment) => sum + payment.refundedSen, 0)).toBe(refundedBefore)
     expect(() => validateDemoState(snapshot)).not.toThrow()
@@ -1929,6 +2114,29 @@ describe('customer, payment, allocation and admin services', () => {
       }
       if (!['admin', 'super_admin'].includes(role)) expect(() => services.admin.snapshot()).toThrow()
     }
+  })
+
+  it('returns an isolated mutable admin snapshot instead of the live frozen repository object', () => {
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const isolated = new AppServices(storage, () => FIXED_NOW)
+    isolated.auth.oneClick('admin')
+    const live = isolated.repository.getSnapshot()
+    const storedBefore = storage.getItem(STORAGE_KEY)
+    const clone = isolated.admin.snapshot()
+
+    expect(clone).toEqual(live)
+    expect(clone).not.toBe(live)
+    expect(clone.orders[0]).not.toBe(live.orders[0])
+    clone.orders[0].snapshot.address.city = 'Changed only in admin export'
+    clone.audits[0].reason = 'Changed only in admin export'
+    clone.audits.splice(0, 1)
+
+    expect(isolated.repository.getSnapshot()).toBe(live)
+    expect(live.orders[0].snapshot.address.city).toBe('Kuala Lumpur')
+    expect(live.audits[0].reason).toBe('Loaded fictional public demo data')
+    expect(live.auditCount).toBe(live.audits.length)
+    expect(storage.getItem(STORAGE_KEY)).toBe(storedBefore)
   })
 
   it('blocks lower staff from invoking another department service action', () => {

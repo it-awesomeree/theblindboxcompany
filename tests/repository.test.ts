@@ -2,6 +2,10 @@ import { describe, expect, it, vi } from 'vitest'
 import { MockRepository, STORAGE_KEY } from '../src/data/MockRepository'
 import { createDemoState } from '../src/data/fixtures'
 import { validateDemoState } from '../src/data/StateValidator'
+import {
+  AUDIT_EVIDENCE_MAX_BYTES,
+  canonicalizeAuditEvidence,
+} from '../src/domain/auditEvidence'
 import { CLAIM_EVIDENCE_WIDENING_NOTE } from '../src/domain/claimStatus'
 import { BOX_PRICE_SEN, MAX_CART_QUANTITY } from '../src/domain/constants'
 import type { DemoState } from '../src/domain/types'
@@ -125,13 +129,41 @@ function stateWithWidenedSealedClaim() {
   return services.repository.exportForTest()
 }
 
+function auditBusinessFields(audit: DemoState['audits'][number]) {
+  const businessFields = structuredClone(audit) as Partial<DemoState['audits'][number]>
+  delete businessFields.sequence
+  delete businessFields.previousId
+  delete businessFields.outcome
+  return businessFields
+}
+
+function toVersion5(state: DemoState = createDemoState()) {
+  const businessState = structuredClone(state) as Partial<DemoState>
+  const audits = state.audits.map(auditBusinessFields)
+  delete businessState.auditCount
+  delete businessState.auditHeadId
+  delete businessState.audits
+  return {
+    ...businessState,
+    schemaVersion: 5 as const,
+    audits,
+  }
+}
+
+function stateWithTwoAudits() {
+  const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+  services.auth.oneClick('customer')
+  services.openBox('box-unopened-01')
+  return services.repository.exportForTest()
+}
+
 describe('MockRepository recovery and persistence', () => {
   it('recovers missing data with current schema fixtures', () => {
     const storage = new MemoryStorage()
     const repository = new MockRepository(storage)
-    expect(repository.getSnapshot().schemaVersion).toBe(5)
+    expect(repository.getSnapshot().schemaVersion).toBe(6)
     expect(repository.recoveryNotice).toMatch(/missing/i)
-    expect(JSON.parse(storage.getItem(STORAGE_KEY)!).schemaVersion).toBe(5)
+    expect(JSON.parse(storage.getItem(STORAGE_KEY)!).schemaVersion).toBe(6)
   })
 
   it('recovers corrupt data without throwing', () => {
@@ -146,7 +178,7 @@ describe('MockRepository recovery and persistence', () => {
     const storage = new MemoryStorage()
     storage.seed(STORAGE_KEY, JSON.stringify({ schemaVersion: 2, users: [] }))
     const repository = new MockRepository(storage)
-    expect(repository.getSnapshot().schemaVersion).toBe(5)
+    expect(repository.getSnapshot().schemaVersion).toBe(6)
     expect(repository.recoveryNotice).toMatch(/current safe version/i)
   })
 
@@ -159,6 +191,291 @@ describe('MockRepository recovery and persistence', () => {
     expect(repository.getSnapshot()).toEqual(createDemoState())
     expect(storage.writes).toBe(0)
     expect(repository.recoveryNotice).toBeNull()
+  })
+
+  it('migrates valid custom version 5 business data once and then loads version 6 without writes', () => {
+    const custom = servicesWithClaim('damage').repository.exportForTest()
+    custom.revision = 42
+    custom.sessionUserId = 'usr-demo-customer'
+    custom.cart[0].quantity = 3
+    custom.audits[0].reason = 'Loaded preserved custom fictional demo records'
+    const legacy = toVersion5(custom)
+    const raw = JSON.stringify(legacy)
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, raw)
+
+    const migrated = new MockRepository(storage)
+    const snapshot = migrated.getSnapshot()
+
+    expect(snapshot.schemaVersion).toBe(6)
+    expect(snapshot.revision).toBe(legacy.revision)
+    expect(snapshot.users).toEqual(legacy.users)
+    expect(snapshot.orders).toEqual(legacy.orders)
+    expect(snapshot.payments).toEqual(legacy.payments)
+    expect(snapshot.boxes).toEqual(legacy.boxes)
+    expect(snapshot.shipments).toEqual(legacy.shipments)
+    expect(snapshot.claims).toEqual(legacy.claims)
+    expect(snapshot.cart).toEqual(legacy.cart)
+    expect(snapshot.audits.map(auditBusinessFields)).toEqual(legacy.audits)
+    expect(snapshot.claims).toHaveLength(1)
+    expect(snapshot.audits.map((audit) => audit.sequence)).toEqual(
+      snapshot.audits.map((_, index) => index + 1),
+    )
+    expect(snapshot.audits.every((audit) => audit.outcome === 'applied')).toBe(true)
+    expect(snapshot.audits.slice(1).every((audit, index) =>
+      audit.previousId === snapshot.audits[index].id)).toBe(true)
+    expect(snapshot.auditCount).toBe(snapshot.audits.length)
+    expect(snapshot.auditHeadId).toBe(snapshot.audits.at(-1)?.id)
+    expect(storage.writes).toBe(1)
+    expect(migrated.recoveryNotice).toMatch(/upgraded safely from version 5 to version 6/i)
+
+    const persistedAfterMigration = storage.getItem(STORAGE_KEY)
+    const loadedAgain = new MockRepository(storage)
+    expect(storage.writes).toBe(1)
+    expect(storage.getItem(STORAGE_KEY)).toBe(persistedAfterMigration)
+    expect(loadedAgain.getSnapshot()).toEqual(snapshot)
+    expect(loadedAgain.recoveryNotice).toBeNull()
+  })
+
+  it('migrates valid version 5 business data with empty audit history using one deterministic anchor', () => {
+    const custom = createDemoState()
+    custom.revision = 73
+    custom.sessionUserId = 'usr-demo-customer'
+    custom.cart[0].quantity = 4
+    const legacy = toVersion5(custom)
+    legacy.audits = []
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(legacy))
+
+    const repository = new MockRepository(storage)
+    const snapshot = repository.getSnapshot()
+
+    expect(snapshot).toMatchObject({
+      schemaVersion: 6,
+      revision: 73,
+      sessionUserId: 'usr-demo-customer',
+      cart: [{ quantity: 4 }],
+      auditCount: 1,
+      auditHeadId: 'audit-migration-v5-empty-anchor',
+    })
+    expect(snapshot.users).toEqual(legacy.users)
+    expect(snapshot.orders).toEqual(legacy.orders)
+    expect(snapshot.payments).toEqual(legacy.payments)
+    expect(snapshot.boxes).toEqual(legacy.boxes)
+    expect(snapshot.shipments).toEqual(legacy.shipments)
+    expect(snapshot.claims).toEqual(legacy.claims)
+    expect(snapshot.audits).toEqual([{
+      id: 'audit-migration-v5-empty-anchor',
+      sequence: 1,
+      outcome: 'applied',
+      actorId: 'system',
+      actorRole: 'super_admin',
+      action: 'migration.v5.audit_anchor',
+      targetType: 'demo_state',
+      targetId: 'state-v5',
+      reason: 'Created a deterministic audit anchor while upgrading empty version 5 history',
+      at: '1970-01-01T00:00:00.000Z',
+      before: { auditCount: 0, schemaVersion: 5 },
+      after: { auditCount: 1, schemaVersion: 6 },
+      requestId: 'migration-v5-empty-audit-anchor',
+    }])
+    expect(storage.writes).toBe(1)
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+
+    const persisted = storage.getItem(STORAGE_KEY)
+    const loadedAgain = new MockRepository(storage)
+    expect(storage.writes).toBe(1)
+    expect(storage.getItem(STORAGE_KEY)).toBe(persisted)
+    expect(loadedAgain.getSnapshot()).toEqual(snapshot)
+  })
+
+  it('keeps original version 5 bytes when migration persistence fails and continues with frozen version 6 memory', () => {
+    const custom = createDemoState()
+    custom.revision = 17
+    custom.cart[0].quantity = 2
+    const raw = JSON.stringify(toVersion5(custom))
+    const storage = new FaultStorage()
+    storage.seed(STORAGE_KEY, raw)
+    storage.failNextWrites = 1
+
+    const repository = new MockRepository(storage)
+
+    expect(repository.getSnapshot()).toMatchObject({
+      schemaVersion: 6,
+      revision: 17,
+      cart: [{ quantity: 2 }],
+    })
+    expect(Object.isFrozen(repository.getSnapshot().orders[0].snapshot.address)).toBe(true)
+    expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+    expect(storage.successfulWrites).toBe(0)
+    expect(repository.recoveryNotice).toMatch(
+      /could not save the upgrade.+original version 5 data was left unchanged.+memory only/i,
+    )
+
+    repository.update((state) => { state.sessionUserId = 'usr-demo-customer' })
+    expect(repository.getSnapshot().sessionUserId).toBe('usr-demo-customer')
+    expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+  })
+
+  it('blocks a stale writer before its mutator and lets it sync once before succeeding', () => {
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const writerA = new MockRepository(storage)
+    const writerB = new MockRepository(storage)
+    const staleIdentity = writerB.getSnapshot()
+    const mutator = vi.fn((state: DemoState) => {
+      state.sessionUserId = 'usr-demo-admin'
+    })
+    const listener = vi.fn()
+    writerB.subscribe(listener)
+
+    writerA.update((state) => { state.sessionUserId = 'usr-demo-customer' })
+    const persistedA = storage.getItem(STORAGE_KEY)
+    const exactA = structuredClone(writerA.getSnapshot())
+
+    expect(() => writerB.update(mutator)).toThrow(
+      expect.objectContaining({ code: 'STATE_CONFLICT' }),
+    )
+    expect(mutator).not.toHaveBeenCalled()
+    expect(writerB.getSnapshot()).toBe(staleIdentity)
+    expect(writerB.getSnapshot().revision).toBe(1)
+    expect(storage.getItem(STORAGE_KEY)).toBe(persistedA)
+    expect(JSON.parse(storage.getItem(STORAGE_KEY)!)).toEqual(exactA)
+    expect(listener).not.toHaveBeenCalled()
+
+    expect(writerB.syncFromStorage()).toBe(true)
+    expect(writerB.getSnapshot()).toEqual(exactA)
+    expect(writerB.getSnapshot()).not.toBe(staleIdentity)
+    expect(listener).toHaveBeenCalledOnce()
+    expect(writerB.syncFromStorage()).toBe(false)
+    expect(listener).toHaveBeenCalledOnce()
+
+    writerB.update(mutator)
+    expect(mutator).toHaveBeenCalledOnce()
+    expect(writerB.getSnapshot()).toMatchObject({
+      revision: exactA.revision + 1,
+      sessionUserId: 'usr-demo-admin',
+    })
+    expect(JSON.parse(storage.getItem(STORAGE_KEY)!)).toEqual(writerB.getSnapshot())
+  })
+
+  it('blocks a stale reset with the same A/B precondition and leaves everything untouched', () => {
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const writerA = new MockRepository(storage)
+    const writerB = new MockRepository(storage)
+    const staleIdentity = writerB.getSnapshot()
+    const listener = vi.fn()
+    writerB.subscribe(listener)
+
+    writerA.update((state) => { state.sessionUserId = 'usr-demo-customer' })
+    const storedAfterA = storage.getItem(STORAGE_KEY)
+    const writesAfterA = storage.writes
+
+    expect(() => writerB.reset()).toThrow(
+      expect.objectContaining({ code: 'STATE_CONFLICT' }),
+    )
+    expect(storage.writes).toBe(writesAfterA)
+    expect(storage.getItem(STORAGE_KEY)).toBe(storedAfterA)
+    expect(writerB.getSnapshot()).toBe(staleIdentity)
+    expect(writerB.getSnapshot().revision).toBe(staleIdentity.revision)
+    expect(listener).not.toHaveBeenCalled()
+  })
+
+  it('rejects older and invalid storage during sync without changing the published snapshot', () => {
+    const storage = new MemoryStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const repository = new MockRepository(storage)
+    repository.update((state) => { state.sessionUserId = 'usr-demo-customer' })
+    const published = repository.getSnapshot()
+    const listener = vi.fn()
+    repository.subscribe(listener)
+
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    expect(() => repository.syncFromStorage()).toThrow(
+      expect.objectContaining({ code: 'STATE_SYNC_REJECTED' }),
+    )
+    expect(repository.getSnapshot()).toBe(published)
+    expect(listener).not.toHaveBeenCalled()
+
+    storage.seed(STORAGE_KEY, '{invalid-json')
+    expect(() => repository.syncFromStorage()).toThrow(
+      expect.objectContaining({ code: 'STORED_STATE_INVALID' }),
+    )
+    expect(repository.getSnapshot()).toBe(published)
+    expect(listener).not.toHaveBeenCalled()
+  })
+
+  it('publishes recursively frozen stable snapshots that cannot mutate state or storage', () => {
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const repository = new MockRepository(storage)
+    const snapshot = repository.getSnapshot()
+    const storedBefore = storage.getItem(STORAGE_KEY)
+    const revisionBefore = snapshot.revision
+    const auditsBefore = structuredClone(snapshot.audits)
+
+    expect(repository.getSnapshot()).toBe(snapshot)
+    expect(Object.isFrozen(snapshot)).toBe(true)
+    expect(Object.isFrozen(snapshot.orders[0].snapshot.address)).toBe(true)
+    expect(() => {
+      snapshot.orders[0].snapshot.address.city = 'Changed outside repository'
+    }).toThrow(TypeError)
+    expect(() => {
+      snapshot.audits.push(structuredClone(snapshot.audits[0]))
+    }).toThrow(TypeError)
+
+    expect(repository.getSnapshot()).toBe(snapshot)
+    expect(repository.getSnapshot().orders[0].snapshot.address.city).toBe('Kuala Lumpur')
+    expect(repository.getSnapshot().revision).toBe(revisionBefore)
+    expect(repository.getSnapshot().audits).toEqual(auditsBefore)
+    expect(storage.getItem(STORAGE_KEY)).toBe(storedBefore)
+    expect(storage.writes).toBe(0)
+  })
+
+  it.each([
+    ['edit', (state: DemoState) => {
+      state.audits[0].reason = 'Edited old audit evidence'
+    }],
+    ['delete', (state: DemoState) => {
+      state.audits.shift()
+      state.auditCount = state.audits.length
+      state.auditHeadId = state.audits.at(-1)!.id
+    }],
+    ['reorder', (state: DemoState) => {
+      const first = state.audits[0]
+      state.audits[0] = state.audits[1]
+      state.audits[1] = first
+    }],
+    ['replace', (state: DemoState) => {
+      state.audits[0] = {
+        ...state.audits[0],
+        requestId: 'replacement-request-id',
+      }
+    }],
+    ['recount inconsistently', (state: DemoState) => {
+      state.auditCount += 1
+    }],
+  ] as const)('rejects an audit-history %s atomically before publication', (_label, mutate) => {
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(stateWithTwoAudits()))
+    const repository = new MockRepository(storage)
+    const published = repository.getSnapshot()
+    const storedBefore = storage.getItem(STORAGE_KEY)
+    const listener = vi.fn()
+    repository.subscribe(listener)
+
+    expect(() => repository.update((state) => {
+      state.cart = []
+      mutate(state)
+    })).toThrow(expect.objectContaining({ code: 'AUDIT_HISTORY_MUTATED' }))
+
+    expect(repository.getSnapshot()).toBe(published)
+    expect(repository.getSnapshot().revision).toBe(published.revision)
+    expect(repository.getSnapshot().cart).toEqual(published.cart)
+    expect(storage.getItem(STORAGE_KEY)).toBe(storedBefore)
+    expect(storage.writes).toBe(0)
+    expect(listener).not.toHaveBeenCalled()
   })
 
   it('persists updates and resets to deterministic fixtures', () => {
@@ -314,7 +631,7 @@ describe('MockRepository recovery and persistence', () => {
     expect(listener).toHaveBeenCalledOnce()
   })
 
-  it('rolls back serialization failure before touching storage or listeners', () => {
+  it('rolls back cyclic tampering with an old audit before touching storage or listeners', () => {
     const storage = new FaultStorage()
     const repository = new MockRepository(storage)
     const before = repository.exportForTest()
@@ -323,8 +640,8 @@ describe('MockRepository recovery and persistence', () => {
     repository.subscribe(listener)
 
     expect(() => repository.update((state) => {
-      state.audits[0].after = state
-    })).toThrow(expect.objectContaining({ code: 'STORAGE_WRITE_FAILED' }))
+      state.audits[0].after = state as never
+    })).toThrow(expect.objectContaining({ code: 'AUDIT_HISTORY_MUTATED' }))
 
     expect(repository.getSnapshot()).toEqual(before)
     expect(storage.getItem(STORAGE_KEY)).toBe(storedBefore)
@@ -333,6 +650,30 @@ describe('MockRepository recovery and persistence', () => {
     repository.update((state) => { state.sessionUserId = 'usr-demo-customer' })
     expect(repository.getSnapshot().revision).toBe(before.revision + 1)
     expect(listener).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    ['non-canonical object keys', (state: DemoState) => {
+      state.audits[0].after = JSON.parse('{"z":1,"a":2}')
+    }],
+    ['dangerous object keys', (state: DemoState) => {
+      state.audits[0].after = JSON.parse('{"__proto__":"unsafe"}')
+    }],
+    ['oversized evidence', (state: DemoState) => {
+      state.audits[0].after = 'x'.repeat(AUDIT_EVIDENCE_MAX_BYTES + 1)
+    }],
+  ] as const)('rejects persisted %s independently and recovers safely', (_label, tamper) => {
+    const state = createDemoState()
+    tamper(state)
+    expect(() => validateDemoState(state)).toThrow(/audit/i)
+
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(state))
+    const repository = new MockRepository(storage)
+
+    expect(repository.getSnapshot()).toEqual(createDemoState())
+    expect(repository.recoveryNotice).toMatch(/replaced/i)
+    expect(storage.writes).toBe(1)
   })
 
   it('updates and resets normally when storage was intentionally omitted', () => {
@@ -373,6 +714,52 @@ describe('MockRepository recovery and persistence', () => {
     expect(state.boxes.find((box) => box.id === 'box-failed-01')?.status).toBe('on_hold')
     expect(state.orders.find((order) => order.id === 'ord-shipped')?.status).toBe('processing')
     expect(state.shipments.every((shipment) => shipment.timeline.at(-1)?.status === shipment.status)).toBe(true)
+  })
+
+  it.each([
+    ['missing audit collection contents', (state: DemoState) => {
+      state.audits = []
+      state.auditCount = 0
+      state.auditHeadId = ''
+    }],
+    ['truncated audit collection', (state: DemoState) => {
+      state.audits.pop()
+    }],
+    ['wrong audit count', (state: DemoState) => {
+      state.auditCount += 1
+    }],
+    ['wrong audit head', (state: DemoState) => {
+      state.auditHeadId = 'audit-not-the-head'
+    }],
+    ['noncontiguous audit sequence', (state: DemoState) => {
+      state.audits[1].sequence += 1
+    }],
+    ['missing audit previous link', (state: DemoState) => {
+      delete state.audits[1].previousId
+    }],
+    ['invalid audit outcome', (state: DemoState) => {
+      state.audits[1].outcome = 'unknown' as never
+    }],
+    ['malformed normalized audit fields', (state: DemoState) => {
+      const audit = state.audits[1]
+      audit.actorId = ' actor '
+      audit.action = ''
+      audit.targetType = '<payment>'
+      audit.targetId = 'target'.repeat(30)
+      audit.reason = ' reason with extra space '
+      audit.requestId = ''
+      audit.eventId = '<event>'
+    }],
+  ] as const)('rejects and recovers %s', (_label, mutate) => {
+    const malformed = stateWithTwoAudits()
+    mutate(malformed)
+    expect(() => validateDemoState(malformed)).toThrow()
+
+    const storage = new MemoryStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(malformed))
+    const repository = new MockRepository(storage)
+    expect(repository.recoveryNotice).toMatch(/replaced/i)
+    expect(repository.getSnapshot()).toEqual(createDemoState())
   })
 
   it('rejects an order timeline whose creation row is not pending payment', () => {
@@ -849,6 +1236,12 @@ describe('MockRepository recovery and persistence', () => {
       entry.note !== CLAIM_EVIDENCE_WIDENING_NOTE)
     state.audits = state.audits.filter((audit) =>
       audit.action !== 'claim.order_level_evidence_widened')
+    state.audits.forEach((audit, index) => {
+      audit.sequence = index + 1
+      audit.previousId = index === 0 ? undefined : state.audits[index - 1].id
+    })
+    state.auditCount = state.audits.length
+    state.auditHeadId = state.audits.at(-1)!.id
     claim.shipmentCandidateEvidenceAt!['shp-digital'] =
       '2026-07-28T11:00:00.000Z'
     claim.status = 'approved'
@@ -881,6 +1274,9 @@ describe('MockRepository recovery and persistence', () => {
     )
     state.audits.push({
       id: 'audit-approved-evidence-freeze-corrupt',
+      sequence: state.auditCount + 1,
+      previousId: state.auditHeadId,
+      outcome: 'applied',
       actorId: claim.userId,
       actorRole: 'customer',
       action: 'claim.order_level_evidence_widened',
@@ -890,12 +1286,14 @@ describe('MockRepository recovery and persistence', () => {
       at: '2026-07-28T11:00:00.000Z',
       requestId: 'req-approved-evidence-freeze-corrupt',
       before: { shipmentCandidateIds: ['shp-processing'] },
-      after: {
-        shipmentCandidateIds: ['shp-digital', 'shp-processing'],
-        shipmentCandidateEvidenceAt: claim.shipmentCandidateEvidenceAt,
+      after: canonicalizeAuditEvidence({
         refundCreated: false,
-      },
+        shipmentCandidateEvidenceAt: claim.shipmentCandidateEvidenceAt!,
+        shipmentCandidateIds: ['shp-digital', 'shp-processing'],
+      }, 'Test audit after evidence'),
     })
+    state.auditCount += 1
+    state.auditHeadId = 'audit-approved-evidence-freeze-corrupt'
 
     expect(() => validateDemoState(state)).toThrow(/unchanged-status customer history/i)
   })

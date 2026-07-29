@@ -11,6 +11,7 @@ import {
   SHIPPING_FEES,
   SHIPMENT_TRANSITIONS,
 } from '../domain/constants'
+import { validateCanonicalAuditEvidence } from '../domain/auditEvidence'
 import {
   assert,
   CHECKOUT_REQUEST_ID_PATTERN,
@@ -85,6 +86,7 @@ const CLAIM_TRANSITIONS: Record<ClaimStatus, ClaimStatus[]> = {
   rejected: [],
   resolved: [],
 }
+const AUDIT_OUTCOMES = new Set(['applied', 'ignored'])
 
 function integer(value: unknown, minimum = 0) {
   return Number.isInteger(value) && Number(value) >= minimum
@@ -96,6 +98,15 @@ function record(value: unknown): value is Record<string, unknown> {
 
 function nonEmptyString(value: unknown) {
   return typeof value === 'string' && value.trim().length > 0
+}
+
+function normalizedText(value: unknown, maximum: number) {
+  return (
+    typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= maximum &&
+    sanitizeText(value, maximum) === value
+  )
 }
 
 function validIso(value: unknown) {
@@ -254,6 +265,16 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
   unique(state.shipments.map((entry) => entry.id), 'Shipment')
   unique(state.claims.map((entry) => entry.id), 'Claim')
   unique(state.audits.map((entry) => entry.id), 'Audit')
+  assert(state.audits.length > 0, 'Audit history must not be empty.')
+  assert(
+    integer(state.auditCount, 1) && state.auditCount === state.audits.length,
+    'Audit count must exactly match audit history.',
+  )
+  assert(
+    normalizedText(state.auditHeadId, 120) &&
+      state.auditHeadId === state.audits.at(-1)?.id,
+    'Audit head must reference the latest audit entry.',
+  )
   assert(state.payments.every((entry) => Array.isArray(entry.events)), 'Payment events must be collections.')
   assert(state.orders.every((entry) => Array.isArray(entry.timeline)), 'Order timelines must be collections.')
   assert(state.shipments.every((entry) => Array.isArray(entry.timeline)), 'Shipment timelines must be collections.')
@@ -906,9 +927,37 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
     }
   }
 
-  for (const audit of state.audits) {
+  for (const [index, audit] of state.audits.entries()) {
+    const expectedSequence = index + 1
+    assert(
+      audit.sequence === expectedSequence,
+      'Audit sequence must be contiguous and begin at one.',
+    )
+    assert(
+      expectedSequence === 1
+        ? audit.previousId === undefined
+        : audit.previousId === state.audits[index - 1].id,
+      'Audit previous link must reference the immediately preceding entry.',
+    )
+    assert(AUDIT_OUTCOMES.has(audit.outcome), 'Audit outcome is invalid.')
+    assert(
+      normalizedText(audit.id, 120) &&
+        normalizedText(audit.actorId, 120) &&
+        normalizedText(audit.action, 120) &&
+        normalizedText(audit.targetType, 80) &&
+        normalizedText(audit.targetId, 120) &&
+        normalizedText(audit.reason, 500) &&
+        normalizedText(audit.requestId, 120) &&
+        (audit.eventId === undefined || normalizedText(audit.eventId, 120)),
+      'Audit text fields must be nonempty, bounded, and normalized.',
+    )
     assert(ROLES.includes(audit.actorRole) && validIso(audit.at), 'Audit actor or time is invalid.')
-    assert(typeof audit.requestId === 'string' && audit.requestId.length > 0, 'Audit request identity is invalid.')
+    if (Object.prototype.hasOwnProperty.call(audit, 'before')) {
+      validateCanonicalAuditEvidence(audit.before, `Audit ${audit.id} before evidence`)
+    }
+    if (Object.prototype.hasOwnProperty.call(audit, 'after')) {
+      validateCanonicalAuditEvidence(audit.after, `Audit ${audit.id} after evidence`)
+    }
   }
 }
 

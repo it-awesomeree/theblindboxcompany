@@ -258,6 +258,9 @@ export interface Claim {
 
 export interface AuditEntry {
   id: string
+  sequence: number
+  previousId?: string
+  outcome: 'applied' | 'ignored'
   actorId: string
   actorRole: Role
   action: string
@@ -265,16 +268,18 @@ export interface AuditEntry {
   targetId: string
   reason: string
   at: string
-  before?: unknown
-  after?: unknown
+  before?: import('./auditEvidence').AuditEvidence
+  after?: import('./auditEvidence').AuditEvidence
   requestId: string
   eventId?: string
 }
 
 export interface DemoState {
-  schemaVersion: 5
+  schemaVersion: 6
   revision: number
   nextSequence: number
+  auditCount: number
+  auditHeadId: string
   sessionUserId: string | null
   users: User[]
   series: PrizeSeries[]

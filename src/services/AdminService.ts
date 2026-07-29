@@ -238,6 +238,6 @@ export class AdminService {
   snapshot(): DemoState {
     const actor = getSessionUser(this.repository.getSnapshot())
     assertRole(actor, ['admin', 'super_admin'], 'read the complete admin state')
-    return this.repository.getSnapshot()
+    return structuredClone(this.repository.getSnapshot())
   }
 }

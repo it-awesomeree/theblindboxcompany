@@ -284,9 +284,9 @@ export class ClaimService {
           requestId: `req-${duplicate.id}-evidence-${duplicate.history.length}`,
           before: { shipmentCandidateIds: beforeCandidateIds },
           after: {
-            shipmentCandidateIds: duplicate.shipmentCandidateIds,
-            shipmentCandidateEvidenceAt: duplicate.shipmentCandidateEvidenceAt,
             refundCreated: false,
+            shipmentCandidateEvidenceAt: duplicate.shipmentCandidateEvidenceAt!,
+            shipmentCandidateIds: duplicate.shipmentCandidateIds,
           },
         })
         return {
@@ -338,12 +338,14 @@ export class ClaimService {
         at: now,
         requestId: claim.requestId,
         after: {
+          ...(claim.boxId !== undefined ? { boxId: claim.boxId } : {}),
           kind: claim.kind,
-          status: claim.status,
-          shipmentId: claim.shipmentId,
-          shipmentCandidateIds: claim.shipmentCandidateIds,
-          boxId: claim.boxId,
           refundCreated: false,
+          ...(claim.shipmentCandidateIds !== undefined
+            ? { shipmentCandidateIds: claim.shipmentCandidateIds }
+            : {}),
+          ...(claim.shipmentId !== undefined ? { shipmentId: claim.shipmentId } : {}),
+          status: claim.status,
         },
       })
       return {
@@ -504,10 +506,14 @@ export class ClaimService {
         requestId,
         before: { status: before },
         after: {
-          status: claim.status,
           refundCreated: false,
-          resolutionOutcome: claim.resolutionOutcome,
-          resolutionReference: claim.resolutionReference,
+          ...(claim.resolutionOutcome !== undefined
+            ? { resolutionOutcome: claim.resolutionOutcome }
+            : {}),
+          ...(claim.resolutionReference !== undefined
+            ? { resolutionReference: claim.resolutionReference }
+            : {}),
+          status: claim.status,
         },
       })
       return { data: claim, changed: true, message: `Claim is now ${claim.status}. No refund was created.` }

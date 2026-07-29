@@ -15,7 +15,15 @@ import {
   paymentWasCaptured,
 } from '../domain/paymentEligibility'
 import { prizeForBox } from '../domain/selectors'
-import type { DemoState, Order, Payment, PaymentEvent, PaymentMethod, PaymentStatus } from '../domain/types'
+import type {
+  DemoState,
+  Order,
+  Payment,
+  PaymentEvent,
+  PaymentMethod,
+  PaymentStatus,
+  Role,
+} from '../domain/types'
 import type { MockRepository } from '../data/MockRepository'
 import { AuditService } from './AuditService'
 import { FulfillmentService } from './FulfillmentService'
@@ -97,6 +105,32 @@ export class MockPaymentGateway {
       assert(caller.id === payment.userId, 'This demo payment belongs to another fictional user.', 'FORBIDDEN')
     }
     return caller
+  }
+
+  private appendIgnoredAdminAudit(
+    state: DemoState,
+    payment: Payment,
+    actor: { id: string; role: Role },
+    attemptedStatus: PaymentStatus,
+    ignoredReason: string,
+    at: string,
+    requestId: string,
+    eventId: string,
+  ) {
+    this.audit.append(state, {
+      actorId: actor.id,
+      actorRole: actor.role,
+      action: 'payment.event_ignored',
+      targetType: 'payment',
+      targetId: payment.id,
+      reason: ignoredReason,
+      at,
+      requestId,
+      eventId,
+      outcome: 'ignored',
+      before: { status: payment.status },
+      after: { status: payment.status, attemptedStatus, ignoredReason },
+    })
   }
 
   createAttempt(
@@ -225,6 +259,9 @@ export class MockPaymentGateway {
             entry.id !== payment.id && ACTIVE_PAYMENT_STATUSES.includes(entry.status),
           )
           if (otherCaptured || otherActive) {
+            const ignoredReason = otherCaptured
+              ? `Order already captured by ${otherCaptured.id}`
+              : `Order has active payment ${otherActive!.id}`
             payment.updatedAt = now
             payment.events.push({
               id: eventId,
@@ -233,14 +270,25 @@ export class MockPaymentGateway {
               source,
               createdAt: now,
               processedAt: now,
-              ignoredReason: otherCaptured
-                ? `Order already captured by ${otherCaptured.id}`
-                : `Order has active payment ${otherActive!.id}`,
+              ignoredReason,
             })
+            if (source === 'admin_reconcile') {
+              this.appendIgnoredAdminAudit(
+                state,
+                payment,
+                caller,
+                next,
+                ignoredReason,
+                now,
+                requestId,
+                eventId,
+              )
+            }
             return { payment, changed: false, message: 'Conflicting success event was recorded and ignored safely.' }
           }
         }
         if (!canTransitionPayment(payment.status, next)) {
+          const ignoredReason = `Out-of-order: ${payment.status} cannot become ${next}`
           payment.updatedAt = now
           payment.events.push({
             id: eventId,
@@ -249,8 +297,20 @@ export class MockPaymentGateway {
             source,
             createdAt: now,
             processedAt: now,
-            ignoredReason: `Out-of-order: ${payment.status} cannot become ${next}`,
+            ignoredReason,
           })
+          if (source === 'admin_reconcile') {
+            this.appendIgnoredAdminAudit(
+              state,
+              payment,
+              caller,
+              next,
+              ignoredReason,
+              now,
+              requestId,
+              eventId,
+            )
+          }
           return {
             payment,
             changed: false,

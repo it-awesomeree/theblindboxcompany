@@ -8,7 +8,7 @@ import type {
   ShippingMethod,
 } from './types'
 
-export const SCHEMA_VERSION = 5 as const
+export const SCHEMA_VERSION = 6 as const
 export const SERIES_ID = 'series-001'
 export const BOX_PRICE_SEN = 10_000
 export const MAX_CART_QUANTITY = 10

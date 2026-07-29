@@ -1,5 +1,10 @@
 # Error log
 
+## 2026-07-29 — Foundation F1 handoff
+
+- The broad session was stopped after mapping and baseline checks with no patch.
+  Work was split into focused foundations to avoid recursive runner work.
+
 ## 2026-07-29 — Release status verified
 
 - `404ba06033117fa6130dad1075cf12019a99ccd4` is the verified application

@@ -278,6 +278,8 @@ const series: PrizeSeries[] = [{
 
 const audits: AuditEntry[] = [{
   id: 'audit-seed-001',
+  sequence: 1,
+  outcome: 'applied',
   actorId: 'system',
   actorRole: 'super_admin',
   action: 'demo.seed',
@@ -286,7 +288,7 @@ const audits: AuditEntry[] = [{
   reason: 'Loaded fictional public demo data',
   at: at(27),
   requestId: 'req-seed-001',
-  after: { orders: orders.length, boxes: boxes.length },
+  after: { boxes: boxes.length, orders: orders.length },
 }]
 
 export function createDemoState(): DemoState {
@@ -294,6 +296,8 @@ export function createDemoState(): DemoState {
     schemaVersion: SCHEMA_VERSION,
     revision: 1,
     nextSequence: 1000,
+    auditCount: audits.length,
+    auditHeadId: audits.at(-1)!.id,
     sessionUserId: null,
     users,
     series,

@@ -38,11 +38,13 @@ import {
   resolveOrderFulfillment,
 } from '../domain/orderFulfillment'
 import {
+  assertFullPaymentRefundCompatible,
   assertNoRemedyScopeConflict,
   claimHoldsRemedyEntitlement,
   expectedClaimRemedySnapshot,
   isTerminalReplacementRefundFallback,
   orderBoxSettlementAllocations,
+  terminalReplacementFallbackAmount,
 } from '../domain/remedyPolicy'
 import { isValidPrizeDefinition } from '../domain/prizeValidation'
 import {
@@ -1300,8 +1302,8 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
         assert(
           claim.settlementPolicy === undefined &&
             replacement === undefined &&
-            claim.acceptedSettlementSen !== claim.requiredSettlementSen,
-          'Legacy under-settled refund evidence must remain explicitly marked, unequal, and non-replacement.',
+            claim.acceptedSettlementSen < claim.requiredSettlementSen,
+          'Legacy under-settled refund evidence must remain explicitly marked, strictly under-settled, and non-replacement.',
         )
       } else if (claim.settlementPolicy === 'exact_scope') {
         assert(
@@ -1313,8 +1315,11 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
         assert(
           claim.settlementPolicy === 'terminal_replacement_fallback' &&
             isTerminalReplacementRefundFallback(replacement) &&
-            claim.acceptedSettlementSen === payment.amountSen - priorRefundedSen,
-          'Terminal replacement fallback must retain only eligible terminal replacement evidence and refund the full prior remaining payment balance.',
+            claim.acceptedSettlementSen === terminalReplacementFallbackAmount(
+              claim.requiredSettlementSen,
+              payment.amountSen - priorRefundedSen,
+            ),
+          'Terminal replacement fallback must retain only eligible terminal replacement evidence and use the capped claim settlement amount.',
         )
       }
       assert(
@@ -1735,6 +1740,27 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
         'Open claim shipment evidence scopes cannot overlap.',
       )
     }
+  }
+  for (const payment of state.payments) {
+    if (
+      payment.status !== 'refunded' ||
+      payment.refundedSen !== payment.amountSen
+    ) {
+      continue
+    }
+    const completingEvent = [...payment.events].reverse().find((event) =>
+      event.type === 'refunded' &&
+      event.ignoredReason === undefined &&
+      event.refundIntent?.paymentId === payment.id)
+    assert(
+      completingEvent,
+      `Fully refunded payment ${payment.id} requires one accepted completing refund event.`,
+    )
+    assertFullPaymentRefundCompatible(
+      state,
+      payment,
+      completingEvent.refundIntent?.claimId,
+    )
   }
 
   for (const [index, audit] of state.audits.entries()) {

@@ -1,4 +1,5 @@
 import { assert } from './guards'
+import { isOpenClaimStatus } from './claimStatus'
 import type {
   Claim,
   ClaimKind,
@@ -28,6 +29,8 @@ const GRANDFATHERED_COMPLETION_OUTCOMES = new Set<
 export const REMEDY_SCOPE_CONFLICT_CODE = 'REMEDY_SCOPE_CONFLICT'
 export const CLAIM_ORDER_FINANCIAL_HOLD_CODE =
   'CLAIM_ORDER_FINANCIAL_HOLD'
+export const FULL_REFUND_REMEDY_CONFLICT_CODE =
+  'FULL_REFUND_REMEDY_CONFLICT'
 
 const CLAIM_ORDER_FINANCIAL_HOLD_STATUSES = new Set<Order['status']>([
   'cancelled',
@@ -55,6 +58,89 @@ export function claimHoldsRemedyEntitlement(claim: Claim) {
       claim.resolutionOutcome !== undefined &&
       GRANDFATHERED_COMPLETION_OUTCOMES.has(claim.resolutionOutcome)
     )
+  )
+}
+
+export function claimBlocksFullPaymentRefund(claim: Claim) {
+  if (
+    claim.legacyUnderSettledRefund === true ||
+    claim.status === 'rejected' ||
+    (
+      claim.status === 'resolved' &&
+      claim.resolutionOutcome === 'no_remedy'
+    )
+  ) {
+    return false
+  }
+  return (
+    isOpenClaimStatus(claim.status) ||
+    claimHoldsRemedyEntitlement(claim)
+  )
+}
+
+export function claimHasAcceptedLinkedRefundOnPayment(
+  claim: Claim,
+  payment: Payment,
+) {
+  if (
+    claim.orderId !== payment.orderId ||
+    claim.userId !== payment.userId ||
+    claim.linkedRefundEventId === undefined ||
+    !Number.isInteger(claim.acceptedSettlementSen) ||
+    claim.acceptedSettlementSen! <= 0
+  ) {
+    return false
+  }
+  const acceptedClaimState =
+    (
+      claim.status === 'approved' &&
+      claim.remedyState === 'refund_linked'
+    ) ||
+    (
+      claim.status === 'resolved' &&
+      claim.remedyState === 'refund_completed' &&
+      claim.resolutionOutcome === 'refund_recorded' &&
+      claim.resolutionReference === claim.linkedRefundEventId
+    )
+  if (!acceptedClaimState) return false
+  const matches = payment.events.filter((event) =>
+    event.id === claim.linkedRefundEventId)
+  if (matches.length !== 1) return false
+  const event = matches[0]
+  return (
+    event.source === 'admin_reconcile' &&
+    event.ignoredReason === undefined &&
+    ['partially_refunded', 'refunded'].includes(event.type) &&
+    event.refundIntent?.paymentId === payment.id &&
+    event.refundIntent.claimId === claim.id &&
+    event.refundIntent.amountSen === claim.acceptedSettlementSen
+  )
+}
+
+export function assertFullPaymentRefundCompatible(
+  state: Pick<DemoState, 'claims'>,
+  payment: Payment,
+  completingClaimId?: string,
+) {
+  const blocker = state.claims.find((claim) => {
+    if (
+      claim.orderId !== payment.orderId ||
+      claim.id === completingClaimId ||
+      !claimBlocksFullPaymentRefund(claim)
+    ) {
+      return false
+    }
+    return (
+      completingClaimId === undefined ||
+      !claimHasAcceptedLinkedRefundOnPayment(claim, payment)
+    )
+  })
+  assert(
+    blocker === undefined,
+    blocker
+      ? `Full refund of payment ${payment.id} is blocked by claim ${blocker.id}.`
+      : 'Full payment refund is compatible with claim remedies.',
+    FULL_REFUND_REMEDY_CONFLICT_CODE,
   )
 }
 
@@ -219,6 +305,21 @@ export function isTerminalReplacementRefundFallback(
 
 export function remainingPaymentBalance(payment: Payment) {
   return payment.amountSen - payment.refundedSen
+}
+
+export function terminalReplacementFallbackAmount(
+  requiredSettlementSen: number,
+  priorRemainingPaymentSen: number,
+) {
+  assert(
+    Number.isInteger(requiredSettlementSen) &&
+      requiredSettlementSen > 0 &&
+      Number.isInteger(priorRemainingPaymentSen) &&
+      priorRemainingPaymentSen > 0,
+    'Terminal replacement fallback inputs must be positive integer-sen amounts.',
+    'CLAIM_SETTLEMENT_AMOUNT_INVALID',
+  )
+  return Math.min(requiredSettlementSen, priorRemainingPaymentSen)
 }
 
 export function deliveredShipmentConflict(

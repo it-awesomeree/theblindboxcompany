@@ -39,12 +39,17 @@ import { sealedCustomerTimeline } from '../src/domain/orderTimeline'
 import { resolveOrderFulfillment } from '../src/domain/orderFulfillment'
 import {
   assertClaimOrderAllowsTypedRemedy,
+  assertFullPaymentRefundCompatible,
   CLAIM_ORDER_FINANCIAL_HOLD_CODE,
+  claimBlocksFullPaymentRefund,
+  claimHasAcceptedLinkedRefundOnPayment,
   claimHoldsRemedyEntitlement,
+  FULL_REFUND_REMEDY_CONFLICT_CODE,
   orderBoxSettlementAllocations,
   requiredSettlementForBoxScope,
+  terminalReplacementFallbackAmount,
 } from '../src/domain/remedyPolicy'
-import type { Claim } from '../src/domain/types'
+import type { Claim, Payment } from '../src/domain/types'
 
 describe('Series 001 and domain guards', () => {
   it('has exactly 10,000 fixed allocations and every value clears RM100', () => {
@@ -320,6 +325,154 @@ describe('Series 001 and domain guards', () => {
       remedyState: 'none',
       resolutionOutcome: 'return_rma_created',
     })).toBe(false)
+  })
+
+  it('classifies full-payment refund blockers with explicit safe terminal exceptions', () => {
+    const base: Claim = {
+      id: 'clm-full-refund-blocker',
+      requestId: 'req-clm-full-refund-blocker',
+      orderId: 'ord-delivered',
+      userId: 'usr-customer',
+      kind: 'damage',
+      note: 'DEMO full refund blocker classification',
+      shipmentId: 'shp-delivered',
+      status: 'approved',
+      remedyState: 'none',
+      remedyBoxIds: ['box-delivered-01'],
+      requiredSettlementSen: 11_200,
+      createdAt: '2026-07-28T00:00:00.000Z',
+      updatedAt: '2026-07-28T00:00:00.000Z',
+      history: [],
+    }
+    for (const status of ['submitted', 'reviewing', 'approved'] as const) {
+      expect(claimBlocksFullPaymentRefund({ ...base, status })).toBe(true)
+    }
+    for (const remedyState of [
+      'rma_created',
+      'replacement_authorized',
+      'replacement_delivered',
+      'refund_linked',
+      'refund_completed',
+    ] as const) {
+      expect(claimBlocksFullPaymentRefund({
+        ...base,
+        status: 'resolved',
+        remedyState,
+        resolutionOutcome: 'refund_recorded',
+      })).toBe(true)
+    }
+    expect(claimBlocksFullPaymentRefund({
+      ...base,
+      status: 'resolved',
+      remedyState: 'none',
+      resolutionOutcome: 'replacement_authorized',
+    })).toBe(true)
+    expect(claimBlocksFullPaymentRefund({
+      ...base,
+      status: 'rejected',
+      remedyState: 'replacement_authorized',
+    })).toBe(false)
+    expect(claimBlocksFullPaymentRefund({
+      ...base,
+      status: 'resolved',
+      remedyState: 'no_remedy',
+      resolutionOutcome: 'no_remedy',
+    })).toBe(false)
+    expect(claimBlocksFullPaymentRefund({
+      ...base,
+      remedyState: 'refund_completed',
+      legacyUnderSettledRefund: true,
+    })).toBe(false)
+  })
+
+  it('requires exact accepted admin evidence on the same payment for coordinated full refunds', () => {
+    const payment: Payment = {
+      id: 'pay-refund-proof',
+      orderId: 'ord-delivered',
+      userId: 'usr-customer',
+      attempt: 1,
+      method: 'FPX',
+      status: 'partially_refunded',
+      amountSen: 21_200,
+      refundedSen: 10_600,
+      createdAt: '2026-07-28T00:00:00.000Z',
+      updatedAt: '2026-07-28T01:00:00.000Z',
+      events: [{
+        id: 'evt-accepted-refund',
+        requestId: 'req-accepted-refund',
+        type: 'partially_refunded',
+        source: 'admin_reconcile',
+        createdAt: '2026-07-28T01:00:00.000Z',
+        processedAt: '2026-07-28T01:00:00.000Z',
+        refundIntent: {
+          paymentId: 'pay-refund-proof',
+          amountSen: 10_600,
+          reason: 'Confirmed accepted refund proof',
+          claimId: 'clm-accepted-refund',
+        },
+      }],
+    }
+    const claim: Claim = {
+      id: 'clm-accepted-refund',
+      requestId: 'req-clm-accepted-refund',
+      orderId: payment.orderId,
+      userId: payment.userId,
+      kind: 'value_floor',
+      note: 'DEMO accepted refund proof',
+      boxId: 'box-delivered-01',
+      status: 'approved',
+      remedyState: 'refund_linked',
+      remedyBoxIds: ['box-delivered-01'],
+      requiredSettlementSen: 10_600,
+      acceptedSettlementSen: 10_600,
+      settlementPolicy: 'exact_scope',
+      linkedRefundEventId: 'evt-accepted-refund',
+      createdAt: '2026-07-28T00:00:00.000Z',
+      updatedAt: '2026-07-28T01:00:00.000Z',
+      history: [],
+    }
+
+    expect(claimHasAcceptedLinkedRefundOnPayment(claim, payment)).toBe(true)
+    expect(claimHasAcceptedLinkedRefundOnPayment(
+      claim,
+      { ...payment, id: 'pay-other' },
+    )).toBe(false)
+    expect(claimHasAcceptedLinkedRefundOnPayment(
+      { ...claim, acceptedSettlementSen: 10_599 },
+      payment,
+    )).toBe(false)
+    expect(() => assertFullPaymentRefundCompatible(
+      { claims: [claim] },
+      payment,
+    )).toThrow(expect.objectContaining({
+      code: FULL_REFUND_REMEDY_CONFLICT_CODE,
+      message: expect.stringContaining(claim.id),
+    }))
+    expect(() => assertFullPaymentRefundCompatible(
+      { claims: [claim] },
+      payment,
+      'clm-completing-refund',
+    )).not.toThrow()
+  })
+
+  it('caps terminal replacement fallback and rejects invalid money inputs', () => {
+    expect(terminalReplacementFallbackAmount(10_600, 21_200)).toBe(10_600)
+    expect(terminalReplacementFallbackAmount(10_600, 10_200)).toBe(10_200)
+    for (const [requiredSen, remainingSen] of [
+      [0, 10_600],
+      [10_600, 0],
+      [-1, 10_600],
+      [10_600, -1],
+      [10_600.5, 10_600],
+      [10_600, 10_600.5],
+    ]) {
+      expect(() => terminalReplacementFallbackAmount(
+        requiredSen,
+        remainingSen,
+      )).toThrow(expect.objectContaining({
+        code: 'CLAIM_SETTLEMENT_AMOUNT_INVALID',
+      }))
+    }
   })
 
   it('blocks typed RMA and replacement work on every claim-order financial hold', () => {

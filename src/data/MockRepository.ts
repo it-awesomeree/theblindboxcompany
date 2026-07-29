@@ -9,6 +9,7 @@ import {
 import {
   expectedClaimRemedySnapshot,
   isTerminalReplacementRefundFallback,
+  terminalReplacementFallbackAmount,
 } from '../domain/remedyPolicy'
 import type { AuditEntry, Claim, DemoState, Shipment } from '../domain/types'
 import { createDemoState } from './fixtures'
@@ -425,10 +426,24 @@ export function migrateDemoStateV7(value: unknown): DemoState {
     const terminalFallback =
       refund &&
       isTerminalReplacementRefundFallback(replacement) &&
-      refund.amountSen === refund.payment.amountSen - refund.priorRefundedSen
+      refund.amountSen === terminalReplacementFallbackAmount(
+        snapshot.requiredSettlementSen,
+        refund.payment.amountSen - refund.priorRefundedSen,
+      )
     const exactScope = refund?.amountSen === snapshot.requiredSettlementSen
     const legacyUnderSettledRefund = Boolean(
-      refund && !exactScope && !terminalFallback,
+      refund &&
+        refund.amountSen < snapshot.requiredSettlementSen &&
+        !exactScope &&
+        !terminalFallback,
+    )
+    assert(
+      !refund ||
+        exactScope ||
+        terminalFallback ||
+        legacyUnderSettledRefund,
+      'Legacy claim refund exceeds its required nonterminal settlement.',
+      'MIGRATION_SOURCE_INVALID',
     )
     return {
       ...claim,
@@ -564,7 +579,10 @@ export class MockRepository {
             migratedFromVersion: 7,
           }
         } catch {
-          // Invalid version 7 data follows the same safe fixture recovery path below.
+          return this.protectedRecovery(
+            raw,
+            'Stored version 7 demo data failed the migration safety checks.',
+          )
         }
       }
       if (record(parsed) && parsed.schemaVersion === 6) {

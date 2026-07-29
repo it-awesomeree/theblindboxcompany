@@ -20,9 +20,11 @@ import {
 } from '../domain/refundLink'
 import { refreshOrderFulfillment } from '../domain/orderFulfillment'
 import {
+  assertFullPaymentRefundCompatible,
   assertNoRemedyScopeConflict,
   isTerminalReplacementRefundFallback,
   remainingPaymentBalance,
+  terminalReplacementFallbackAmount,
 } from '../domain/remedyPolicy'
 import { prizeForBox } from '../domain/selectors'
 import type {
@@ -332,6 +334,9 @@ export class MockPaymentGateway {
           assert(payment.amountSen === order.snapshot.totals.totalSen, 'Payment amount failed the server-like total check.', 'AMOUNT_MISMATCH')
         }
         const before = payment.status
+        if (before === 'disputed' && next === 'refunded') {
+          assertFullPaymentRefundCompatible(state, payment)
+        }
         const disputeRefundAmount =
           before === 'disputed' && next === 'refunded'
             ? payment.amountSen - payment.refundedSen
@@ -663,9 +668,13 @@ export class MockPaymentGateway {
           ? 'terminal_replacement_fallback'
           : 'exact_scope'
         if (terminalFallback) {
+          const expectedAmountSen = terminalReplacementFallbackAmount(
+            linkedClaim.requiredSettlementSen,
+            remainingPaymentBalance(payment),
+          )
           assert(
-            amountSen === remainingPaymentBalance(payment),
-            'A terminal replacement refund fallback must refund the selected payment’s full remaining balance.',
+            amountSen === expectedAmountSen,
+            'A terminal replacement refund fallback must equal the smaller of the claim requirement and the selected payment’s remaining balance.',
             'CLAIM_SETTLEMENT_MISMATCH',
           )
         } else {
@@ -693,9 +702,16 @@ export class MockPaymentGateway {
           'REFUND_BEFORE_CLAIM',
         )
       }
+      const full = payment.refundedSen + amountSen === payment.amountSen
+      if (full) {
+        assertFullPaymentRefundCompatible(
+          state,
+          payment,
+          cleanClaimId,
+        )
+      }
       const before = { status: payment.status, refundedSen: payment.refundedSen }
       payment.refundedSen += amountSen
-      const full = payment.refundedSen === payment.amountSen
       payment.status = transitionPayment(payment.status, full ? 'refunded' : 'partially_refunded')
       payment.updatedAt = now
       payment.events.push({

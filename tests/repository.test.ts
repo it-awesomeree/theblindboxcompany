@@ -13,6 +13,8 @@ import {
   VALUE_FLOOR_SEN,
 } from '../src/domain/constants'
 import { exactOddsLabel } from '../src/domain/odds'
+import { refreshOrderFulfillment } from '../src/domain/orderFulfillment'
+import { FULL_REFUND_REMEDY_CONFLICT_CODE } from '../src/domain/remedyPolicy'
 import type { DemoState } from '../src/domain/types'
 import { AppServices } from '../src/services/AppServices'
 import {
@@ -395,6 +397,73 @@ function legacyUnderSettledVersion7State() {
   return legacy
 }
 
+function cappedTerminalFallbackVersion7State() {
+  const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+  services.auth.oneClick('customer')
+  const claim = services.claims.submit({
+    orderId: 'ord-failed',
+    kind: 'non_delivery',
+    shipmentId: 'shp-failed',
+    note: 'DEMO capped terminal version 7 migration evidence',
+  }).data
+  services.auth.oneClick('admin')
+  services.claims.review(
+    claim.id,
+    'acknowledge',
+    'Confirmed capped terminal migration acknowledgement',
+  )
+  services.claims.review(
+    claim.id,
+    'approve',
+    'Confirmed capped terminal migration approval',
+  )
+  const replacement = services.claims.authorizeReplacement(
+    claim.id,
+    'Confirmed capped terminal migration replacement',
+  ).data
+  for (const status of [
+    'picking',
+    'packed',
+    'label_created',
+    'shipped',
+    'returned',
+  ] as const) {
+    services.fulfilment.advance(
+      replacement.id,
+      status,
+      `Confirmed capped terminal migration ${status}`,
+    )
+  }
+  services.payments.refund(
+    'pay-failed',
+    1000,
+    'Confirmed prior partial for capped terminal migration',
+    'req-v7-capped-terminal-prior',
+  )
+  services.payments.refund(
+    'pay-failed',
+    10_200,
+    'Confirmed capped terminal version 7 claim refund',
+    'req-v7-capped-terminal-claim',
+    claim.id,
+  )
+  return toVersion7(services.repository.exportForTest())
+}
+
+function overSettledVersion7State() {
+  const legacy = legacyUnderSettledVersion7State()
+  const claim = legacy.claims[0]
+  const payment = legacy.payments.find((entry) => entry.id === 'pay-processing')!
+  const event = payment.events.find((entry) =>
+    entry.id === claim.linkedRefundEventId)!
+  event.refundIntent!.amountSen = 10_601
+  payment.refundedSen = 10_601
+  const paymentAudit = legacy.audits.find((audit) =>
+    audit.eventId === event.id && audit.targetType === 'payment')!
+  ;(paymentAudit.after as Record<string, unknown>).refundedSen = 10_601
+  return legacy
+}
+
 function stateWithDeliveredDigitalReissue() {
   let now = FIXED_NOW
   const services = new AppServices(new MemoryStorage(), () => now)
@@ -474,6 +543,94 @@ describe('MockRepository recovery and persistence', () => {
   it('accepts both approved intermediate and resolved bidirectional claim-refund links', () => {
     expect(() => validateDemoState(stateWithLinkedRefundClaim())).not.toThrow()
     expect(() => validateDemoState(stateWithLinkedRefundClaim(true))).not.toThrow()
+  })
+
+  it('rejects a fully refunded payment corrupted with a restored generic blocker', () => {
+    const original = servicesWithClaim('damage').repository.exportForTest()
+    const blocker = structuredClone(original.claims[0])
+    const stripped = structuredClone(original)
+    stripped.claims = []
+    const strippedOrder = stripped.orders.find((order) =>
+      order.id === blocker.orderId)!
+    strippedOrder.claimIds = []
+    refreshOrderFulfillment(
+      stripped,
+      strippedOrder,
+      FIXED_NOW,
+      'Removed blocker only to construct validator corruption fixture',
+    )
+    const storage = new MemoryStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(stripped))
+    const isolated = new AppServices(storage, () => FIXED_NOW)
+    isolated.auth.oneClick('admin')
+    isolated.payments.refund(
+      'pay-delivered',
+      11_200,
+      'Confirmed generic full refund before corruption',
+      'req-validator-generic-full-before-corruption',
+    )
+    const corrupt = isolated.repository.exportForTest()
+    corrupt.claims.push(blocker)
+    corrupt.orders.find((order) => order.id === blocker.orderId)!
+      .claimIds.push(blocker.id)
+
+    expect(() => validateDemoState(corrupt)).toThrow(expect.objectContaining({
+      code: FULL_REFUND_REMEDY_CONFLICT_CODE,
+      message: expect.stringContaining(blocker.id),
+    }))
+  })
+
+  it('rejects a claim-linked full refund corrupted with another uncoordinated blocker', () => {
+    const setup = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    setup.auth.oneClick('customer')
+    const completing = setup.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'damage',
+      shipmentId: 'shp-delivered',
+      note: 'DEMO completing linked refund validator claim',
+    }).data
+    const blocker = setup.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'value_floor',
+      boxId: 'box-delivered-01',
+      note: 'DEMO uncoordinated validator blocker claim',
+    }).data
+    setup.auth.oneClick('admin')
+    setup.claims.review(
+      completing.id,
+      'acknowledge',
+      'Confirmed completing validator claim acknowledgement',
+    )
+    setup.claims.review(
+      completing.id,
+      'approve',
+      'Confirmed completing validator claim approval',
+    )
+    const stripped = setup.repository.exportForTest()
+    stripped.claims = stripped.claims.filter((claim) => claim.id !== blocker.id)
+    stripped.orders.find((order) => order.id === blocker.orderId)!.claimIds =
+      stripped.orders.find((order) => order.id === blocker.orderId)!.claimIds
+        .filter((claimId) => claimId !== blocker.id)
+    const storage = new MemoryStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(stripped))
+    const isolated = new AppServices(storage, () => FIXED_NOW)
+    isolated.auth.oneClick('admin')
+    isolated.payments.refund(
+      'pay-delivered',
+      11_200,
+      'Confirmed linked full refund before corruption',
+      'req-validator-linked-full-before-corruption',
+      completing.id,
+    )
+    const corrupt = isolated.repository.exportForTest()
+    corrupt.claims.push(blocker)
+    corrupt.orders.find((order) => order.id === blocker.orderId)!
+      .claimIds.push(blocker.id)
+
+    expect(() => validateDemoState(corrupt)).toThrow(expect.objectContaining({
+      code: FULL_REFUND_REMEDY_CONFLICT_CODE,
+      message: expect.stringContaining(blocker.id),
+    }))
   })
 
   it.each([
@@ -1065,6 +1222,55 @@ describe('MockRepository recovery and persistence', () => {
     expect(() => validateDemoState(snapshot)).not.toThrow()
   })
 
+  it('classifies exact and capped-terminal version 7 settlements with shared rules', () => {
+    const exactStorage = new MemoryStorage()
+    exactStorage.seed(
+      STORAGE_KEY,
+      JSON.stringify(toVersion7(stateWithLinkedRefundClaim(true))),
+    )
+    const exact = new MockRepository(exactStorage).getSnapshot().claims[0]
+    expect(exact).toMatchObject({
+      acceptedSettlementSen: 11_200,
+      requiredSettlementSen: 11_200,
+      settlementPolicy: 'exact_scope',
+    })
+    expect(exact.legacyUnderSettledRefund).toBeUndefined()
+
+    const terminalStorage = new MemoryStorage()
+    terminalStorage.seed(
+      STORAGE_KEY,
+      JSON.stringify(cappedTerminalFallbackVersion7State()),
+    )
+    const terminalSnapshot = new MockRepository(terminalStorage).getSnapshot()
+    const terminal = terminalSnapshot.claims.find((claim) =>
+      claim.orderId === 'ord-failed')!
+    expect(terminal).toMatchObject({
+      acceptedSettlementSen: 10_200,
+      requiredSettlementSen: 11_200,
+      settlementPolicy: 'terminal_replacement_fallback',
+    })
+    expect(terminal.legacyUnderSettledRefund).toBeUndefined()
+    expect(() => validateDemoState(terminalSnapshot)).not.toThrow()
+  })
+
+  it('protects raw over-settled nonterminal version 7 bytes without upgrading them', () => {
+    const raw = JSON.stringify(overSettledVersion7State())
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, raw)
+
+    const repository = new MockRepository(storage)
+
+    expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+    expect(storage.writes).toBe(0)
+    expect(repository.getSnapshot().schemaVersion).toBe(8)
+    expect(repository.recoveryNotice).toMatch(
+      /version 7.+failed.+exact original browser bytes were left unchanged/i,
+    )
+    expect(() => repository.update(() => undefined)).toThrow(
+      expect.objectContaining({ code: 'CONFIRMED_RESET_REQUIRED' }),
+    )
+  })
+
   it('preserves a valid version 7 grouped replacement scope as history while activating only its exact claim scope', () => {
     const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
     makeProcessingOrderSingleGroupedPhysicalShipment(services)
@@ -1179,6 +1385,65 @@ describe('MockRepository recovery and persistence', () => {
     expect(snapshot.boxes.find((entry) => entry.id === 'box-processing-01')?.status)
       .toBe('opened')
     expect(() => validateDemoState(snapshot)).not.toThrow()
+
+    const activeStorage = new MemoryStorage()
+    activeStorage.seed(STORAGE_KEY, JSON.stringify(snapshot))
+    const services = new AppServices(activeStorage, () => FIXED_NOW)
+    services.auth.oneClick('admin')
+    const claimBefore = structuredClone(services.repository.getSnapshot().claims[0])
+    services.payments.refund(
+      'pay-processing',
+      20_200,
+      'Confirmed generic full after legacy under-settlement',
+      'req-generic-full-after-legacy-under-settlement',
+    )
+    const after = services.repository.getSnapshot()
+    expect(after.payments.find((entry) => entry.id === 'pay-processing'))
+      .toMatchObject({ status: 'refunded', refundedSen: 21_200 })
+    expect(after.claims[0]).toEqual(claimBefore)
+  })
+
+  it('protects a forged schema-v8 legacy refund settled above its requirement', () => {
+    const migrationStorage = new MemoryStorage()
+    migrationStorage.seed(
+      STORAGE_KEY,
+      JSON.stringify(legacyUnderSettledVersion7State()),
+    )
+    const forged = structuredClone(
+      new MockRepository(migrationStorage).getSnapshot(),
+    )
+    const claim = forged.claims[0]
+    const payment = forged.payments.find((entry) =>
+      entry.id === 'pay-processing')!
+    const event = payment.events.find((entry) =>
+      entry.id === claim.linkedRefundEventId)!
+    const acceptedSettlementSen = claim.requiredSettlementSen + 1
+    claim.acceptedSettlementSen = acceptedSettlementSen
+    event.refundIntent!.amountSen = acceptedSettlementSen
+    payment.refundedSen = acceptedSettlementSen
+    const paymentAudit = forged.audits.find((audit) =>
+      audit.eventId === event.id && audit.targetType === 'payment')!
+    ;(paymentAudit.after as Record<string, unknown>).refundedSen =
+      acceptedSettlementSen
+
+    expect(forged.schemaVersion).toBe(8)
+    expect(() => validateDemoState(forged)).toThrow(
+      /strictly under-settled/i,
+    )
+
+    const raw = JSON.stringify(forged)
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, raw)
+    const repository = new MockRepository(storage)
+
+    expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+    expect(storage.writes).toBe(0)
+    expect(repository.recoveryNotice).toMatch(
+      /version 8.+failed the safety checks.+exact original browser bytes/i,
+    )
+    expect(() => repository.update(() => undefined)).toThrow(
+      expect.objectContaining({ code: 'CONFIRMED_RESET_REQUIRED' }),
+    )
   })
 
   it('maps a financially cancelled version 6 digital shipment to canonical digital cancelled without fabricating delivery', () => {
@@ -1499,6 +1764,22 @@ describe('MockRepository recovery and persistence', () => {
     })
     expect(snapshot.shipments.filter((shipment) => shipment.purpose === 'replacement')).toHaveLength(0)
     expect(() => validateDemoState(snapshot)).not.toThrow()
+
+    const activeStorage = new MemoryStorage()
+    activeStorage.seed(STORAGE_KEY, JSON.stringify(snapshot))
+    const migratedServices = new AppServices(activeStorage, () => FIXED_NOW)
+    migratedServices.auth.oneClick('admin')
+    const before = structuredClone(migratedServices.repository.getSnapshot())
+    expect(() => migratedServices.payments.refund(
+      'pay-delivered',
+      11_200,
+      'Attempted generic full with grandfathered entitlement',
+      'req-generic-full-grandfathered-entitlement',
+    )).toThrow(expect.objectContaining({
+      code: FULL_REFUND_REMEDY_CONFLICT_CODE,
+      message: expect.stringContaining(snapshot.claims[0].id),
+    }))
+    expect(migratedServices.repository.getSnapshot()).toEqual(before)
   })
 
   it('rejects persisted overlapping remedy entitlement holders across distinct claim kinds', () => {

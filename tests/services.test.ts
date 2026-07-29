@@ -9,6 +9,7 @@ import {
 import { AUDIT_EVIDENCE_MAX_BYTES } from '../src/domain/auditEvidence'
 import { exactOddsLabel } from '../src/domain/odds'
 import { sealedCustomerTimeline } from '../src/domain/orderTimeline'
+import { FULL_REFUND_REMEDY_CONFLICT_CODE } from '../src/domain/remedyPolicy'
 import type { DemoState, Role } from '../src/domain/types'
 import { createDemoState, DEMO_ADDRESS } from '../src/data/fixtures'
 import {
@@ -270,8 +271,10 @@ function physicalReplacementScenario(
   return { services: isolated, claim, replacement }
 }
 
-function failedDigitalReplacementScenario() {
-  const isolated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+function failedDigitalReplacementScenario(
+  storage: MemoryStorage = new MemoryStorage(),
+) {
+  const isolated = new AppServices(storage, () => FIXED_NOW)
   isolated.auth.oneClick('customer')
   isolated.openBox('box-processing-02')
   isolated.auth.oneClick('admin')
@@ -2769,7 +2772,7 @@ describe('customer, payment, allocation and admin services', () => {
     expect(storage.writes).toBe(writesBeforeReplay)
   })
 
-  it('keeps goodwill refunds unlinked and blocks them from resolving an approved claim', () => {
+  it('keeps partial goodwill refunds unlinked and blocks them from resolving an approved claim', () => {
     services.auth.oneClick('customer')
     const claim = services.claims.submit({
       orderId: 'ord-delivered',
@@ -2782,7 +2785,7 @@ describe('customer, payment, allocation and admin services', () => {
     services.claims.review(claim.id, 'approve', 'Approved goodwill separation evidence')
     services.payments.refund(
       'pay-delivered',
-      claim.requiredSettlementSen,
+      claim.requiredSettlementSen - 1,
       'Confirmed unlinked goodwill refund',
       'req-unlinked-goodwill-refund',
     )
@@ -2826,6 +2829,242 @@ describe('customer, payment, allocation and admin services', () => {
     })
     expect(event.refundIntent?.claimId).toBeUndefined()
     expect(() => validateDemoState(services.repository.getSnapshot())).not.toThrow()
+  })
+
+  it.each(['submitted', 'reviewing', 'approved'] as const)(
+    'atomically blocks a generic full refund while a same-order claim is %s',
+    (status) => {
+      const isolated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+      isolated.auth.oneClick('customer')
+      const claim = isolated.claims.submit({
+        orderId: 'ord-delivered',
+        kind: 'damage',
+        shipmentId: 'shp-delivered',
+        note: `DEMO generic full refund ${status} blocker`,
+      }).data
+      isolated.auth.oneClick('admin')
+      if (status !== 'submitted') {
+        isolated.claims.review(
+          claim.id,
+          'acknowledge',
+          `Confirmed generic full refund ${status} review`,
+        )
+      }
+      if (status === 'approved') {
+        isolated.claims.review(
+          claim.id,
+          'approve',
+          'Confirmed generic full refund approved review',
+        )
+      }
+      const before = structuredClone(isolated.repository.getSnapshot())
+
+      expect(() => isolated.payments.refund(
+        'pay-delivered',
+        11_200,
+        `Attempted generic full refund with ${status} claim`,
+        `req-generic-full-${status}`,
+      )).toThrow(expect.objectContaining({
+        code: FULL_REFUND_REMEDY_CONFLICT_CODE,
+        message: expect.stringContaining(claim.id),
+      }))
+      expect(isolated.repository.getSnapshot()).toEqual(before)
+    },
+  )
+
+  it('atomically blocks generic full refunds for active RMA evidence', () => {
+    const isolated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    isolated.auth.oneClick('customer')
+    const claim = isolated.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'damage',
+      shipmentId: 'shp-delivered',
+      note: 'DEMO generic full refund RMA blocker',
+    }).data
+    approveClaim(isolated, claim.id)
+    isolated.claims.createRma(
+      claim.id,
+      'DEMO-RMA-FULL-REFUND-BLOCK',
+      'Confirmed generic full refund RMA blocker',
+    )
+    const before = structuredClone(isolated.repository.getSnapshot())
+
+    expect(() => isolated.payments.refund(
+      'pay-delivered',
+      11_200,
+      'Attempted generic full refund during RMA',
+      'req-generic-full-rma',
+    )).toThrow(expect.objectContaining({
+      code: FULL_REFUND_REMEDY_CONFLICT_CODE,
+      message: expect.stringContaining(claim.id),
+    }))
+    expect(isolated.repository.getSnapshot()).toEqual(before)
+  })
+
+  it.each([
+    ['authorized', 'unfulfilled'],
+    ['delivered', 'delivered'],
+  ] as const)(
+    'atomically blocks a generic full refund for a replacement that is %s',
+    (_label, replacementStatus) => {
+      const scenario = physicalReplacementScenario(replacementStatus)
+      const { services: isolated, claim } = scenario
+      const before = structuredClone(isolated.repository.getSnapshot())
+
+      expect(() => isolated.payments.refund(
+        'pay-failed',
+        11_200,
+        `Attempted generic full refund with ${replacementStatus} replacement`,
+        `req-generic-full-replacement-${replacementStatus}`,
+      )).toThrow(expect.objectContaining({
+        code: FULL_REFUND_REMEDY_CONFLICT_CODE,
+        message: expect.stringContaining(claim.id),
+      }))
+      expect(isolated.repository.getSnapshot()).toEqual(before)
+    },
+  )
+
+  it.each(['linked', 'completed'] as const)(
+    'atomically blocks a generic full refund for a claim refund that is %s',
+    (claimRefundState) => {
+      const isolated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+      makeProcessingOrderSingleGroupedPhysicalShipment(isolated)
+      isolated.auth.oneClick('customer')
+      isolated.openBox('box-processing-02')
+      const claim = isolated.claims.submit({
+        orderId: 'ord-processing',
+        kind: 'value_floor',
+        boxId: 'box-processing-01',
+        note: `DEMO generic full refund ${claimRefundState} claim blocker`,
+      }).data
+      approveClaim(isolated, claim.id)
+      isolated.payments.refund(
+        'pay-processing',
+        claim.requiredSettlementSen,
+        `Confirmed ${claimRefundState} claim refund before generic full`,
+        `req-claim-refund-${claimRefundState}`,
+        claim.id,
+      )
+      if (claimRefundState === 'completed') {
+        const eventId = isolated.repository.getSnapshot().claims
+          .find((entry) => entry.id === claim.id)!.linkedRefundEventId!
+        isolated.claims.review(
+          claim.id,
+          'resolve',
+          'Confirmed claim refund completion before generic full',
+          { outcome: 'refund_recorded', reference: eventId },
+        )
+      }
+      const before = structuredClone(isolated.repository.getSnapshot())
+
+      expect(() => isolated.payments.refund(
+        'pay-processing',
+        10_600,
+        `Attempted generic full with claim refund ${claimRefundState}`,
+        `req-generic-full-refund-${claimRefundState}`,
+      )).toThrow(expect.objectContaining({
+        code: FULL_REFUND_REMEDY_CONFLICT_CODE,
+        message: expect.stringContaining(claim.id),
+      }))
+      expect(isolated.repository.getSnapshot()).toEqual(before)
+    },
+  )
+
+  it.each(['rejected', 'no_remedy'] as const)(
+    'allows a generic full refund after a claim ends as %s without changing it',
+    (terminalClaimState) => {
+      const isolated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+      isolated.auth.oneClick('customer')
+      const claim = isolated.claims.submit({
+        orderId: 'ord-delivered',
+        kind: 'damage',
+        shipmentId: 'shp-delivered',
+        note: `DEMO generic full refund allowed ${terminalClaimState}`,
+      }).data
+      isolated.auth.oneClick('admin')
+      if (terminalClaimState === 'rejected') {
+        isolated.claims.review(
+          claim.id,
+          'reject',
+          'Confirmed rejected claim before generic full refund',
+        )
+      } else {
+        isolated.claims.review(
+          claim.id,
+          'acknowledge',
+          'Confirmed no-remedy acknowledgement before generic full refund',
+        )
+        isolated.claims.review(
+          claim.id,
+          'approve',
+          'Confirmed no-remedy approval before generic full refund',
+        )
+        isolated.claims.review(
+          claim.id,
+          'resolve',
+          'Confirmed no remedy before generic full refund completion',
+          { outcome: 'no_remedy', reference: 'DEMO-NO-REMEDY-FULL-REFUND' },
+        )
+      }
+      const claimBefore = structuredClone(
+        isolated.repository.getSnapshot().claims.find((entry) =>
+          entry.id === claim.id),
+      )
+
+      isolated.payments.refund(
+        'pay-delivered',
+        11_200,
+        `Confirmed generic full refund after ${terminalClaimState}`,
+        `req-generic-full-allowed-${terminalClaimState}`,
+      )
+
+      const snapshot = isolated.repository.getSnapshot()
+      expect(snapshot.payments.find((entry) => entry.id === 'pay-delivered'))
+        .toMatchObject({ status: 'refunded', refundedSen: 11_200 })
+      expect(snapshot.claims.find((entry) => entry.id === claim.id))
+        .toEqual(claimBefore)
+    },
+  )
+
+  it('blocks a disputed refund without touching the claim, then permits the merchant win', () => {
+    const isolated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    isolated.auth.oneClick('customer')
+    const claim = isolated.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'damage',
+      shipmentId: 'shp-delivered',
+      note: 'DEMO dispute refund full-payment blocker',
+    }).data
+    isolated.auth.oneClick('admin')
+    isolated.payments.dispute(
+      'pay-delivered',
+      'Confirmed dispute before guarded refund outcome',
+      'evt-dispute-full-refund-block',
+    )
+    const beforeRefund = structuredClone(isolated.repository.getSnapshot())
+
+    expect(() => isolated.payments.resolveDispute(
+      'pay-delivered',
+      'refund',
+      'Attempted disputed refund with open claim',
+      'evt-dispute-refund-blocked',
+    )).toThrow(expect.objectContaining({
+      code: FULL_REFUND_REMEDY_CONFLICT_CODE,
+      message: expect.stringContaining(claim.id),
+    }))
+    expect(isolated.repository.getSnapshot()).toEqual(beforeRefund)
+
+    isolated.payments.resolveDispute(
+      'pay-delivered',
+      'merchant_won',
+      'Confirmed merchant win preserves open claim',
+      'evt-dispute-merchant-win',
+    )
+    const afterWin = isolated.repository.getSnapshot()
+    expect(afterWin.payments.find((entry) => entry.id === 'pay-delivered')?.status)
+      .toBe('succeeded')
+    expect(afterWin.claims.find((entry) => entry.id === claim.id))
+      .toEqual(beforeRefund.claims.find((entry) => entry.id === claim.id))
   })
 
   it('blocks missing and cross-order claim links atomically', () => {
@@ -3415,23 +3654,22 @@ describe('customer, payment, allocation and admin services', () => {
     expect(isolated.repository.getSnapshot()).toEqual(beforeConflict)
   })
 
-  it('blocks an overlapping replacement after another claim links a refund', () => {
+  it('blocks a claim-linked full refund when another same-order claim is uncoordinated', () => {
     const { services: isolated, damage, valueFloor } = overlappingCrossKindClaims()
     approveClaim(isolated, damage.id)
     approveClaim(isolated, valueFloor.id)
-    isolated.payments.refund(
+    const beforeConflict = structuredClone(isolated.repository.getSnapshot())
+
+    expect(() => isolated.payments.refund(
       'pay-delivered',
       damage.requiredSettlementSen,
       'Confirmed damage claim refund before overlapping replacement',
       'req-overlap-refund-then-replacement',
       damage.id,
-    )
-    const beforeConflict = structuredClone(isolated.repository.getSnapshot())
-
-    expect(() => isolated.claims.authorizeReplacement(
-      valueFloor.id,
-      'Attempted value-floor replacement after overlapping claim refund',
-    )).toThrow(expect.objectContaining({ code: 'REMEDY_SCOPE_CONFLICT' }))
+    )).toThrow(expect.objectContaining({
+      code: FULL_REFUND_REMEDY_CONFLICT_CODE,
+      message: expect.stringContaining(valueFloor.id),
+    }))
     expect(isolated.repository.getSnapshot()).toEqual(beforeConflict)
   })
 
@@ -3650,8 +3888,58 @@ describe('customer, payment, allocation and admin services', () => {
       .toBe('partially_fulfilled')
   })
 
+  it('coordinates two disjoint RM106 claim refunds to complete one RM212 payment', () => {
+    const isolated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    makeProcessingOrderSingleGroupedPhysicalShipment(isolated)
+    isolated.auth.oneClick('customer')
+    isolated.openBox('box-processing-02')
+    const claims = [
+      isolated.claims.submit({
+        orderId: 'ord-processing',
+        kind: 'value_floor',
+        boxId: 'box-processing-01',
+        note: 'DEMO first disjoint coordinated refund claim',
+      }).data,
+      isolated.claims.submit({
+        orderId: 'ord-processing',
+        kind: 'value_floor',
+        boxId: 'box-processing-02',
+        note: 'DEMO second disjoint coordinated refund claim',
+      }).data,
+    ]
+    for (const claim of claims) approveClaim(isolated, claim.id)
+
+    for (const [index, claim] of claims.entries()) {
+      isolated.payments.refund(
+        'pay-processing',
+        10_600,
+        `Confirmed disjoint coordinated claim refund ${index + 1}`,
+        `req-disjoint-coordinated-refund-${index + 1}`,
+        claim.id,
+      )
+    }
+
+    const snapshot = isolated.repository.getSnapshot()
+    expect(snapshot.payments.find((entry) => entry.id === 'pay-processing'))
+      .toMatchObject({ status: 'refunded', refundedSen: 21_200 })
+    expect(claims.map((claim) =>
+      snapshot.claims.find((entry) => entry.id === claim.id))).toEqual([
+        expect.objectContaining({
+          remedyState: 'refund_linked',
+          acceptedSettlementSen: 10_600,
+          settlementPolicy: 'exact_scope',
+        }),
+        expect.objectContaining({
+          remedyState: 'refund_linked',
+          acceptedSettlementSen: 10_600,
+          settlementPolicy: 'exact_scope',
+        }),
+      ])
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+  })
+
   it.each(['lost', 'returned'] as const)(
-    'allows a terminal physical %s replacement to fall back to the full remaining payment refund',
+    'caps a terminal physical %s replacement fallback at its required or remaining amount',
     (status) => {
       const scenario = physicalReplacementScenario(status)
       const { services: isolated, claim, replacement } = scenario
@@ -3666,6 +3954,7 @@ describe('customer, payment, allocation and admin services', () => {
       const payment = isolated.repository.getSnapshot().payments
         .find((entry) => entry.id === 'pay-failed')!
       const remainingSen = payment.amountSen - payment.refundedSen
+      if (status === 'returned') expect(remainingSen).toBe(10_200)
       const result = isolated.payments.refund(
         payment.id,
         remainingSen,
@@ -3686,55 +3975,70 @@ describe('customer, payment, allocation and admin services', () => {
         acceptedSettlementSen: remainingSen,
         settlementPolicy: 'terminal_replacement_fallback',
       })
+      expect(snapshot.payments.find((entry) => entry.id === payment.id))
+        .toMatchObject({ status: 'refunded', refundedSen: 11_200 })
       expect(snapshot.shipments.find((entry) => entry.id === 'shp-failed')?.status)
         .toBe('failed_delivery')
       expect(() => validateDemoState(snapshot)).not.toThrow()
     },
   )
 
-  it('uses full remaining balance for failed digital replacement fallback with exact replay and conflict guards', () => {
-    const scenario = failedDigitalReplacementScenario()
+  it('caps a two-box terminal digital fallback at RM106 with exact no-write replay', () => {
+    for (const amountSen of [10_599, 10_601]) {
+      const rejected = failedDigitalReplacementScenario()
+      const before = structuredClone(rejected.services.repository.getSnapshot())
+      expect(() => rejected.services.payments.refund(
+        'pay-processing',
+        amountSen,
+        `Attempted one-sen terminal digital mismatch ${amountSen}`,
+        `req-digital-fallback-mismatch-${amountSen}`,
+        rejected.claim.id,
+      )).toThrow(expect.objectContaining({ code: 'CLAIM_SETTLEMENT_MISMATCH' }))
+      expect(rejected.services.repository.getSnapshot()).toEqual(before)
+    }
+
+    const storage = new CountingStorage()
+    const scenario = failedDigitalReplacementScenario(storage)
     const { services: isolated, claim, replacement } = scenario
     const beforeRefund = isolated.repository.getSnapshot()
     const payment = beforeRefund.payments.find((entry) => entry.id === 'pay-processing')!
     expect(claim.requiredSettlementSen).toBe(10_600)
     expect(payment.amountSen).toBe(21_200)
-    expect(() => isolated.payments.refund(
-      payment.id,
-      claim.requiredSettlementSen,
-      'Attempted scoped amount for terminal digital fallback',
-      'req-digital-fallback-under',
-      claim.id,
-    )).toThrow(expect.objectContaining({ code: 'CLAIM_SETTLEMENT_MISMATCH' }))
 
     const first = isolated.payments.refund(
       payment.id,
-      payment.amountSen,
-      'Confirmed terminal digital replacement full fallback',
+      claim.requiredSettlementSen,
+      'Confirmed capped terminal digital replacement fallback',
       'req-digital-fallback-exact',
       claim.id,
     )
     const afterFirst = structuredClone(isolated.repository.getSnapshot())
+    const writesBeforeReplay = storage.writes
     const replay = isolated.payments.refund(
       payment.id,
-      payment.amountSen,
-      'Confirmed terminal digital replacement full fallback',
+      claim.requiredSettlementSen,
+      'Confirmed capped terminal digital replacement fallback',
       'req-digital-fallback-exact',
       claim.id,
     )
     expect(replay).toMatchObject({ changed: false, payment: { id: first.payment.id } })
     expect(isolated.repository.getSnapshot()).toEqual(afterFirst)
+    expect(storage.writes).toBe(writesBeforeReplay)
+    expect(afterFirst.payments.find((entry) => entry.id === payment.id)).toMatchObject({
+      refundedSen: 10_600,
+      status: 'partially_refunded',
+    })
     expect(afterFirst.claims.find((entry) => entry.id === claim.id)).toMatchObject({
       status: 'approved',
       remedyState: 'refund_linked',
-      acceptedSettlementSen: 21_200,
+      acceptedSettlementSen: 10_600,
       settlementPolicy: 'terminal_replacement_fallback',
       replacementShipmentId: replacement.id,
     })
     for (const [amountSen, reason, changedClaimId] of [
-      [21_199, 'Confirmed terminal digital replacement full fallback', claim.id],
-      [21_200, 'Changed terminal digital replacement fallback reason', claim.id],
-      [21_200, 'Confirmed terminal digital replacement full fallback', `${claim.id}-other`],
+      [10_599, 'Confirmed capped terminal digital replacement fallback', claim.id],
+      [10_600, 'Changed terminal digital replacement fallback reason', claim.id],
+      [10_600, 'Confirmed capped terminal digital replacement fallback', `${claim.id}-other`],
     ] as const) {
       expect(() => isolated.payments.refund(
         payment.id,

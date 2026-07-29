@@ -210,7 +210,7 @@ test.describe('desktop admin journeys', () => {
     await expect(originalScope.locator('.remedy-replacement').getByText(/replacement delivered/i)).toBeVisible()
   })
 
-  test('lost physical replacement exposes an exact full-remaining terminal fallback', {
+  test('lost physical replacement exposes a capped terminal fallback at the smaller settlement amount', {
     tag: mobile320RemedyTag,
   }, async ({ page }) => {
     await login(page, 'customer')
@@ -261,9 +261,11 @@ test.describe('desktop admin journeys', () => {
     await claim.getByRole('button', { name: /record typed remedy/i }).click()
     const fallbackRouteDialog = page.getByRole('dialog', { name: new RegExp(claimId) })
     await expect(fallbackRouteDialog.getByRole('radio', {
-      name: /open terminal replacement fallback in payments/i,
+      name: /open capped terminal replacement fallback in payments/i,
     })).toBeChecked()
-    await expect(fallbackRouteDialog).toContainText(/exact full remaining balance/i)
+    await expect(fallbackRouteDialog).toContainText(
+      /smaller of required settlement rm\s*112\.00 and the selected payment.s remaining balance/i,
+    )
     await fallbackRouteDialog.getByRole('button', { name: /open exact payment/i }).click()
 
     const filteredPayment = page.locator('.payment-record').filter({ hasText: 'pay-failed' })
@@ -273,19 +275,22 @@ test.describe('desktop admin journeys', () => {
     await expect(filteredPayment.getByRole('button', { name: /unlinked refund remaining/i })).toHaveCount(0)
     await expect(filteredPayment.getByRole('button', { name: /mark disputed/i })).toHaveCount(0)
     const fallback = filteredPayment.getByRole('button', {
-      name: new RegExp(`linked claim ${claimId}.+terminal replacement fallback rm\\s*102\\.00`, 'i'),
+      name: new RegExp(`linked claim ${claimId}.+capped terminal replacement fallback rm\\s*102\\.00`, 'i'),
     })
     await expect(fallback).toBeVisible()
     await fallback.click()
     const fallbackDialog = page.getByRole('dialog', {
-      name: new RegExp(`terminal replacement fallback of rm\\s*102\\.00 for claim ${claimId}`, 'i'),
+      name: new RegExp(`capped terminal replacement fallback of rm\\s*102\\.00 for claim ${claimId}`, 'i'),
     })
     await expect(fallbackDialog).toContainText('pay-failed')
     await expect(fallbackDialog).toContainText(/required claim settlementrm\s*112\.00/i)
     await expect(fallbackDialog).toContainText(/remaining payment balancerm\s*102\.00/i)
-    await expect(fallbackDialog).toContainText(/terminal replacement fallback/i)
+    await expect(fallbackDialog).toContainText(/settlement policyterminal replacement fallback/i)
+    await expect(fallbackDialog).toContainText(
+      /smaller of the required claim settlement and the remaining payment balance:\s*rm\s*102\.00/i,
+    )
     const amountRow = fallbackDialog.locator('.detail-list > div').filter({ hasText: 'Amount to refund' })
-    const confirmFallback = fallbackDialog.getByRole('button', { name: /confirm terminal fallback & audit/i })
+    const confirmFallback = fallbackDialog.getByRole('button', { name: /confirm capped terminal fallback & audit/i })
     await expect(amountRow).toBeVisible()
     await expect(amountRow).toContainText(/rm\s*102\.00/i)
     await expect(confirmFallback).toBeVisible()

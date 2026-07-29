@@ -10,6 +10,26 @@
 - [x] Fixed-clock fulfilment timeline identity regression coverage
 - [x] Production boundary and operating-flow notes
 
+## 2026-07-29 public demo release
+
+- [x] Confirm `main` contains the verified application release commit
+  `404ba06033117fa6130dad1075cf12019a99ccd4`
+- [x] Confirm PR #1 is closed and GitHub reports `merged=true`
+- [x] Confirm main CI run `30415550591` completed successfully with passing
+  `verify` and `e2e` jobs
+- [x] Confirm Pages run `30415550658` completed successfully with passing
+  `build-test-upload` and `deploy` jobs
+- [x] Confirm local verification passed 283/283 tests with 0 vulnerabilities
+- [x] Review and publish the browser-local fake-data demo to GitHub Pages
+- [x] Check the live site in personal Chrome at 1440×900, 360×800, 390×844,
+  430×932 and 768×1024 with no horizontal overflow and a visible WebGL canvas
+- [x] Verify live customer sign-in, cart, checkout, mock HitPay, payment, order,
+  open/reload persistence, and admin dashboard/payment views
+- [x] Reset the created fake record and close the test tab
+
+Release boundary: this is a public browser-local fake-data demo, not a real
+HitPay, Google or server backend. It must not accept real orders or money.
+
 ## 2026-07-29 whole-branch follow-up remediation
 
 - [x] Prevent cross-route sealed-prize state reuse and clean reveal timers
@@ -51,12 +71,11 @@
   and `npm run verify` passed the 90-file scan, two 0-vulnerability audits,
   lint, typecheck, 283/283 tests and build
 
-Local `npm audit` remained blocked by the restricted-network approval boundary.
-The code candidate is committed and pushed on the draft branch. The PR remains
-draft and unmerged, and no Pages deployment occurred. This later
-documentation-only change is not claimed to have passed CI.
+Historical checkpoint note: direct local `npm audit` network access was blocked,
+although the recorded local and remote release audits passed. This pre-merge
+checkpoint is superseded by the completed release checklist above.
 
-## Current local release candidate verification
+## Historical 2026-07-28 local release candidate verification
 
 - [x] `npm run verify` — passed end-to-end
 - [x] `npm run secrets:test` — secret-scanner self-test passed
@@ -82,7 +101,8 @@ documentation-only change is not claimed to have passed CI.
 - [x] Confirm commit `0ee805e1ce12fa7e9bdca6a7dab66dfc5ba4ebfe`
   passed GitHub Actions CI run #8 on 2026-07-28: both the `verify` and `e2e`
   jobs succeeded
-- [ ] Review the release candidate and make a separate publishing decision
+- [x] Review the release candidate and publish the demo
 
-The draft PR remains unmerged, and no Pages deployment occurred. No reviewer
-assignment or personal-profile manual browsing is claimed.
+This section preserves historical pre-release evidence. The current merge,
+deployment and personal-Chrome verification status is recorded in the completed
+2026-07-29 public demo release checklist above.

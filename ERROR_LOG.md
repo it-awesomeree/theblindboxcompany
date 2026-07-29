@@ -1,5 +1,28 @@
 # Error log
 
+## 2026-07-29 — Release status verified
+
+- `404ba06033117fa6130dad1075cf12019a99ccd4` is the verified application
+  release commit and remains contained in `main`.
+- This documentation-only follow-up records the release evidence and does not
+  change the application.
+- PR #1 is closed and GitHub reports `merged=true`.
+- Main CI run `30415550591` completed successfully with passing `verify` and
+  `e2e` jobs.
+- Pages run `30415550658` completed successfully with passing
+  `build-test-upload` and `deploy` jobs.
+- Local verification passed 283/283 tests and found 0 vulnerabilities.
+- The live site,
+  <https://it-awesomeree.github.io/theblindboxcompany/>, was checked in the
+  owner's personal Chrome at 1440×900, 360×800, 390×844, 430×932 and 768×1024.
+  It had no horizontal overflow, and its WebGL canvas was visible at every size.
+- Live customer sign-in, cart, checkout, mock HitPay, payment, order,
+  open/reload persistence, and admin dashboard/payment views were verified.
+  The created fake record was reset and the test tab was closed.
+
+This is a public browser-local fake-data demo, not a real HitPay, Google or
+server backend. It must not accept real orders or money.
+
 ## 2026-07-29 — Whole-branch follow-up resolved locally
 
 - Full customer route identity now remounts parameter/query-bound state.
@@ -38,12 +61,11 @@
 - Verify logs prove `npm ci` audited 254 packages with 0 vulnerabilities and
   `npm run verify` passed the 90-file secret scan, two audit commands with 0
   vulnerabilities, lint, typecheck, 283/283 tests and build. The e2e job passed.
-- Local `npm audit` remained blocked by the restricted-network approval
-  boundary. The code candidate is committed and pushed on the draft branch;
-  the PR remains draft and unmerged, and no Pages deployment occurred. This
-  later documentation-only change is not claimed to have passed CI.
+- Historical checkpoint note: direct local `npm audit` network access was
+  blocked, although the recorded local and remote release audits passed. This
+  pre-merge checkpoint is superseded by the verified release status above.
 
-## 2026-07-28 — Current local release candidate verification
+## 2026-07-28 — Historical local release candidate verification
 
 - `npm run verify` passed end-to-end.
 - The secret-scanner self-test passed and 85 publishable text files were
@@ -70,7 +92,8 @@
   WebGL.
 - Commit `0ee805e1ce12fa7e9bdca6a7dab66dfc5ba4ebfe` passed GitHub Actions CI run
   #8 on 2026-07-28: both the `verify` and `e2e` jobs succeeded.
-- The draft PR remains unmerged, and no Pages deployment occurred.
+- This pre-merge evidence is superseded by the verified 2026-07-29 merge and
+  deployment status above.
 
 ## 2026-07-28 — Release repair resolved locally
 

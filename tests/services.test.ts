@@ -1860,10 +1860,25 @@ describe('customer, payment, allocation and admin services', () => {
       1000,
       'Confirmed audited refund for claim resolution',
       'req-claim-resolution-refund',
+      claim.id,
     )
     const refundEvent = services.repository.getSnapshot().payments
       .find((payment) => payment.id === 'pay-delivered')!
       .events.find((event) => event.requestId === 'req-claim-resolution-refund')!
+    const beforeWrongResolution = structuredClone(services.repository.getSnapshot())
+    expect(() => services.claims.review(
+      claim.id,
+      'resolve',
+      'Attempted mismatched refund resolution reference',
+      { outcome: 'refund_recorded', reference: 'evt-ord-delivered-success' },
+    )).toThrow(expect.objectContaining({ code: 'RESOLUTION_REFUND_LINK_MISMATCH' }))
+    expect(() => services.claims.review(
+      claim.id,
+      'resolve',
+      'Attempted replacement after linking an exact refund event',
+      { outcome: 'replacement_authorized', reference: `DEMO-${claim.id.toUpperCase()}` },
+    )).toThrow(expect.objectContaining({ code: 'RESOLUTION_REFUND_LINK_MISMATCH' }))
+    expect(services.repository.getSnapshot()).toEqual(beforeWrongResolution)
     const result = services.claims.review(
       claim.id,
       'resolve',
@@ -1871,15 +1886,229 @@ describe('customer, payment, allocation and admin services', () => {
       { outcome: 'refund_recorded', reference: refundEvent.id },
     )
     expect(result.data).toMatchObject({
+      linkedRefundEventId: refundEvent.id,
       status: 'resolved',
       resolutionOutcome: 'refund_recorded',
       resolutionReference: refundEvent.id,
     })
+    expect(refundEvent.refundIntent?.claimId).toBe(claim.id)
     expect(services.repository.getSnapshot().audits.find((audit) => audit.eventId === refundEvent.id)).toMatchObject({
       targetId: 'pay-delivered',
       action: 'payment.partially_refunded',
     })
+    expect(services.repository.getSnapshot().audits.find((audit) =>
+      audit.eventId === refundEvent.id && audit.targetId === claim.id)).toMatchObject({
+        action: 'claim.refund_linked',
+        outcome: 'applied',
+      })
     expect(() => validateDemoState(services.repository.getSnapshot())).not.toThrow()
+  })
+
+  it('makes an exact linked-refund replay a no-op and treats claimId as part of identity', () => {
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const isolated = new AppServices(storage, () => FIXED_NOW)
+    isolated.auth.oneClick('customer')
+    const claim = isolated.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'damage',
+      shipmentId: 'shp-delivered',
+      note: 'DEMO linked refund replay evidence',
+    }).data
+    isolated.auth.oneClick('admin')
+    isolated.claims.review(claim.id, 'acknowledge', 'Acknowledged linked refund replay evidence')
+    isolated.claims.review(claim.id, 'approve', 'Approved linked refund replay evidence')
+    const first = isolated.payments.refund(
+      'pay-delivered',
+      1000,
+      'Confirmed exact claim-linked refund replay',
+      'req-linked-refund-replay',
+      claim.id,
+    )
+    const beforeReplay = structuredClone(isolated.repository.getSnapshot())
+    const writesBeforeReplay = storage.writes
+
+    const replay = isolated.payments.refund(
+      'pay-delivered',
+      1000,
+      'Confirmed exact claim-linked refund replay',
+      'req-linked-refund-replay',
+      claim.id,
+    )
+    expect(replay).toMatchObject({
+      changed: false,
+      payment: { id: first.payment.id },
+    })
+    expect(isolated.repository.getSnapshot()).toEqual(beforeReplay)
+    expect(storage.writes).toBe(writesBeforeReplay)
+
+    expect(() => isolated.payments.refund(
+      'pay-delivered',
+      1000,
+      'Confirmed exact claim-linked refund replay',
+      'req-linked-refund-replay',
+      `${claim.id}-changed`,
+    )).toThrow(expect.objectContaining({ code: 'IDEMPOTENCY_CONFLICT' }))
+    expect(isolated.repository.getSnapshot()).toEqual(beforeReplay)
+    expect(storage.writes).toBe(writesBeforeReplay)
+  })
+
+  it('keeps goodwill refunds unlinked and blocks them from resolving an approved claim', () => {
+    services.auth.oneClick('customer')
+    const claim = services.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'damage',
+      shipmentId: 'shp-delivered',
+      note: 'DEMO goodwill refund must not resolve this claim',
+    }).data
+    services.auth.oneClick('admin')
+    services.claims.review(claim.id, 'acknowledge', 'Acknowledged goodwill separation evidence')
+    services.claims.review(claim.id, 'approve', 'Approved goodwill separation evidence')
+    services.payments.refund(
+      'pay-delivered',
+      1000,
+      'Confirmed unlinked goodwill refund',
+      'req-unlinked-goodwill-refund',
+    )
+    const event = services.repository.getSnapshot().payments
+      .find((payment) => payment.id === 'pay-delivered')!
+      .events.find((entry) => entry.requestId === 'req-unlinked-goodwill-refund')!
+    expect(event.refundIntent?.claimId).toBeUndefined()
+    expect(services.repository.getSnapshot().claims
+      .find((entry) => entry.id === claim.id)?.linkedRefundEventId).toBeUndefined()
+    const beforeResolution = structuredClone(services.repository.getSnapshot())
+
+    expect(() => services.claims.review(
+      claim.id,
+      'resolve',
+      'Attempted to resolve from unrelated goodwill refund',
+      { outcome: 'refund_recorded', reference: event.id },
+    )).toThrow(expect.objectContaining({ code: 'RESOLUTION_REFUND_LINK_MISMATCH' }))
+    expect(services.repository.getSnapshot()).toEqual(beforeResolution)
+  })
+
+  it('keeps dispute-origin refunds unlinked and valid', () => {
+    services.auth.oneClick('admin')
+    services.payments.dispute(
+      'pay-unopened',
+      'Confirmed dispute before unlinked dispute refund',
+      'evt-unlinked-dispute',
+    )
+    services.payments.resolveDispute(
+      'pay-unopened',
+      'refund',
+      'Confirmed dispute-origin full refund',
+      'evt-unlinked-dispute-refund',
+    )
+    const event = services.repository.getSnapshot().payments
+      .find((payment) => payment.id === 'pay-unopened')!
+      .events.find((entry) => entry.id === 'evt-unlinked-dispute-refund')!
+
+    expect(event.refundIntent).toMatchObject({
+      paymentId: 'pay-unopened',
+      reason: 'Confirmed dispute-origin full refund',
+    })
+    expect(event.refundIntent?.claimId).toBeUndefined()
+    expect(() => validateDemoState(services.repository.getSnapshot())).not.toThrow()
+  })
+
+  it('blocks missing and cross-order claim links atomically', () => {
+    services.auth.oneClick('customer')
+    const claim = services.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'damage',
+      shipmentId: 'shp-delivered',
+      note: 'DEMO cross-order refund link evidence',
+    }).data
+    services.auth.oneClick('admin')
+    services.claims.review(claim.id, 'acknowledge', 'Acknowledged cross-order refund evidence')
+    services.claims.review(claim.id, 'approve', 'Approved cross-order refund evidence')
+    const before = structuredClone(services.repository.getSnapshot())
+
+    expect(() => services.payments.refund(
+      'pay-unopened',
+      1000,
+      'Attempted cross-order linked refund',
+      'req-cross-order-linked-refund',
+      claim.id,
+    )).toThrow(expect.objectContaining({ code: 'CLAIM_PAYMENT_MISMATCH' }))
+    expect(() => services.payments.refund(
+      'pay-delivered',
+      1000,
+      'Attempted missing claim-linked refund',
+      'req-missing-claim-linked-refund',
+      'clm-missing-refund-link',
+    )).toThrow(expect.objectContaining({ code: 'CLAIM_MISSING' }))
+    expect(services.repository.getSnapshot()).toEqual(before)
+  })
+
+  it.each(['submitted', 'reviewing', 'rejected', 'resolved'] as const)(
+    'blocks a %s claim from being linked to a refund without any partial write',
+    (status) => {
+      const isolated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+      isolated.auth.oneClick('customer')
+      const claim = isolated.claims.submit({
+        orderId: 'ord-delivered',
+        kind: 'damage',
+        shipmentId: 'shp-delivered',
+        note: `DEMO ${status} claim cannot create a refund link`,
+      }).data
+      isolated.auth.oneClick('admin')
+      if (status === 'reviewing') {
+        isolated.claims.review(claim.id, 'acknowledge', 'Acknowledged non-approved link evidence')
+      } else if (status === 'rejected') {
+        isolated.claims.review(claim.id, 'reject', 'Rejected non-approved link evidence')
+      } else if (status === 'resolved') {
+        isolated.claims.review(claim.id, 'acknowledge', 'Acknowledged resolved link evidence')
+        isolated.claims.review(claim.id, 'approve', 'Approved resolved link evidence')
+        isolated.claims.review(
+          claim.id,
+          'resolve',
+          'Resolved through a sufficiently descriptive replacement path',
+          { outcome: 'replacement_authorized', reference: `DEMO-${claim.id.toUpperCase()}` },
+        )
+      }
+      const before = structuredClone(isolated.repository.getSnapshot())
+
+      expect(() => isolated.payments.refund(
+        'pay-delivered',
+        1000,
+        `Attempted ${status} claim-linked refund`,
+        `req-${status}-claim-linked-refund`,
+        claim.id,
+      )).toThrow(expect.objectContaining({ code: 'CLAIM_NOT_APPROVED' }))
+      expect(isolated.repository.getSnapshot()).toEqual(before)
+    },
+  )
+
+  it('blocks a second refund event for the same approved claim atomically', () => {
+    services.auth.oneClick('customer')
+    const claim = services.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'damage',
+      shipmentId: 'shp-delivered',
+      note: 'DEMO one refund event per approved claim',
+    }).data
+    services.auth.oneClick('admin')
+    services.claims.review(claim.id, 'acknowledge', 'Acknowledged single linked event evidence')
+    services.claims.review(claim.id, 'approve', 'Approved single linked event evidence')
+    services.payments.refund(
+      'pay-delivered',
+      1000,
+      'Confirmed first claim-linked refund',
+      'req-first-claim-linked-refund',
+      claim.id,
+    )
+    const beforeSecond = structuredClone(services.repository.getSnapshot())
+
+    expect(() => services.payments.refund(
+      'pay-delivered',
+      1000,
+      'Attempted second claim-linked refund',
+      'req-second-claim-linked-refund',
+      claim.id,
+    )).toThrow(expect.objectContaining({ code: 'CLAIM_REFUND_ALREADY_LINKED' }))
+    expect(services.repository.getSnapshot()).toEqual(beforeSecond)
   })
 
   it('treats a refund request identity as global across payments', () => {

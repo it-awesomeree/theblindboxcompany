@@ -195,7 +195,117 @@ function stateWithTwoAudits() {
   return services.repository.exportForTest()
 }
 
+function stateWithLinkedRefundClaim(resolved = false) {
+  const services = servicesWithClaim('damage')
+  const claim = services.repository.getSnapshot().claims[0]
+  services.auth.oneClick('admin')
+  services.claims.review(claim.id, 'acknowledge', 'Acknowledged linked validator evidence')
+  services.claims.review(claim.id, 'approve', 'Approved linked validator evidence')
+  services.payments.refund(
+    'pay-delivered',
+    1000,
+    'Confirmed linked validator refund',
+    'req-linked-validator-refund',
+    claim.id,
+  )
+  if (resolved) {
+    const linked = services.repository.getSnapshot().claims[0].linkedRefundEventId!
+    services.claims.review(
+      claim.id,
+      'resolve',
+      'Resolved with the exact linked and audited refund event',
+      { outcome: 'refund_recorded', reference: linked },
+    )
+  }
+  return services.repository.exportForTest()
+}
+
 describe('MockRepository recovery and persistence', () => {
+  it('accepts both approved intermediate and resolved bidirectional claim-refund links', () => {
+    expect(() => validateDemoState(stateWithLinkedRefundClaim())).not.toThrow()
+    expect(() => validateDemoState(stateWithLinkedRefundClaim(true))).not.toThrow()
+  })
+
+  it.each([
+    ['missing claim reverse link', (state: DemoState) => {
+      delete state.claims[0].linkedRefundEventId
+    }],
+    ['wrong refund-event claim ID', (state: DemoState) => {
+      const event = state.payments.find((payment) => payment.id === 'pay-delivered')!
+        .events.find((entry) => entry.requestId === 'req-linked-validator-refund')!
+      event.refundIntent!.claimId = 'clm-wrong-link-owner'
+    }],
+    ['refund event before claim creation', (state: DemoState) => {
+      const event = state.payments.find((payment) => payment.id === 'pay-delivered')!
+        .events.find((entry) => entry.requestId === 'req-linked-validator-refund')!
+      event.createdAt = '2026-07-28T03:59:59.000Z'
+      event.processedAt = event.createdAt
+    }],
+    ['missing matching payment refund audit', (state: DemoState) => {
+      const audit = state.audits.find((entry) =>
+        entry.action === 'payment.partially_refunded' &&
+        entry.requestId === 'req-linked-validator-refund')!
+      audit.eventId = 'evt-missing-payment-refund-audit'
+    }],
+    ['ignored linked refund event', (state: DemoState) => {
+      const event = state.payments.find((payment) => payment.id === 'pay-delivered')!
+        .events.find((entry) => entry.requestId === 'req-linked-validator-refund')!
+      event.ignoredReason = 'Tampered into an ignored event'
+    }],
+    ['tampered claim-link audit evidence', (state: DemoState) => {
+      const audit = state.audits.find((entry) =>
+        entry.action === 'claim.refund_linked')!
+      const after = audit.after as Record<string, unknown>
+      after.paymentId = 'pay-wrong-audit'
+    }],
+    ['one refund event reused across two claims', (state: DemoState) => {
+      const original = state.claims[0]
+      const reused = structuredClone(original)
+      reused.id = 'clm-reused-refund-event'
+      reused.requestId = 'req-clm-reused-refund-event'
+      reused.kind = 'value_floor'
+      reused.note = 'DEMO second claim reusing one refund event'
+      delete reused.shipmentId
+      reused.boxId = 'box-delivered-01'
+      reused.history = reused.history.map((entry, index) => ({
+        ...entry,
+        id: `${reused.id}-h-${String(index + 1).padStart(2, '0')}`,
+        ...(index === 0 ? { note: reused.note } : {}),
+      }))
+      state.claims.push(reused)
+      state.orders.find((order) => order.id === reused.orderId)!.claimIds.push(reused.id)
+    }],
+  ] as Array<[string, (state: DemoState) => void]>)(
+    'rejects linked refund corruption: %s',
+    (_label, mutate) => {
+      const state = stateWithLinkedRefundClaim()
+      mutate(state)
+      expect(() => validateDemoState(state)).toThrow()
+    },
+  )
+
+  it.each([
+    ['mismatched resolution reference', (state: DemoState) => {
+      state.claims[0].resolutionReference = 'evt-ord-delivered-success'
+    }],
+    ['non-refund resolution carrying a refund link', (state: DemoState) => {
+      const claim = state.claims[0]
+      claim.resolutionOutcome = 'replacement_authorized'
+      claim.resolutionReference = `DEMO-${claim.id.toUpperCase()}`
+      claim.resolutionNote = 'Descriptive replacement must not retain a refund link'
+    }],
+    ['resolved refund with its reverse link removed', (state: DemoState) => {
+      delete state.claims[0].linkedRefundEventId
+    }],
+  ] as Array<[string, (state: DemoState) => void]>)(
+    'rejects refund resolution corruption: %s',
+    (_label, mutate) => {
+      const state = stateWithLinkedRefundClaim(true)
+      mutate(state)
+      expect(() => validateDemoState(state)).toThrow()
+    },
+  )
+
   it('recovers missing data with current schema fixtures', () => {
     const storage = new MemoryStorage()
     const repository = new MockRepository(storage)

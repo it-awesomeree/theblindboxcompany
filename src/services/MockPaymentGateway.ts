@@ -14,6 +14,10 @@ import {
   paymentRetryEligibility,
   paymentWasCaptured,
 } from '../domain/paymentEligibility'
+import {
+  CLAIM_REFUND_LINK_ACTION,
+  claimRefundLinkedHistoryNote,
+} from '../domain/refundLink'
 import { prizeForBox } from '../domain/selectors'
 import type {
   DemoState,
@@ -527,16 +531,29 @@ export class MockPaymentGateway {
     return this.processEvent(paymentId, makeId('evt', `${paymentId}:${action}:${payment.events.length}`), mapping[action])
   }
 
-  refund(paymentId: string, amountSen: number, reason: string, requestId: string) {
+  refund(
+    paymentId: string,
+    amountSen: number,
+    reason: string,
+    requestId: string,
+    claimId?: string,
+  ) {
     const snapshot = this.repository.getSnapshot()
     const currentActor = getSessionUser(snapshot)
     assertRole(currentActor, ['finance', 'admin', 'super_admin'], 'refund demo payments')
     const cleanRequestId = sanitizeText(requestId, 120)
     const cleanReason = sanitizeText(reason, 240)
+    const cleanClaimId = claimId === undefined ? undefined : sanitizeText(claimId, 120)
     assert(
       cleanRequestId.length >= 4 && cleanRequestId === requestId,
       'Refund request identity is invalid.',
       'INVALID_REFUND_REQUEST_ID',
+    )
+    assert(
+      cleanClaimId === undefined ||
+        (cleanClaimId.length >= 4 && cleanClaimId === claimId),
+      'Refund claim identity is invalid.',
+      'INVALID_REFUND_CLAIM_ID',
     )
     assert(cleanReason.length >= 8, 'Give a reason of at least 8 characters for this refund.', 'REASON_REQUIRED')
     assert(Number.isInteger(amountSen) && amountSen > 0, 'Refund must be a positive amount in sen.', 'INVALID_REFUND')
@@ -548,10 +565,11 @@ export class MockPaymentGateway {
       const exactReplay =
         replayEvent.refundIntent?.paymentId === paymentId &&
         replayEvent.refundIntent.amountSen === amountSen &&
-        replayEvent.refundIntent.reason === cleanReason
+        replayEvent.refundIntent.reason === cleanReason &&
+        replayEvent.refundIntent.claimId === cleanClaimId
       assert(
         exactReplay,
-        'Refund request identity was already used for different payment, amount, or reason.',
+        'Refund request identity was already used for different payment, amount, reason, or claim.',
         'IDEMPOTENCY_CONFLICT',
       )
       return {
@@ -575,13 +593,58 @@ export class MockPaymentGateway {
       )
       assert(['succeeded', 'partially_refunded'].includes(payment.status), 'Only succeeded demo payments can be refunded.', 'NOT_REFUNDABLE')
       assert(payment.refundedSen + amountSen <= payment.amountSen, 'Refund exceeds the paid demo amount.', 'REFUND_TOO_HIGH')
+      const order = state.orders.find((entry) => entry.id === payment.orderId)
+      assert(order, 'Payment order is missing.', 'ORDER_MISSING')
+      const now = this.now()
+      const eventId = makeId('evt', cleanRequestId)
+      const linkedClaim = cleanClaimId === undefined
+        ? undefined
+        : state.claims.find((claim) => claim.id === cleanClaimId)
+      if (cleanClaimId !== undefined) {
+        assert(linkedClaim, 'The refund claim was not found.', 'CLAIM_MISSING')
+        assert(
+          linkedClaim.orderId === payment.orderId &&
+            linkedClaim.userId === payment.userId &&
+            order.userId === linkedClaim.userId,
+          'The refund claim must belong to the same order and customer as the payment.',
+          'CLAIM_PAYMENT_MISMATCH',
+        )
+        assert(
+          linkedClaim.status === 'approved',
+          'A claim must be approved before its refund can be linked.',
+          'CLAIM_NOT_APPROVED',
+        )
+        assert(
+          linkedClaim.linkedRefundEventId === undefined &&
+            !state.payments.some((entry) =>
+              entry.events.some((event) => event.refundIntent?.claimId === linkedClaim.id),
+            ),
+          'This claim is already linked to a refund event.',
+          'CLAIM_REFUND_ALREADY_LINKED',
+        )
+        assert(
+          !state.claims.some((claim) =>
+            claim.id !== linkedClaim.id &&
+            (
+              claim.linkedRefundEventId === eventId ||
+              claim.resolutionReference === eventId
+            ),
+          ),
+          'This refund event identity is already linked to another claim.',
+          'REFUND_EVENT_ALREADY_LINKED',
+        )
+        assert(
+          Date.parse(now) >= Date.parse(linkedClaim.createdAt) &&
+            Date.parse(now) >= Date.parse(linkedClaim.updatedAt),
+          'A linked refund event cannot be recorded before the approved claim history.',
+          'REFUND_BEFORE_CLAIM',
+        )
+      }
       const before = { status: payment.status, refundedSen: payment.refundedSen }
       payment.refundedSen += amountSen
       const full = payment.refundedSen === payment.amountSen
       payment.status = transitionPayment(payment.status, full ? 'refunded' : 'partially_refunded')
-      const now = this.now()
       payment.updatedAt = now
-      const eventId = makeId('evt', cleanRequestId)
       payment.events.push({
         id: eventId,
         requestId: cleanRequestId,
@@ -593,10 +656,10 @@ export class MockPaymentGateway {
           paymentId: payment.id,
           amountSen,
           reason: cleanReason,
+          ...(cleanClaimId !== undefined ? { claimId: cleanClaimId } : {}),
         },
       })
-      const order = state.orders.find((entry) => entry.id === payment.orderId)
-      if (order && full && order.status !== 'refunded') {
+      if (full && order.status !== 'refunded') {
         const financialReason = sanitizeText(`${cleanReason}; prize allocation retained`, 240)
         this.financialSafety.stop(
           state,
@@ -619,8 +682,42 @@ export class MockPaymentGateway {
         requestId: cleanRequestId,
         eventId,
         before,
-        after: { status: payment.status, refundedSen: payment.refundedSen, allocationsReturned: 0 },
+        after: {
+          allocationsReturned: 0,
+          ...(cleanClaimId !== undefined ? { claimId: cleanClaimId } : {}),
+          refundedSen: payment.refundedSen,
+          status: payment.status,
+        },
       })
+      if (linkedClaim) {
+        linkedClaim.linkedRefundEventId = eventId
+        linkedClaim.updatedAt = now
+        linkedClaim.history.push({
+          id: `${linkedClaim.id}-h-${String(linkedClaim.history.length + 1).padStart(2, '0')}`,
+          status: linkedClaim.status,
+          note: claimRefundLinkedHistoryNote(eventId),
+          actorId: actor.id,
+          actorRole: actor.role,
+          at: now,
+        })
+        this.audit.append(state, {
+          actorId: actor.id,
+          actorRole: actor.role,
+          action: CLAIM_REFUND_LINK_ACTION,
+          targetType: 'claim',
+          targetId: linkedClaim.id,
+          reason: cleanReason,
+          at: now,
+          requestId: cleanRequestId,
+          eventId,
+          before: { linkedRefundEventId: null, status: 'approved' },
+          after: {
+            linkedRefundEventId: eventId,
+            paymentId: payment.id,
+            status: 'approved',
+          },
+        })
+      }
       return { payment, changed: true, message: full ? 'Full demo refund recorded.' : 'Partial demo refund recorded.' }
     })
   }

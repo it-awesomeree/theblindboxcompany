@@ -34,6 +34,11 @@ import {
 } from '../domain/claimStatus'
 import { deriveOrderStatusFromShipments } from '../domain/orderStatus'
 import { isValidPrizeDefinition } from '../domain/prizeValidation'
+import {
+  claimRefundLinkedHistoryNote,
+  matchingAppliedClaimRefundLinkAudit,
+  matchingAppliedPaymentRefundAudit,
+} from '../domain/refundLink'
 import type {
   Box,
   BoxStatus,
@@ -466,6 +471,7 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
     validateOrderFulfilment(state, order.id)
   }
 
+  const refundLinkedClaimIds: string[] = []
   for (const payment of state.payments) {
     assert(PAYMENT_STATUSES.has(payment.status), 'Payment status is invalid.')
     assert(PAYMENT_METHODS.has(payment.method as PaymentMethod), 'Payment method is invalid.')
@@ -492,6 +498,11 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
       assert(timestamp(event.processedAt) >= timestamp(event.createdAt), 'Payment processing cannot precede event creation.')
       if (event.refundIntent !== undefined) {
         assert(record(event.refundIntent), 'Refund intent must be a structured record.')
+        const hasClaimId = Object.prototype.hasOwnProperty.call(
+          event.refundIntent,
+          'claimId',
+        )
+        const claimId = event.refundIntent.claimId
         assert(
           ['partially_refunded', 'refunded'].includes(event.type) &&
             event.source === 'admin_reconcile' &&
@@ -504,6 +515,71 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
             sanitizeText(event.refundIntent.reason, 240) === event.refundIntent.reason,
           'Refund intent is invalid.',
         )
+        assert(
+          !hasClaimId ||
+            (
+              normalizedText(claimId, 120) &&
+              claimId === event.refundIntent.claimId
+            ),
+          'Refund intent claim link is invalid.',
+        )
+        if (claimId !== undefined) {
+          const claim = state.claims.find((entry) => entry.id === claimId)
+          assert(
+            claim &&
+              claim.orderId === payment.orderId &&
+              claim.userId === payment.userId &&
+              claim.linkedRefundEventId === event.id,
+            'Linked refund event must point to one same-order claim with a matching reverse link.',
+          )
+          assert(
+            event.ignoredReason === undefined &&
+              ['approved', 'resolved'].includes(claim.status) &&
+              (
+                claim.status !== 'resolved' ||
+                (
+                  claim.resolutionOutcome === 'refund_recorded' &&
+                  claim.resolutionReference === event.id
+                )
+              ),
+            'Linked refund event must be accepted and belong to an approved or refund-resolved claim.',
+          )
+          assert(
+            timestamp(event.createdAt) >= timestamp(claim.createdAt) &&
+              timestamp(event.processedAt) >= timestamp(claim.createdAt) &&
+              timestamp(claim.updatedAt) >= timestamp(event.processedAt),
+            'Linked refund event cannot precede its claim or end after the claim update.',
+          )
+          const paymentAudit = matchingAppliedPaymentRefundAudit(
+            state,
+            payment,
+            event,
+            claim,
+          )
+          const claimAudit = matchingAppliedClaimRefundLinkAudit(
+            state,
+            payment,
+            event,
+            claim,
+          )
+          assert(
+            paymentAudit,
+            'Linked refund event requires matching applied payment refund audit evidence.',
+          )
+          assert(
+            claimAudit &&
+              claimAudit.actorId === paymentAudit.actorId &&
+              claimAudit.actorRole === paymentAudit.actorRole &&
+              claim.history.some((entry) =>
+                entry.status === 'approved' &&
+                entry.note === claimRefundLinkedHistoryNote(event.id) &&
+                entry.actorId === claimAudit.actorId &&
+                entry.actorRole === claimAudit.actorRole &&
+                entry.at === event.processedAt),
+            'Linked refund event requires matching claim audit and immutable history evidence.',
+          )
+          refundLinkedClaimIds.push(claimId)
+        }
       }
     }
     chronological(payment.events.map((event) => event.processedAt), `Payment ${payment.id} events`)
@@ -540,6 +616,7 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
       assert(payment.refundedSen === 0, 'A non-refund payment status must have a zero refunded amount.')
     }
   }
+  unique(refundLinkedClaimIds, 'Refund-linked claim')
   unique(
     state.payments.flatMap((payment) => payment.events.map((event) => event.requestId)),
     'Payment event request',
@@ -677,6 +754,8 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
   }
 
   unique(state.claims.map((claim) => claim.requestId), 'Claim request')
+  const claimLinkedRefundEventIds: string[] = []
+  const refundResolutionReferences: string[] = []
   for (const claim of state.claims) {
     assert(CLAIM_KINDS.has(claim.kind) && CLAIM_STATUSES.has(claim.status), 'Claim kind or status is invalid.')
     const order = state.orders.find((entry) => entry.id === claim.orderId)
@@ -705,6 +784,57 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
     )
     assert(timestamp(claim.history.at(-1)!.at) <= timestamp(claim.updatedAt), 'Claim history cannot end after its updated time.')
     changedStatusesAreLegal(claim.history.map((entry) => entry.status), CLAIM_TRANSITIONS, `Claim ${claim.id}`)
+    const hasLinkedRefundEventId = Object.prototype.hasOwnProperty.call(
+      claim,
+      'linkedRefundEventId',
+    )
+    assert(
+      !hasLinkedRefundEventId || normalizedText(claim.linkedRefundEventId, 120),
+      'Claim reverse refund link is invalid.',
+    )
+    if (claim.linkedRefundEventId !== undefined) {
+      const eventMatches = state.payments.flatMap((payment) =>
+        payment.events
+          .filter((event) => event.id === claim.linkedRefundEventId)
+          .map((event) => ({ event, payment })),
+      )
+      assert(
+        eventMatches.length === 1,
+        'Claim reverse refund link must point to exactly one payment event.',
+      )
+      const { event, payment } = eventMatches[0]
+      assert(
+        payment.orderId === claim.orderId &&
+          payment.userId === claim.userId &&
+          event.refundIntent?.claimId === claim.id &&
+          event.refundIntent.paymentId === payment.id &&
+          event.source === 'admin_reconcile' &&
+          ['partially_refunded', 'refunded'].includes(event.type) &&
+          event.ignoredReason === undefined,
+        'Claim reverse refund link must point to its accepted same-order refund event.',
+      )
+      assert(
+        timestamp(event.createdAt) >= timestamp(claim.createdAt) &&
+          timestamp(event.processedAt) >= timestamp(claim.createdAt) &&
+          timestamp(claim.updatedAt) >= timestamp(event.processedAt),
+        'Claim-linked refund event cannot precede the claim or end after its update.',
+      )
+      assert(
+        claim.status === 'approved' ||
+          (
+            claim.status === 'resolved' &&
+            claim.resolutionOutcome === 'refund_recorded' &&
+            claim.resolutionReference === event.id
+          ),
+        'A refund-linked claim must remain approved or resolve with that exact refund event.',
+      )
+      assert(
+        matchingAppliedPaymentRefundAudit(state, payment, event, claim) &&
+          matchingAppliedClaimRefundLinkAudit(state, payment, event, claim),
+        'Claim reverse refund link requires matching applied payment and claim audit evidence.',
+      )
+      claimLinkedRefundEventIds.push(claim.linkedRefundEventId)
+    }
     const hasBoxLink = claim.boxId !== undefined
     const hasExactShipmentLink = claim.shipmentId !== undefined
     const hasOrderLevelCandidates = claim.shipmentCandidateIds !== undefined
@@ -876,26 +1006,35 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
         'Resolved claims require structured outcome, reference, and note evidence.',
       )
       if (claim.resolutionOutcome === 'refund_recorded') {
+        assert(
+          claim.linkedRefundEventId !== undefined &&
+            claim.resolutionReference === claim.linkedRefundEventId,
+          'Refund-recorded resolution must equal the claim reverse refund link.',
+        )
+        refundResolutionReferences.push(claim.resolutionReference)
         const payment = state.payments.find((entry) =>
           entry.orderId === claim.orderId &&
+          entry.userId === claim.userId &&
           entry.events.some((event) =>
             event.id === claim.resolutionReference &&
             !event.ignoredReason &&
-            Boolean(event.refundIntent) &&
+            event.refundIntent?.claimId === claim.id &&
             ['partially_refunded', 'refunded'].includes(event.type),
           ),
         )
+        const event = payment?.events.find((entry) =>
+          entry.id === claim.resolutionReference)
         assert(
           payment &&
-            state.audits.some((audit) =>
-              audit.targetType === 'payment' &&
-              audit.targetId === payment.id &&
-              audit.eventId === claim.resolutionReference &&
-              ['payment.partially_refunded', 'payment.refunded'].includes(audit.action),
-            ),
-          'Refund-recorded resolution must reference an audited refund event on the claim order.',
+            event &&
+            matchingAppliedPaymentRefundAudit(state, payment, event, claim),
+          'Refund-recorded resolution must reference its linked audited refund event.',
         )
       } else {
+        assert(
+          claim.linkedRefundEventId === undefined,
+          'Non-refund claim resolutions cannot carry a refund event link.',
+        )
         assert(
           /^DEMO-[A-Z0-9][A-Z0-9-]{2,96}$/.test(claim.resolutionReference!) &&
             claim.resolutionNote!.length >= 16,
@@ -909,6 +1048,8 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
       )
     }
   }
+  unique(claimLinkedRefundEventIds, 'Claim-linked refund event')
+  unique(refundResolutionReferences, 'Refund resolution reference')
   const openClaims = state.claims.filter((claim) => isOpenClaimStatus(claim.status))
   unique(
     openClaims.map((claim) => {

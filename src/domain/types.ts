@@ -167,6 +167,7 @@ export interface PaymentEvent {
     paymentId: string
     amountSen: number
     reason: string
+    claimId?: string
   }
 }
 
@@ -254,6 +255,7 @@ export interface Claim {
   resolutionNote?: string
   resolutionOutcome?: ClaimResolutionOutcome
   resolutionReference?: string
+  linkedRefundEventId?: string
   history: ClaimHistoryEntry[]
 }
 

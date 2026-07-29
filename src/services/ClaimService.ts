@@ -15,6 +15,7 @@ import {
   CLAIM_EVIDENCE_WIDENING_NOTE,
   isOpenClaimStatus,
 } from '../domain/claimStatus'
+import { matchingAppliedPaymentRefundAudit } from '../domain/refundLink'
 import type {
   Claim,
   ClaimKind,
@@ -432,24 +433,42 @@ export class ClaimService {
     const reference = sanitizeText(resolution.reference, 100)
     assert(reference.length >= 4, 'Enter the fictional resolution reference.', 'RESOLUTION_REFERENCE_REQUIRED')
     if (resolution.outcome === 'refund_recorded') {
+      assert(
+        claim.linkedRefundEventId && reference === claim.linkedRefundEventId,
+        'Refund resolution must use the exact refund event already linked to this claim.',
+        'RESOLUTION_REFUND_LINK_MISMATCH',
+      )
       const payment = state.payments.find((entry) =>
         entry.orderId === claim.orderId &&
+        entry.userId === claim.userId &&
         entry.events.some((event) =>
           event.id === reference &&
           !event.ignoredReason &&
-          Boolean(event.refundIntent) &&
+          event.source === 'admin_reconcile' &&
+          event.refundIntent?.paymentId === entry.id &&
+          event.refundIntent.claimId === claim.id &&
           ['partially_refunded', 'refunded'].includes(event.type),
         ),
       )
       const event = payment?.events.find((entry) => entry.id === reference)
-      const audited = Boolean(payment && event && state.audits.some((audit) =>
-        audit.targetType === 'payment' &&
-        audit.targetId === payment.id &&
-        audit.eventId === event.id &&
-        ['payment.partially_refunded', 'payment.refunded'].includes(audit.action),
-      ))
-      assert(audited, 'Refund resolution must reference an existing audited refund event for this order.', 'RESOLUTION_REFUND_MISSING')
+      const audited = Boolean(
+        payment &&
+        event &&
+        Date.parse(event.createdAt) >= Date.parse(claim.createdAt) &&
+        Date.parse(event.processedAt) >= Date.parse(claim.createdAt) &&
+        matchingAppliedPaymentRefundAudit(state, payment, event, claim),
+      )
+      assert(
+        audited,
+        'Refund resolution must reference this claim’s accepted and audited linked refund event.',
+        'RESOLUTION_REFUND_MISSING',
+      )
     } else {
+      assert(
+        claim.linkedRefundEventId === undefined,
+        'A claim linked to a refund event must use the refund-recorded resolution.',
+        'RESOLUTION_REFUND_LINK_MISMATCH',
+      )
       assert(
         /^DEMO-[A-Z0-9][A-Z0-9-]{2,96}$/.test(reference),
         'Replacement, RMA, and no-remedy references must be clearly fictional DEMO- codes.',
@@ -519,6 +538,9 @@ export class ClaimService {
             : {}),
           ...(claim.resolutionReference !== undefined
             ? { resolutionReference: claim.resolutionReference }
+            : {}),
+          ...(claim.linkedRefundEventId !== undefined
+            ? { linkedRefundEventId: claim.linkedRefundEventId }
             : {}),
           status: claim.status,
         },

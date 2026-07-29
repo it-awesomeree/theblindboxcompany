@@ -99,21 +99,24 @@ npm run verify
 npm run verify:all
 ```
 
-`npm run verify` performs the scanner self-test, full publishable-source
-accidental-secrets scan (including legacy and lockfile), zero-high dependency
-audit, lint, type check, unit tests and production build. `npm run verify:all`
-adds the complete Playwright matrix. Local `npm run e2e` uses installed Google
-Chrome and keeps the animated WebGL vault active. CI installs the Chromium
-build pinned by the exact Playwright 1.62.0 lockfile dependency and opens the
-same black/gold/cyan page with `?nogl=1`, exercising the faithful static vault
-fallback instead of the expensive raymarch renderer. The preview health-check
-URL stays query-free, and the query appears before the route hash. End-to-end
-checks include customer success, failure/retry, open-later/refresh, sealed-box
-tracking and eligible claims through structured admin resolution, protected
-admin operations, confirmed reset, keyboard/runtime WebGL fallback, full
-commerce/admin journeys at 360, 390, 430 and 768 pixels, input sizing,
-important element bounds and page-level overflow. The preview server never
-reuses an older running server.
+`npm run verify` runs the scanner self-test, then checks all files that Git
+could publish for accidental secrets (including legacy files and the lockfile).
+It then runs the dependency, code and unit checks, makes one production build,
+and checks that exact finished `dist` folder for accidental secrets. The Pages
+job uses the same already checked `dist` folder for browser tests and upload; it
+does not rebuild it.
+`npm run verify:all` adds the complete Playwright matrix. Local `npm run e2e`
+uses installed Google Chrome and keeps the animated WebGL vault active. CI
+installs the Chromium build pinned by the exact Playwright 1.62.0 lockfile
+dependency and opens the same black/gold/cyan page with `?nogl=1`, exercising
+the faithful static vault fallback instead of the expensive raymarch renderer.
+The preview health-check URL stays query-free, and the query appears before the
+route hash. End-to-end checks include customer success, failure/retry,
+open-later/refresh, sealed-box tracking and eligible claims through structured
+admin resolution, protected admin operations, confirmed reset,
+keyboard/runtime WebGL fallback, full commerce/admin journeys at 360, 390, 430
+and 768 pixels, input sizing, important element bounds and page-level overflow.
+The preview server never reuses an older running server.
 
 Historical pre-merge local verification from 2026-07-28:
 
@@ -209,6 +212,20 @@ It browser-tested the exact `dist` folder with lockfile-pinned Chromium, then
 uploaded and deployed that same folder without a second build. This does not
 turn the demo into a secure shop. The app keeps `noindex,nofollow`, copies
 `.nojekyll`, uses fake fixtures, and contains no secret.
+
+The production build now adds a strict Content Security Policy (CSP) meta tag
+and a `no-referrer` meta tag to the published HTML. They are not in the source
+`index.html`, so they do not interfere with the local development connection.
+The meta CSP is only an extra safety layer for this demo.
+
+GitHub Pages cannot add the custom response headers that a real shop needs.
+This demo therefore cannot provide response-header CSP,
+`X-Content-Type-Options`, `Permissions-Policy`, or dependable protection
+against another site framing it. Browsers ignore `frame-ancestors` in a meta
+CSP, and `X-Frame-Options` cannot be set with a meta tag. HSTS is supplied by
+the GitHub Pages platform when HTTPS enforcement is enabled; it is not supplied
+by this app. A real production host or proxy must control and test all security
+response headers.
 
 **PRODUCTION LAUNCH: STOP.** Before any real commercial launch, use the separate backend described in
 `docs/PRODUCTION_BACKEND.md`, obtain Malaysian legal/compliance advice, verify

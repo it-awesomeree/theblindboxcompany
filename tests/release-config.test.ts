@@ -1,6 +1,12 @@
 import { readdirSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
+import {
+  PRODUCTION_CONTENT_SECURITY_POLICY,
+  PRODUCTION_REFERRER_POLICY,
+  productionSecurityMetadataPlugin,
+  productionSecurityMetaTags,
+} from '../vite-security-metadata'
 
 const read = (path: string) => readFileSync(resolve(process.cwd(), path), 'utf8')
 
@@ -26,9 +32,78 @@ function luminance(hex: string) {
 }
 
 describe('release and responsive safety configuration', () => {
+  it('defines the exact production CSP and no-referrer contract', () => {
+    expect(PRODUCTION_CONTENT_SECURITY_POLICY).toBe(
+      "default-src 'none'; base-uri 'none'; script-src 'self'; style-src 'self'; " +
+      "img-src 'self' data:; font-src 'none'; connect-src 'none'; object-src 'none'; " +
+      "media-src 'none'; frame-src 'none'; worker-src 'none'; manifest-src 'none'; " +
+      "form-action 'none'",
+    )
+    expect(PRODUCTION_REFERRER_POLICY).toBe('no-referrer')
+  })
+
+  it('injects exactly one of each security meta tag at the start of the built head', () => {
+    const tags = productionSecurityMetaTags()
+    const cspTags = tags.filter(
+      (tag) => tag.tag === 'meta' &&
+        tag.attrs?.['http-equiv'] === 'Content-Security-Policy',
+    )
+    const referrerTags = tags.filter(
+      (tag) => tag.tag === 'meta' && tag.attrs?.name === 'referrer',
+    )
+
+    expect(tags).toHaveLength(2)
+    expect(cspTags).toHaveLength(1)
+    expect(cspTags[0].attrs?.content).toBe(PRODUCTION_CONTENT_SECURITY_POLICY)
+    expect(referrerTags).toHaveLength(1)
+    expect(referrerTags[0].attrs?.content).toBe(PRODUCTION_REFERRER_POLICY)
+    expect(tags.every((tag) => tag.injectTo === 'head-prepend')).toBe(true)
+  })
+
+  it('keeps security metadata build-only and out of the source HTML used by development', () => {
+    const plugin = productionSecurityMetadataPlugin()
+    const viteConfig = read('vite.config.ts')
+    const sourceHtml = read('index.html')
+
+    expect(plugin.apply).toBe('build')
+    expect(plugin.transformIndexHtml).toBe(productionSecurityMetaTags)
+    expect(viteConfig).toContain('productionSecurityMetadataPlugin(),')
+    expect(sourceHtml).not.toMatch(/content-security-policy/i)
+    expect(sourceHtml).not.toMatch(/<meta\b(?=[^>]*\bname=["']referrer["'])[^>]*>/i)
+  })
+
+  it('runs release checks once in order and scans the completed dist last', () => {
+    const packageJson = JSON.parse(read('package.json')) as {
+      scripts: Record<string, string>
+    }
+    const verifyCommands = packageJson.scripts.verify.split(' && ')
+
+    expect(packageJson.scripts['secrets:check:dist']).toBe(
+      'node scripts/check-secrets.mjs --dist',
+    )
+    expect(packageJson.scripts['audit:release'].split(' && ')).toEqual([
+      'npm audit --audit-level=moderate',
+      'npm audit --omit=dev --audit-level=moderate',
+    ])
+    expect(verifyCommands).toEqual([
+      'npm run secrets:test',
+      'npm run secrets:check',
+      'npm run audit:release',
+      'npm run lint',
+      'npm run typecheck',
+      'npm run test',
+      'npm run build',
+      'npm run secrets:check:dist',
+    ])
+    expect(verifyCommands.filter((command) => command === 'npm run build')).toHaveLength(1)
+    expect(verifyCommands.at(-1)).toBe('npm run secrets:check:dist')
+  })
+
   it('builds Pages once, browser-tests that exact dist, then uploads and deploys the same artifact', () => {
     const workflow = read('.github/workflows/pages.yml')
+    const buildTestUpload = jobSection(workflow, 'build-test-upload')
     expect(workflow).not.toContain('workflow_dispatch')
+    expect(workflow).not.toContain('schedule:')
     expect(workflow).toMatch(/push:\s*\n\s+branches:\s*\n\s+- main/)
     expect(workflow).toMatch(/^permissions:\s*\n\s+contents: read/m)
     const [beforeDeploy, deployJob] = workflow.split(/^ {2}deploy:/m)
@@ -39,12 +114,49 @@ describe('release and responsive safety configuration', () => {
     expect(workflow).toContain('build-test-upload:')
     expect(workflow).not.toContain('chrome-e2e:')
     expect(workflow.match(/npm run verify/g)).toHaveLength(1)
-    expect(workflow).not.toContain('npm run build')
-    expect(workflow).toContain('npm run e2e:dist')
-    expect(workflow.indexOf('npm run verify')).toBeLessThan(workflow.indexOf('npm run e2e:dist'))
-    expect(workflow.indexOf('npm run e2e:dist')).toBeLessThan(workflow.indexOf('actions/upload-pages-artifact'))
-    expect(workflow).toMatch(/upload-pages-artifact@[^\n]+[\s\S]*?path: dist/)
+    expect(buildTestUpload).not.toContain('npm run build')
+    expect(buildTestUpload.match(/npm run e2e:dist/g)).toHaveLength(1)
+    expect(buildTestUpload.indexOf('npm run verify')).toBeLessThan(
+      buildTestUpload.indexOf('npm run e2e:dist'),
+    )
+    expect(buildTestUpload.indexOf('npm run e2e:dist')).toBeLessThan(
+      buildTestUpload.indexOf('actions/upload-pages-artifact'),
+    )
+    expect(buildTestUpload.slice(buildTestUpload.indexOf('npm run verify')))
+      .not.toContain('npm run build')
+    expect(buildTestUpload).toMatch(/upload-pages-artifact@[^\n]+[\s\S]*?path: dist/)
     expect(deployJob).toContain('needs: build-test-upload')
+  })
+
+  it('schedules CI weekly in UTC without scheduling Pages deployments', () => {
+    const ci = read('.github/workflows/ci.yml')
+    const pages = read('.github/workflows/pages.yml')
+    const schedules = [...ci.matchAll(/cron:\s*['"]([^'"]+)['"]/g)]
+
+    expect(ci).toContain('pull_request:')
+    expect(ci).toContain('push:')
+    expect(schedules).toHaveLength(1)
+    expect(schedules[0][1]).toMatch(/^\d+ \d+ \* \* [0-6]$/)
+    expect(pages).not.toContain('schedule:')
+  })
+
+  it('checks npm and GitHub Actions dependencies weekly without auto-merge', () => {
+    const dependabot = read('.github/dependabot.yml')
+    const updates = [...dependabot.matchAll(
+      /- package-ecosystem: "([^"]+)"([\s\S]*?)(?=\n {2}- package-ecosystem:|$)/g,
+    )]
+
+    expect(dependabot).toMatch(/^version: 2$/m)
+    expect(updates.map(([, ecosystem]) => ecosystem)).toEqual(['npm', 'github-actions'])
+    for (const [, , settings] of updates) {
+      expect(settings).toMatch(/directory: "\/"/)
+      expect(settings).toMatch(/schedule:\s*\n\s+interval: "weekly"/)
+      const pullRequestLimit = settings.match(/open-pull-requests-limit: (\d+)/)
+      expect(pullRequestLimit).not.toBeNull()
+      expect(Number(pullRequestLimit?.[1])).toBeGreaterThan(0)
+      expect(Number(pullRequestLimit?.[1])).toBeLessThanOrEqual(5)
+    }
+    expect(dependabot).not.toMatch(/auto[-_]?merge/i)
   })
 
   it('keeps the root error boundary outside provider construction', () => {

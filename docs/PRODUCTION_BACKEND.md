@@ -201,6 +201,22 @@ alone.
 
 ## Secrets and deployment
 
+For this public demo, `npm run verify` checks the files Git could publish, makes
+one production build, and then checks the exact finished `dist` folder. The
+Pages job browser-tests and uploads that same checked folder without rebuilding
+it. The production build adds CSP and `no-referrer` metadata to the published
+HTML; the source `index.html` used during development does not contain those
+tags. The meta CSP is defense-in-depth only, meaning it is one extra safety
+layer and not a complete security boundary.
+
+GitHub Pages cannot add custom security response headers. This demo cannot
+provide response-header CSP, `X-Content-Type-Options`, `Permissions-Policy`, or
+reliable anti-framing protection. Browsers ignore `frame-ancestors` when it is
+placed in a meta CSP, and `X-Frame-Options` cannot be set through a meta tag.
+HSTS comes from the GitHub Pages platform when its HTTPS enforcement is
+enabled. A real production host or proxy must control, test and monitor the
+response headers.
+
 - Store HitPay keys/salt, Supabase service-role key, mail and courier credentials
   only in the production host’s encrypted secret manager.
 - Never use a `VITE_` or public browser variable for a secret.
@@ -208,8 +224,10 @@ alone.
   refund/admin activity.
 - Protect deploy branches, require review, run migrations separately, and keep a
   tested rollback.
-- Add CSP, HSTS, secure cookies, CSRF protections where applicable, dependency
-  scanning and regular penetration/security review.
+- Add response-header CSP, HSTS, `X-Content-Type-Options`,
+  `Permissions-Policy`, anti-framing controls, secure cookies, CSRF protections
+  where applicable, dependency scanning and regular penetration/security
+  review.
 
 ## Mail, shipping and operations
 

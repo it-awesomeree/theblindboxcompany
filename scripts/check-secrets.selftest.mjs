@@ -1,5 +1,21 @@
 import assert from 'node:assert/strict'
-import { SECRET_PATTERNS, scanPublishableFiles, scanText } from './check-secrets.mjs'
+import {
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import {
+  collectDistFiles,
+  scanDistDirectory,
+  SECRET_PATTERNS,
+  scanPublishableFiles,
+  scanText,
+} from './check-secrets.mjs'
 
 const fixtures = [
   ['private key', ['-----BEGIN ', 'PRIVATE KEY-----'].join('')],
@@ -51,6 +67,56 @@ assert.deepEqual(
   scanPublishableFiles(['public/binary-reference.png'], () => Buffer.from([1, 0, 2])),
   { findings: [], scanned: 0 },
 )
+
+const temporaryRoot = mkdtempSync(join(tmpdir(), 'check-secrets-'))
+try {
+  const dist = join(temporaryRoot, 'dist')
+  const nested = join(dist, 'assets', 'nested')
+  mkdirSync(nested, { recursive: true })
+  writeFileSync(join(dist, 'z-last.txt'), 'safe release text')
+  writeFileSync(join(dist, 'a-first.txt'), 'safe release text')
+  writeFileSync(join(dist, 'assets', 'middle.txt'), 'safe release text')
+  writeFileSync(join(nested, 'binary.bin'), Buffer.from([1, 0, 2]))
+
+  assert.deepEqual(collectDistFiles(dist), [
+    join(dist, 'a-first.txt'),
+    join(dist, 'assets', 'middle.txt'),
+    join(nested, 'binary.bin'),
+    join(dist, 'z-last.txt'),
+  ])
+  assert.deepEqual(scanDistDirectory(dist), { findings: [], scanned: 3 })
+
+  const fakeSecretFile = join(nested, 'constructed-secret.txt')
+  writeFileSync(fakeSecretFile, ['CLIENT_', 'SECRET="', 'x'.repeat(24), '"'].join(''))
+  assert.deepEqual(scanDistDirectory(dist).findings, [
+    `${fakeSecretFile}: possible assigned secret`,
+  ])
+
+  const missing = join(temporaryRoot, 'missing-dist')
+  assert.throws(() => collectDistFiles(missing))
+  const notDirectory = join(temporaryRoot, 'dist-file')
+  writeFileSync(notDirectory, 'not a directory')
+  assert.throws(() => collectDistFiles(notDirectory), /must be a real directory/)
+
+  const symlink = join(dist, 'linked-file')
+  let symlinkSupported = true
+  try {
+    symlinkSync(join(dist, 'a-first.txt'), symlink)
+  } catch (error) {
+    symlinkSupported = false
+    assert(
+      error && typeof error === 'object' && 'code' in error,
+      'symlink creation failed without an operating-system error code',
+    )
+  }
+  if (symlinkSupported) {
+    assert(lstatSync(symlink).isSymbolicLink())
+    assert.throws(() => collectDistFiles(dist), /symbolic links are not allowed/)
+  }
+} finally {
+  rmSync(temporaryRoot, { recursive: true, force: true })
+}
+
 process.stdout.write(
-  `Accidental-secrets scanner self-test passed (${SECRET_PATTERNS.length} declared credential patterns, two HitPay header syntaxes, a benign hash, fail-closed reads and binary skipping).\n`,
+  `Accidental-secrets scanner self-test passed (${SECRET_PATTERNS.length} declared credential patterns, dist recursion, findings, fail-closed paths and binary skipping).\n`,
 )

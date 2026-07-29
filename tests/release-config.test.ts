@@ -225,6 +225,35 @@ describe('release and responsive safety configuration', () => {
     expect(config).toContain('reuseExistingServer: false')
   })
 
+  it('keeps all six responsive browser projects at their exact release viewports', () => {
+    const config = read('playwright.config.ts')
+    const projects = config
+      .split('\n')
+      .filter((line) => line.includes("{ name: '"))
+      .map((line) => {
+        const match = line.match(
+          /name: '([^']+)'.*viewport: \{ width: (\d+), height: (\d+) \}(.*)$/,
+        )
+        if (!match) throw new Error(`Could not read responsive project: ${line.trim()}`)
+        return {
+          name: match[1],
+          width: Number(match[2]),
+          height: Number(match[3]),
+          isMobile: match[4].includes('isMobile: true'),
+          hasTouch: match[4].includes('hasTouch: true'),
+        }
+      })
+
+    expect(projects).toEqual([
+      { name: 'chrome-desktop', width: 1440, height: 900, isMobile: false, hasTouch: false },
+      { name: 'mobile-320', width: 320, height: 568, isMobile: true, hasTouch: true },
+      { name: 'mobile-360', width: 360, height: 800, isMobile: true, hasTouch: true },
+      { name: 'mobile-390', width: 390, height: 844, isMobile: true, hasTouch: true },
+      { name: 'mobile-430', width: 430, height: 932, isMobile: true, hasTouch: true },
+      { name: 'tablet-768', width: 768, height: 1024, isMobile: true, hasTouch: true },
+    ])
+  })
+
   it('disables checkout credential persistence without changing pinned actions', () => {
     const workflows = readdirSync(resolve(process.cwd(), '.github/workflows'))
       .filter((name) => /\.ya?ml$/.test(name))

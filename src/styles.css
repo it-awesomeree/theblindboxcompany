@@ -3736,6 +3736,124 @@ legend {
   }
 }
 
+@media (max-width: 820px) {
+  label {
+    font-size: .75rem;
+  }
+
+  label > span:not(.sr-only) {
+    font-size: .75rem;
+  }
+
+  label small {
+    font-size: .6875rem;
+  }
+
+  input,
+  select,
+  textarea {
+    font-size: 1rem !important;
+  }
+
+  button,
+  a.button,
+  .nav-links a,
+  .nav-action,
+  .admin-nav a,
+  .admin-shortcuts a,
+  .queue-list > a,
+  .table-action,
+  .subsection-heading > a,
+  summary {
+    min-height: 44px;
+  }
+
+  .demo-banner,
+  .brand-name,
+  .nav-links a,
+  .nav-action,
+  .nav-count,
+  .nav-user,
+  .recovery-note,
+  .eyebrow,
+  .panel-heading span,
+  .subsection-heading span,
+  .admin-heading span,
+  .admin-bar span,
+  .panel-heading > small,
+  .status,
+  legend,
+  .dialog-code,
+  .hologram > div,
+  .hologram > p,
+  .hologram footer,
+  .ticker > div,
+  .section-code,
+  .data-table th,
+  .data-table tfoot td,
+  .tier,
+  .table-note,
+  .manifest header span,
+  .manifest footer,
+  .steps-grid article > span,
+  .steps-grid small,
+  .final-cta > .content > strong,
+  .action-tile > span,
+  .order-summary > small,
+  .mock-provider-bar,
+  .payment-amount span,
+  .payment-amount small,
+  .method-code,
+  .return-proof span,
+  .timeline small,
+  .mini-timeline small,
+  .subsection-heading > small,
+  .subsection-heading > a,
+  .box-number,
+  .box-icon span,
+  .shipment-flags span,
+  .reveal-topline,
+  .result-code,
+  .result-identifiers,
+  .result-value span,
+  .metric-grid span,
+  .metric-grid small,
+  .attention-strip span,
+  .account-order header span,
+  .account-order-grid span,
+  .account-order-grid .sealed-delivery-summary .tracking-code,
+  .account-prizes span,
+  .admin-bar b,
+  .admin-nav a,
+  .admin-nav p,
+  .admin-shortcuts span,
+  .admin-table td small,
+  .table-action,
+  .filter-bar button,
+  .admin-record > summary small,
+  .record-detail-grid h3,
+  .event-list small,
+  .inventory-summary span,
+  .audit-entry span,
+  .audit-entry small,
+  .audit-entry summary,
+  .audit-entry pre,
+  .footer-grid > div > b,
+  .footer-legal,
+  .footer-legal button,
+  .demo-banner span,
+  .hero-copy > p,
+  .prize-table td:nth-child(4),
+  .prize-table td:nth-child(5),
+  .manifest,
+  .manifest > p,
+  .manifest-stamp,
+  .admin-table td::before,
+  .mobile-buy-bar small {
+    font-size: .6875rem;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

@@ -9,6 +9,7 @@ import {
   canTransitionBox,
   canTransitionPayment,
   canTransitionShipment,
+  canTransitionShipmentForKind,
   transitionBox,
   transitionBoxForReveal,
   transitionBoxForShipment,
@@ -30,8 +31,12 @@ import {
 } from '../src/domain/fulfillmentEligibility'
 import { createDemoState } from '../src/data/fixtures'
 import { exactOddsLabel } from '../src/domain/odds'
-import { valueFloorClaimEligibility } from '../src/domain/claimEligibility'
+import {
+  shipmentClaimEligibility,
+  valueFloorClaimEligibility,
+} from '../src/domain/claimEligibility'
 import { sealedCustomerTimeline } from '../src/domain/orderTimeline'
+import { resolveOrderFulfillment } from '../src/domain/orderFulfillment'
 
 describe('Series 001 and domain guards', () => {
   it('has exactly 10,000 fixed allocations and every value clears RM100', () => {
@@ -72,6 +77,55 @@ describe('Series 001 and domain guards', () => {
       })
     expect(valueFloorClaimEligibility(revealed, '2026-07-18T07:59:59.999Z').eligible)
       .toBe(false)
+  })
+
+  it('uses failed or three-day overdue sent evidence for digital non-delivery and never damage', () => {
+    const sent = structuredClone(
+      createDemoState().shipments.find((shipment) => shipment.id === 'shp-digital')!,
+    )
+    sent.status = 'sent'
+    sent.timeline.push(
+      {
+        id: 'digital-issued-eligibility',
+        status: 'issued',
+        label: 'Digital issued',
+        at: '2026-07-24T00:00:00.000Z',
+      },
+      {
+        id: 'digital-sent-eligibility',
+        status: 'sent',
+        label: 'Digital sent',
+        at: '2026-07-25T00:00:00.000Z',
+      },
+    )
+    expect(shipmentClaimEligibility(
+      sent,
+      'non_delivery',
+      '2026-07-27T23:59:59.999Z',
+    ).eligible).toBe(false)
+    expect(shipmentClaimEligibility(
+      sent,
+      'non_delivery',
+      '2026-07-28T00:00:00.000Z',
+    ).eligible).toBe(true)
+    expect(shipmentClaimEligibility(sent, 'damage', '2026-07-28T00:00:00.000Z'))
+      .toEqual({
+        eligible: false,
+        reason: 'A digital fulfilment cannot have physical damage.',
+      })
+
+    sent.status = 'failed'
+    sent.timeline.push({
+      id: 'digital-failed-eligibility',
+      status: 'failed',
+      label: 'Digital failed',
+      at: '2026-07-28T00:00:00.000Z',
+    })
+    expect(shipmentClaimEligibility(
+      sent,
+      'non_delivery',
+      '2026-07-28T00:00:00.000Z',
+    ).eligible).toBe(true)
   })
 
   it('shows one neutral resolution after a sealed dispute without mutating or leaking stored reasons', () => {
@@ -160,6 +214,10 @@ describe('Series 001 and domain guards', () => {
     expect(canTransitionOrder('refunded', 'processing')).toBe(false)
     expect(canTransitionShipment('packed', 'label_created')).toBe(true)
     expect(canTransitionShipment('delivered', 'picking')).toBe(false)
+    expect(canTransitionShipmentForKind('DIGITAL', 'unfulfilled', 'issued')).toBe(true)
+    expect(canTransitionShipmentForKind('DIGITAL', 'unfulfilled', 'picking')).toBe(false)
+    expect(canTransitionShipmentForKind('PARCEL', 'unfulfilled', 'issued')).toBe(false)
+    expect(canTransitionShipmentForKind('PARCEL', 'failed_delivery', 'shipped')).toBe(false)
   })
 
   it('guards box transitions while keeping reveal and shipment independent', () => {
@@ -186,6 +244,28 @@ describe('Series 001 and domain guards', () => {
     expect(deriveOrderStatusFromShipments(['delivered', 'delivered'])).toBe('fulfilled')
   })
 
+  it('derives state-aware original scopes without counting replacement rows as extra work', () => {
+    const state = createDemoState()
+    const original = state.shipments.find((shipment) => shipment.id === 'shp-digital')!
+    state.shipments.push({
+      ...structuredClone(original),
+      id: 'shp-demo-replacement-row',
+      purpose: 'replacement',
+      sourceClaimId: 'clm-demo-replacement-row',
+      replacementForShipmentId: original.id,
+      trackingNumber: 'DEMO-REPLACEMENT-ROW',
+    })
+
+    const resolution = resolveOrderFulfillment(state, 'ord-processing')
+
+    expect(resolution.scopes.map((scope) => scope.originalShipmentId)).toEqual([
+      'shp-processing',
+      'shp-digital',
+    ])
+    expect(resolution.scopes).toHaveLength(2)
+    expect(resolution.status).toBe('processing')
+  })
+
   it('keeps split-sensitive order progress neutral until customer details unlock', () => {
     expect(neutralOrderDeliveryStatus('confirmed')).toBe('delivery_preparing')
     expect(neutralOrderDeliveryStatus('processing')).toBe('delivery_in_progress')
@@ -209,7 +289,7 @@ describe('Series 001 and domain guards', () => {
   it('hides all digital fulfilment actions on financial hold but keeps legal physical evidence', () => {
     const state = createDemoState()
     const digital = state.shipments.find((shipment) => shipment.id === 'shp-digital')!
-    digital.status = 'shipped'
+    digital.status = 'sent'
     const physical = state.shipments.find((shipment) => shipment.id === 'shp-shipped')!
 
     for (const hold of ['cancelled', 'refunded', 'disputed'] as const) {

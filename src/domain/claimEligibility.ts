@@ -22,6 +22,9 @@ export function shipmentClaimEligibility(
   kind: Extract<ClaimKind, 'damage' | 'non_delivery'>,
   at: string,
 ): ClaimEligibility {
+  if (shipment.purpose !== 'original') {
+    return { eligible: false, reason: 'Claims must use the immutable original fulfilment record.' }
+  }
   const events = shipment.timeline.filter((entry) => time(entry.at) <= time(at))
   const status = historicalShipmentStatus(shipment, at)
 
@@ -35,7 +38,20 @@ export function shipmentClaimEligibility(
   }
 
   if (shipment.kind === 'DIGITAL') {
-    return { eligible: false, reason: 'A digital fulfilment cannot have physical non-delivery.' }
+    if (status === 'failed') {
+      return { eligible: true, reason: 'This digital delivery record contains failed delivery evidence.' }
+    }
+    if (status !== 'sent') {
+      return {
+        eligible: false,
+        reason: 'Digital non-delivery requires a failed or sent delivery record.',
+      }
+    }
+    const sentAt = events.filter((entry) => entry.status === 'sent').at(-1)?.at
+    if (!sentAt || !Number.isFinite(time(at)) || time(at) - time(sentAt) < SHIPPED_OVERDUE_MS) {
+      return { eligible: false, reason: 'A sent digital delivery must be at least three demo days overdue.' }
+    }
+    return { eligible: true, reason: 'This sent digital delivery is at least three demo days overdue.' }
   }
   if (events.some((entry) => entry.status === 'delivered')) {
     return {

@@ -24,6 +24,18 @@ import {
 let checkoutSequence = 0
 const nextCheckoutRequestId = () => `checkout_f${(++checkoutSequence).toString(16).padStart(31, '0')}`
 
+class FailNextWriteStorage extends MemoryStorage {
+  failNextWrite = false
+
+  setItem(key: string, value: string) {
+    if (this.failNextWrite) {
+      this.failNextWrite = false
+      throw new Error('write blocked for atomic service test')
+    }
+    super.setItem(key, value)
+  }
+}
+
 function checkout(services: AppServices, quantity = 1, requestId = nextCheckoutRequestId()) {
   services.auth.oneClick('customer')
   services.orders.setCartQuantity(quantity)
@@ -972,36 +984,516 @@ describe('customer, payment, allocation and admin services', () => {
     }
   })
 
-  it('keeps repeated legal shipment cycles collision-proof with a fixed clock', () => {
+  it('blocks failed-original redelivery cycles without rewriting immutable evidence', () => {
     services.auth.oneClick('admin')
     services.fulfilment.advance('shp-shipped', 'failed_delivery', 'Confirmed first fixed-clock delivery exception')
-    services.fulfilment.advance('shp-shipped', 'shipped', 'Confirmed fixed-clock delivery retry')
-    services.fulfilment.advance('shp-shipped', 'failed_delivery', 'Confirmed repeated fixed-clock delivery exception')
+    const beforeBlockedRetry = structuredClone(services.repository.getSnapshot())
+    expect(() => services.fulfilment.advance(
+      'shp-shipped',
+      'shipped',
+      'Confirmed forbidden fixed-clock original retry',
+    )).toThrow(expect.objectContaining({ code: 'INVALID_TRANSITION' }))
 
     const snapshot = services.repository.getSnapshot()
     const shipment = snapshot.shipments.find((entry) => entry.id === 'shp-shipped')!
     const order = snapshot.orders.find((entry) => entry.id === shipment.orderId)!
-    expect(shipment.timeline.slice(-3).map((entry) => entry.status)).toEqual(['failed_delivery', 'shipped', 'failed_delivery'])
+    expect(snapshot).toEqual(beforeBlockedRetry)
+    expect(shipment.timeline.at(-1)?.status).toBe('failed_delivery')
     expect(new Set(shipment.timeline.map((entry) => entry.id)).size).toBe(shipment.timeline.length)
     expect(new Set(order.timeline.map((entry) => entry.id)).size).toBe(order.timeline.length)
-    expect(snapshot.nextSequence).toBe(1003)
     expect(() => validateDemoState(snapshot)).not.toThrow()
   })
 
-  it('accepts failed_delivery to shipped to delivered and derives fulfilment exactly', () => {
+  it('delivers a separately linked replacement without changing the failed original', () => {
+    services.auth.oneClick('customer')
+    const claim = services.claims.submit({
+      orderId: 'ord-failed',
+      kind: 'non_delivery',
+      shipmentId: 'shp-failed',
+      note: 'DEMO failed original needs a separate replacement',
+    }).data
     services.auth.oneClick('admin')
-    services.fulfilment.advance('shp-failed', 'shipped', 'Confirmed redelivery after failed delivery')
-    services.fulfilment.advance('shp-failed', 'delivered', 'Confirmed successful redelivery completion')
+    services.claims.review(claim.id, 'acknowledge', 'Confirmed replacement review acknowledgement')
+    services.claims.review(claim.id, 'approve', 'Confirmed replacement review approval')
+    expect(() => services.claims.createRma(
+      claim.id,
+      'DEMO-RMA-NOT-DELIVERED',
+      'Attempted RMA for an undelivered original',
+    )).toThrow(expect.objectContaining({ code: 'RMA_PHYSICAL_DELIVERY_REQUIRED' }))
+    const replacement = services.claims.authorizeReplacement(
+      claim.id,
+      'Confirmed exact-scope replacement authorization',
+    ).data
+    for (const status of ['picking', 'packed', 'label_created', 'shipped', 'delivered'] as const) {
+      services.fulfilment.advance(
+        replacement.id,
+        status,
+        `Confirmed replacement ${status} evidence`,
+      )
+    }
 
     const snapshot = services.repository.getSnapshot()
-    expect(snapshot.shipments.find((entry) => entry.id === 'shp-failed')?.timeline.slice(-3).map((entry) => entry.status)).toEqual([
-      'failed_delivery',
-      'shipped',
-      'delivered',
-    ])
+    expect(snapshot.shipments.find((entry) => entry.id === 'shp-failed')?.status).toBe('failed_delivery')
+    expect(snapshot.shipments.find((entry) => entry.id === replacement.id)).toMatchObject({
+      purpose: 'replacement',
+      sourceClaimId: claim.id,
+      replacementForShipmentId: 'shp-failed',
+      status: 'delivered',
+    })
+    expect(snapshot.claims.find((entry) => entry.id === claim.id)).toMatchObject({
+      status: 'resolved',
+      remedyState: 'replacement_delivered',
+      replacementShipmentId: replacement.id,
+      resolutionReference: replacement.id,
+    })
     expect(snapshot.orders.find((entry) => entry.id === 'ord-failed')?.status).toBe('fulfilled')
-    expect(snapshot.boxes.find((entry) => entry.id === 'box-failed-01')?.status).toBe('fulfilled')
+    expect(snapshot.boxes.find((entry) => entry.id === 'box-failed-01')).toMatchObject({
+      status: 'fulfilled',
+      shipmentId: 'shp-failed',
+    })
     expect(() => validateDemoState(snapshot)).not.toThrow()
+  })
+
+  it('preserves a replacement through a dispute stop and resumes it before delivery', () => {
+    const isolated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    isolated.auth.oneClick('customer')
+    const claim = isolated.claims.submit({
+      orderId: 'ord-failed',
+      kind: 'non_delivery',
+      shipmentId: 'shp-failed',
+      note: 'DEMO disputed replacement keeps immutable original evidence',
+    }).data
+    isolated.auth.oneClick('admin')
+    isolated.claims.review(claim.id, 'acknowledge', 'Confirmed disputed replacement acknowledgement')
+    isolated.claims.review(claim.id, 'approve', 'Confirmed disputed replacement approval')
+    const replacement = isolated.claims.authorizeReplacement(
+      claim.id,
+      'Confirmed disputed replacement authorization',
+    ).data
+
+    isolated.payments.dispute(
+      'pay-failed',
+      'Confirmed replacement financial dispute stop',
+      'evt-replacement-dispute-stop',
+    )
+    expect(isolated.repository.getSnapshot().shipments
+      .find((entry) => entry.id === replacement.id)?.status).toBe('cancelled')
+    expect(isolated.repository.getSnapshot().orders
+      .find((entry) => entry.id === 'ord-failed')?.status).toBe('disputed')
+
+    isolated.payments.resolveDispute(
+      'pay-failed',
+      'merchant_won',
+      'Confirmed replacement financial dispute resume',
+      'evt-replacement-dispute-resume',
+    )
+    expect(isolated.repository.getSnapshot().shipments
+      .find((entry) => entry.id === replacement.id)?.status).toBe('unfulfilled')
+    for (const status of ['picking', 'packed', 'label_created', 'shipped', 'delivered'] as const) {
+      isolated.fulfilment.advance(
+        replacement.id,
+        status,
+        `Confirmed resumed replacement ${status}`,
+      )
+    }
+    const snapshot = isolated.repository.getSnapshot()
+    expect(snapshot.shipments.find((entry) => entry.id === 'shp-failed')?.status)
+      .toBe('failed_delivery')
+    expect(snapshot.claims.find((entry) => entry.id === claim.id)).toMatchObject({
+      status: 'resolved',
+      remedyState: 'replacement_delivered',
+    })
+    expect(snapshot.orders.find((entry) => entry.id === 'ord-failed')?.status)
+      .toBe('fulfilled')
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+  })
+
+  it('records ordered RMA evidence with role guards, exact replay, and inspected completion', () => {
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    let rmaNow = FIXED_NOW
+    const isolated = new AppServices(storage, () => rmaNow)
+    isolated.auth.oneClick('customer')
+    const claim = isolated.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'damage',
+      shipmentId: 'shp-delivered',
+      note: 'DEMO damaged physical delivery needs an RMA inspection',
+    }).data
+    isolated.auth.oneClick('admin')
+    isolated.claims.review(claim.id, 'acknowledge', 'Confirmed RMA review acknowledgement')
+    isolated.claims.review(claim.id, 'approve', 'Confirmed RMA review approval')
+    rmaNow = '2026-07-28T05:00:00.000Z'
+    isolated.fulfilment.advance(
+      'shp-delivered',
+      'returned',
+      'Confirmed customer return after delivered damage evidence',
+    )
+
+    isolated.repository.update((state) => { state.sessionUserId = 'usr-fulfilment' })
+    const beforeForbidden = structuredClone(isolated.repository.getSnapshot())
+    expect(() => isolated.claims.createRma(
+      claim.id,
+      'DEMO-RMA-ORDERED-01',
+      'Confirmed ordered RMA creation evidence',
+    )).toThrow(expect.objectContaining({ code: 'FORBIDDEN' }))
+    expect(isolated.repository.getSnapshot()).toEqual(beforeForbidden)
+
+    isolated.repository.update((state) => { state.sessionUserId = 'usr-support' })
+    const created = isolated.claims.createRma(
+      claim.id,
+      'DEMO-RMA-ORDERED-01',
+      'Confirmed ordered RMA creation evidence',
+    )
+    expect(created).toMatchObject({
+      changed: true,
+      data: { status: 'approved', remedyState: 'rma_created' },
+    })
+    const writesBeforeReplay = storage.writes
+    expect(isolated.claims.createRma(
+      claim.id,
+      'DEMO-RMA-ORDERED-01',
+      'Confirmed ordered RMA creation evidence',
+    ).changed).toBe(false)
+    expect(storage.writes).toBe(writesBeforeReplay)
+    expect(() => isolated.claims.createRma(
+      claim.id,
+      'DEMO-RMA-ORDERED-01',
+      'Conflicting RMA creation evidence',
+    )).toThrow(expect.objectContaining({ code: 'IDEMPOTENCY_CONFLICT' }))
+    expect(() => isolated.claims.recordRmaInspected(
+      claim.id,
+      'DEMO-RMA-ORDERED-01',
+      'Attempted inspection before receipt evidence',
+    )).toThrow(expect.objectContaining({ code: 'RMA_ORDER_INVALID' }))
+    expect(() => isolated.claims.review(
+      claim.id,
+      'resolve',
+      'Attempted premature RMA no-remedy completion',
+      { outcome: 'no_remedy', reference: 'DEMO-NO-PREMATURE-RMA' },
+    )).toThrow(expect.objectContaining({ code: 'REMEDY_INCOMPLETE' }))
+
+    expect(isolated.claims.recordRmaReceived(
+      claim.id,
+      'DEMO-RMA-ORDERED-01',
+      'Confirmed ordered RMA receipt evidence',
+    )).toMatchObject({
+      changed: true,
+      data: { status: 'approved', remedyState: 'rma_received' },
+    })
+    expect(isolated.claims.recordRmaReceived(
+      claim.id,
+      'DEMO-RMA-ORDERED-01',
+      'Confirmed ordered RMA receipt evidence',
+    ).changed).toBe(false)
+    expect(isolated.claims.recordRmaInspected(
+      claim.id,
+      'DEMO-RMA-ORDERED-01',
+      'Confirmed ordered RMA inspection evidence',
+    )).toMatchObject({
+      changed: true,
+      data: { status: 'approved', remedyState: 'rma_inspected' },
+    })
+    expect(isolated.claims.recordRmaInspected(
+      claim.id,
+      'DEMO-RMA-ORDERED-01',
+      'Confirmed ordered RMA inspection evidence',
+    ).changed).toBe(false)
+    expect(() => isolated.claims.review(
+      claim.id,
+      'resolve',
+      'Attempted inspected RMA completion without refund or replacement',
+      { outcome: 'no_remedy', reference: 'DEMO-RMA-MISSING-OUTCOME' },
+    )).toThrow(expect.objectContaining({ code: 'REMEDY_INCOMPLETE' }))
+    isolated.repository.update((state) => { state.sessionUserId = 'usr-demo-admin' })
+    isolated.payments.refund(
+      'pay-delivered',
+      1000,
+      'Confirmed inspected RMA linked refund',
+      'req-inspected-rma-linked-refund',
+      claim.id,
+    )
+    const linkedRefundEventId = isolated.repository.getSnapshot().claims
+      .find((entry) => entry.id === claim.id)!.linkedRefundEventId!
+    const completed = isolated.claims.review(
+      claim.id,
+      'resolve',
+      'Confirmed inspected RMA linked refund completion',
+      { outcome: 'refund_recorded', reference: linkedRefundEventId },
+    )
+    expect(completed.data).toMatchObject({
+      status: 'resolved',
+      remedyState: 'refund_completed',
+      rma: { status: 'inspected' },
+      resolutionReference: linkedRefundEventId,
+    })
+    expect(isolated.repository.getSnapshot().shipments
+      .find((entry) => entry.id === 'shp-delivered')?.status).toBe('returned')
+    expect(isolated.repository.getSnapshot().orders
+      .find((entry) => entry.id === 'ord-delivered')?.status).toBe('fulfilled')
+    expect(() => validateDemoState(isolated.repository.getSnapshot())).not.toThrow()
+  })
+
+  it('completes a post-delivery return through one replacement after RMA inspection', () => {
+    let rmaNow = FIXED_NOW
+    const isolated = new AppServices(new MemoryStorage(), () => rmaNow)
+    isolated.auth.oneClick('customer')
+    const claim = isolated.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'damage',
+      shipmentId: 'shp-delivered',
+      note: 'DEMO returned damaged delivery uses inspected RMA replacement path',
+    }).data
+    isolated.auth.oneClick('admin')
+    isolated.claims.review(claim.id, 'acknowledge', 'Confirmed inspected replacement acknowledgement')
+    isolated.claims.review(claim.id, 'approve', 'Confirmed inspected replacement approval')
+    rmaNow = '2026-07-28T05:00:00.000Z'
+    isolated.fulfilment.advance(
+      'shp-delivered',
+      'returned',
+      'Confirmed returned original before inspected replacement',
+    )
+    isolated.repository.update((state) => { state.sessionUserId = 'usr-support' })
+    isolated.claims.createRma(claim.id, 'DEMO-RMA-REPLACE-01', 'Confirmed replacement RMA creation')
+    isolated.claims.recordRmaReceived(claim.id, 'DEMO-RMA-REPLACE-01', 'Confirmed replacement RMA receipt')
+    isolated.claims.recordRmaInspected(claim.id, 'DEMO-RMA-REPLACE-01', 'Confirmed replacement RMA inspection')
+    expect(() => isolated.claims.authorizeReplacement(
+      claim.id,
+      'Confirmed inspected replacement authorization',
+    )).toThrow(expect.objectContaining({ code: 'FORBIDDEN' }))
+
+    isolated.repository.update((state) => { state.sessionUserId = 'usr-fulfilment' })
+    const authorized = isolated.claims.authorizeReplacement(
+      claim.id,
+      'Confirmed inspected replacement authorization',
+    )
+    expect(authorized).toMatchObject({
+      changed: true,
+      data: {
+        purpose: 'replacement',
+        sourceClaimId: claim.id,
+        replacementForShipmentId: 'shp-delivered',
+        status: 'unfulfilled',
+      },
+    })
+    expect(isolated.repository.getSnapshot().claims.find((entry) => entry.id === claim.id))
+      .toMatchObject({ status: 'approved', remedyState: 'replacement_authorized' })
+    const beforeReplay = structuredClone(isolated.repository.getSnapshot())
+    expect(isolated.claims.authorizeReplacement(
+      claim.id,
+      'Confirmed inspected replacement authorization',
+    )).toMatchObject({ changed: false, data: { id: authorized.data.id } })
+    expect(isolated.repository.getSnapshot()).toEqual(beforeReplay)
+    expect(() => isolated.claims.authorizeReplacement(
+      claim.id,
+      'Conflicting inspected replacement authorization',
+    )).toThrow(expect.objectContaining({ code: 'IDEMPOTENCY_CONFLICT' }))
+    for (const status of ['picking', 'packed', 'label_created', 'shipped', 'delivered'] as const) {
+      isolated.fulfilment.advance(
+        authorized.data.id,
+        status,
+        `Confirmed inspected RMA replacement ${status}`,
+      )
+    }
+    const completed = isolated.repository.getSnapshot()
+    expect(completed.shipments.find((entry) => entry.id === 'shp-delivered')?.status)
+      .toBe('returned')
+    expect(completed.claims.find((entry) => entry.id === claim.id)).toMatchObject({
+      status: 'resolved',
+      remedyState: 'replacement_delivered',
+      replacementShipmentId: authorized.data.id,
+      resolutionReference: authorized.data.id,
+    })
+    expect(completed.orders.find((entry) => entry.id === 'ord-delivered')?.status)
+      .toBe('fulfilled')
+    expect(() => validateDemoState(completed)).not.toThrow()
+  })
+
+  it('uses the digital issued-sent path for a replacement and never mutates its failed original', () => {
+    services.auth.oneClick('customer')
+    services.openBox('box-processing-02')
+    services.auth.oneClick('admin')
+    services.fulfilment.advance('shp-digital', 'issued', 'Confirmed original digital issue evidence')
+    services.fulfilment.advance('shp-digital', 'sent', 'Confirmed original digital send evidence')
+    services.fulfilment.advance('shp-digital', 'failed', 'Confirmed original digital failure evidence')
+    services.auth.oneClick('customer')
+    expect(() => services.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'damage',
+      shipmentId: 'shp-digital',
+      note: 'DEMO digital delivery cannot have physical damage',
+    })).toThrow(/digital fulfilment cannot have physical damage/i)
+    const claim = services.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'non_delivery',
+      shipmentId: 'shp-digital',
+      note: 'DEMO failed digital original needs a digital replacement',
+    }).data
+    services.auth.oneClick('admin')
+    services.claims.review(claim.id, 'acknowledge', 'Confirmed digital replacement acknowledgement')
+    services.claims.review(claim.id, 'approve', 'Confirmed digital replacement approval')
+    expect(() => services.claims.createRma(
+      claim.id,
+      'DEMO-RMA-DIGITAL-FORBIDDEN',
+      'Attempted RMA for a failed digital original',
+    )).toThrow(expect.objectContaining({ code: 'RMA_PHYSICAL_DELIVERY_REQUIRED' }))
+    const replacement = services.claims.authorizeReplacement(
+      claim.id,
+      'Confirmed digital replacement authorization',
+    ).data
+    expect(replacement).toMatchObject({
+      kind: 'DIGITAL',
+      purpose: 'replacement',
+      boxIds: ['box-processing-02'],
+      insured: false,
+      signatureRequired: false,
+    })
+    expect(() => services.fulfilment.setTracking(
+      replacement.id,
+      'Digital Vault',
+      'DEMO-DIGITAL-REPLACEMENT-EDIT',
+      'Attempted digital replacement tracking edit',
+    )).toThrow(expect.objectContaining({ code: 'DIGITAL_TRACKING_FORBIDDEN' }))
+    services.fulfilment.advance(replacement.id, 'issued', 'Confirmed replacement digital issued')
+    services.fulfilment.advance(replacement.id, 'sent', 'Confirmed replacement digital sent')
+    expect(services.repository.getSnapshot().claims.find((entry) => entry.id === claim.id))
+      .toMatchObject({ status: 'approved', remedyState: 'replacement_authorized' })
+    services.fulfilment.advance(replacement.id, 'delivered', 'Confirmed replacement digital delivered')
+
+    const snapshot = services.repository.getSnapshot()
+    expect(snapshot.shipments.find((entry) => entry.id === 'shp-digital')).toMatchObject({
+      purpose: 'original',
+      status: 'failed',
+    })
+    expect(snapshot.shipments.find((entry) => entry.id === replacement.id)?.timeline
+      .map((entry) => entry.status)).toEqual(['unfulfilled', 'issued', 'sent', 'delivered'])
+    expect(snapshot.claims.find((entry) => entry.id === claim.id)).toMatchObject({
+      status: 'resolved',
+      remedyState: 'replacement_delivered',
+      resolutionReference: replacement.id,
+    })
+    expect(snapshot.orders.find((entry) => entry.id === 'ord-processing')?.status)
+      .toBe('partially_fulfilled')
+    expect(snapshot.boxes.find((entry) => entry.id === 'box-processing-02')).toMatchObject({
+      status: 'fulfilled',
+      shipmentId: 'shp-digital',
+    })
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+  })
+
+  it('completes a failed original scope only after its exact linked refund resolves', () => {
+    services.auth.oneClick('customer')
+    const claim = services.claims.submit({
+      orderId: 'ord-failed',
+      kind: 'non_delivery',
+      shipmentId: 'shp-failed',
+      note: 'DEMO failed original uses exact linked refund completion',
+    }).data
+    services.auth.oneClick('admin')
+    services.claims.review(claim.id, 'acknowledge', 'Confirmed failed-scope refund acknowledgement')
+    services.claims.review(claim.id, 'approve', 'Confirmed failed-scope refund approval')
+    services.payments.refund(
+      'pay-failed',
+      1000,
+      'Confirmed exact failed-scope linked refund',
+      'req-failed-scope-linked-refund',
+      claim.id,
+    )
+    let snapshot = services.repository.getSnapshot()
+    const linked = snapshot.claims.find((entry) => entry.id === claim.id)!.linkedRefundEventId!
+    expect(snapshot.orders.find((entry) => entry.id === 'ord-failed')?.status).toBe('processing')
+    expect(snapshot.claims.find((entry) => entry.id === claim.id)).toMatchObject({
+      status: 'approved',
+      remedyState: 'refund_linked',
+    })
+
+    services.claims.review(
+      claim.id,
+      'resolve',
+      'Confirmed exact failed-scope refund completion',
+      { outcome: 'refund_recorded', reference: linked },
+    )
+    snapshot = services.repository.getSnapshot()
+    expect(snapshot.shipments.find((entry) => entry.id === 'shp-failed')?.status)
+      .toBe('failed_delivery')
+    expect(snapshot.claims.find((entry) => entry.id === claim.id)).toMatchObject({
+      status: 'resolved',
+      remedyState: 'refund_completed',
+      resolutionReference: linked,
+    })
+    expect(snapshot.orders.find((entry) => entry.id === 'ord-failed')?.status).toBe('fulfilled')
+    expect(snapshot.boxes.find((entry) => entry.id === 'box-failed-01')).toMatchObject({
+      status: 'fulfilled',
+      shipmentId: 'shp-failed',
+    })
+    expect(() => services.admin.changeOrderStatus(
+      'ord-failed',
+      'closed',
+      'Confirmed close after exact failed-scope remedy',
+    )).not.toThrow()
+    expect(() => validateDemoState(services.repository.getSnapshot())).not.toThrow()
+  })
+
+  it('rolls back failed RMA and replacement writes and permits safe retries', () => {
+    const storage = new FailNextWriteStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    let rmaNow = FIXED_NOW
+    const isolated = new AppServices(storage, () => rmaNow)
+    isolated.auth.oneClick('customer')
+    const claim = isolated.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'damage',
+      shipmentId: 'shp-delivered',
+      note: 'DEMO atomic remedy storage failure claim',
+    }).data
+    isolated.auth.oneClick('admin')
+    isolated.claims.review(claim.id, 'acknowledge', 'Confirmed atomic remedy acknowledgement')
+    isolated.claims.review(claim.id, 'approve', 'Confirmed atomic remedy approval')
+    rmaNow = '2026-07-28T05:00:00.000Z'
+    isolated.fulfilment.advance(
+      'shp-delivered',
+      'returned',
+      'Confirmed atomic post-delivery return evidence',
+    )
+    const beforeRma = structuredClone(isolated.repository.getSnapshot())
+    const rawBeforeRma = storage.getItem(STORAGE_KEY)
+    storage.failNextWrite = true
+    expect(() => isolated.claims.createRma(
+      claim.id,
+      'DEMO-RMA-ATOMIC-01',
+      'Confirmed atomic RMA creation evidence',
+    )).toThrow(expect.objectContaining({ code: 'STORAGE_WRITE_FAILED' }))
+    expect(isolated.repository.getSnapshot()).toEqual(beforeRma)
+    expect(storage.getItem(STORAGE_KEY)).toBe(rawBeforeRma)
+
+    isolated.claims.createRma(
+      claim.id,
+      'DEMO-RMA-ATOMIC-01',
+      'Confirmed atomic RMA creation evidence',
+    )
+    isolated.claims.recordRmaReceived(
+      claim.id,
+      'DEMO-RMA-ATOMIC-01',
+      'Confirmed atomic RMA receipt evidence',
+    )
+    isolated.claims.recordRmaInspected(
+      claim.id,
+      'DEMO-RMA-ATOMIC-01',
+      'Confirmed atomic RMA inspection evidence',
+    )
+    const beforeReplacement = structuredClone(isolated.repository.getSnapshot())
+    const rawBeforeReplacement = storage.getItem(STORAGE_KEY)
+    storage.failNextWrite = true
+    expect(() => isolated.claims.authorizeReplacement(
+      claim.id,
+      'Confirmed atomic replacement authorization',
+    )).toThrow(expect.objectContaining({ code: 'STORAGE_WRITE_FAILED' }))
+    expect(isolated.repository.getSnapshot()).toEqual(beforeReplacement)
+    expect(storage.getItem(STORAGE_KEY)).toBe(rawBeforeReplacement)
+    expect(isolated.claims.authorizeReplacement(
+      claim.id,
+      'Confirmed atomic replacement authorization',
+    )).toMatchObject({ changed: true, data: { purpose: 'replacement' } })
   })
 
   it('records a post-delivery return and reopens a fulfilled order without money or claim side effects', () => {
@@ -1021,16 +1513,25 @@ describe('customer, payment, allocation and admin services', () => {
 
   it('derives a mixed delivered and returned order as partially fulfilled', () => {
     services.auth.oneClick('admin')
-    for (const shipmentId of ['shp-processing', 'shp-digital']) {
-      const shipment = services.repository.getSnapshot().shipments.find((entry) => entry.id === shipmentId)!
-      const path = shipment.status === 'picking'
-        ? ['packed', 'label_created', 'shipped', 'delivered'] as const
-        : ['picking', 'packed', 'label_created', 'shipped', 'delivered'] as const
-      for (const status of path) {
-        services.fulfilment.advance(shipmentId, status, `Confirmed mixed-order ${status}`)
-      }
+    for (const status of ['packed', 'label_created', 'shipped', 'delivered'] as const) {
+      services.fulfilment.advance('shp-processing', status, `Confirmed mixed physical ${status}`)
+    }
+    expect(services.repository.getSnapshot().orders
+      .find((entry) => entry.id === 'ord-processing')?.status).toBe('partially_fulfilled')
+    expect(() => services.admin.changeOrderStatus(
+      'ord-processing',
+      'closed',
+      'Attempted close before digital scope completion',
+    )).toThrow()
+    for (const status of ['issued', 'sent', 'delivered'] as const) {
+      services.fulfilment.advance('shp-digital', status, `Confirmed mixed digital ${status}`)
     }
     expect(services.repository.getSnapshot().orders.find((entry) => entry.id === 'ord-processing')?.status).toBe('fulfilled')
+    services.admin.changeOrderStatus(
+      'ord-processing',
+      'closed',
+      'Confirmed close after both original scopes completed',
+    )
     services.fulfilment.advance('shp-processing', 'returned', 'Confirmed one mixed shipment returned')
     const snapshot = services.repository.getSnapshot()
     expect(snapshot.orders.find((entry) => entry.id === 'ord-processing')?.status).toBe('partially_fulfilled')
@@ -1210,7 +1711,7 @@ describe('customer, payment, allocation and admin services', () => {
   )
 
   it.each(['refund', 'dispute'] as const)(
-    'allows failed-delivery reship and delivery evidence during a %s hold without reopening finance or boxes',
+    'blocks rewriting a failed original during a %s hold without changing finance or boxes',
     (hold) => {
       const held = new AppServices(new MemoryStorage(), () => FIXED_NOW)
       held.repository.update((state) => {
@@ -1238,23 +1739,14 @@ describe('customer, payment, allocation and admin services', () => {
       const stoppedPayment = stopped.payments.find((entry) => entry.id === payment.id)!
       const stoppedBoxes = stopped.boxes.filter((box) => stoppedOrder.boxIds.includes(box.id))
 
-      held.fulfilment.advance(
+      expect(() => held.fulfilment.advance(
         'shp-failed',
         'shipped',
-        'Carrier retried the failed fictional delivery',
-      )
-      held.fulfilment.advance(
-        'shp-failed',
-        'delivered',
-        'Carrier completed the retried fictional delivery',
-      )
+        'Attempted rewrite of the failed fictional original',
+      )).toThrow(/graph-legal physical carrier evidence/i)
 
       const snapshot = held.repository.getSnapshot()
-      expect(snapshot.shipments.find((entry) => entry.id === 'shp-failed')?.timeline.slice(-3).map((entry) => entry.status)).toEqual([
-        'failed_delivery',
-        'shipped',
-        'delivered',
-      ])
+      expect(snapshot.shipments.find((entry) => entry.id === 'shp-failed')?.status).toBe('failed_delivery')
       expect(snapshot.orders.find((entry) => entry.id === stoppedOrder.id)).toEqual(stoppedOrder)
       expect(snapshot.payments.find((entry) => entry.id === stoppedPayment.id)).toEqual(stoppedPayment)
       expect(snapshot.boxes.filter((box) => stoppedOrder.boxIds.includes(box.id))).toEqual(stoppedBoxes)
@@ -1296,21 +1788,18 @@ describe('customer, payment, allocation and admin services', () => {
     )).toThrow(/financial hold/i)
     expect(held.repository.getSnapshot()).toEqual(before)
 
-    held.fulfilment.advance('shp-failed', 'shipped', 'Carrier retried the held delivery')
-    held.fulfilment.advance('shp-failed', 'delivered', 'Carrier delivered the held retry')
-    const delivered = structuredClone(held.repository.getSnapshot())
     expect(() => held.fulfilment.advance(
       'shp-failed',
-      'lost',
-      'Attempted impossible post-delivery loss',
+      'shipped',
+      'Attempted held original redelivery rewrite',
     )).toThrow(/graph-legal physical carrier evidence/i)
-    expect(held.repository.getSnapshot()).toEqual(delivered)
+    expect(held.repository.getSnapshot()).toEqual(before)
   })
 
   it('does not treat digital fulfilment as physical carrier evidence during a financial hold', () => {
     const held = new AppServices(new MemoryStorage(), () => FIXED_NOW)
     held.auth.oneClick('admin')
-    for (const status of ['picking', 'packed', 'label_created', 'shipped'] as const) {
+    for (const status of ['issued', 'sent'] as const) {
       held.fulfilment.advance('shp-digital', status, `Confirmed digital hold setup ${status}`)
     }
     held.payments.dispute(
@@ -1328,6 +1817,7 @@ describe('customer, payment, allocation and admin services', () => {
   })
 
   it('resumes only shipments stopped by that dispute and keeps earlier cancellations held', () => {
+    makeProcessingOrderTwoPhysicalShipments(services)
     services.auth.oneClick('admin')
     services.fulfilment.advance('shp-digital', 'cancelled', 'Cancelled earlier for an unrelated fulfilment reason')
     services.payments.dispute(
@@ -1607,11 +2097,11 @@ describe('customer, payment, allocation and admin services', () => {
     expect(() => validateDemoState(services.repository.getSnapshot())).not.toThrow()
   })
 
-  it('does not treat a returned digital fulfilment as physical non-delivery evidence', () => {
+  it('accepts digital failed as non-delivery without using any physical status', () => {
     services.auth.oneClick('customer')
     services.openBox('box-processing-02')
     services.auth.oneClick('admin')
-    for (const status of ['picking', 'packed', 'label_created', 'shipped', 'returned'] as const) {
+    for (const status of ['issued', 'sent', 'failed'] as const) {
       services.fulfilment.advance(
         'shp-digital',
         status,
@@ -1619,15 +2109,52 @@ describe('customer, payment, allocation and admin services', () => {
       )
     }
     services.auth.oneClick('customer')
-    const before = structuredClone(services.repository.getSnapshot())
-
-    expect(() => services.claims.submit({
+    const result = services.claims.submit({
       orderId: 'ord-processing',
       kind: 'non_delivery',
       shipmentId: 'shp-digital',
-      note: 'DEMO digital fulfilment cannot be a physical non-delivery',
-    })).toThrow(/digital fulfilment cannot have physical non-delivery/i)
-    expect(services.repository.getSnapshot()).toEqual(before)
+      note: 'DEMO failed digital fulfilment did not arrive',
+    })
+    expect(result).toMatchObject({
+      changed: true,
+      data: { kind: 'non_delivery', shipmentId: 'shp-digital' },
+    })
+    expect(services.repository.getSnapshot().shipments
+      .find((entry) => entry.id === 'shp-digital')?.timeline
+      .map((entry) => entry.status)).toEqual(['unfulfilled', 'issued', 'sent', 'failed'])
+  })
+
+  it('makes a sent digital original non-delivery eligible only after three demo days', () => {
+    let digitalNow = FIXED_NOW
+    const isolated = new AppServices(new MemoryStorage(), () => digitalNow)
+    isolated.auth.oneClick('customer')
+    isolated.openBox('box-processing-02')
+    isolated.auth.oneClick('admin')
+    isolated.fulfilment.advance('shp-digital', 'issued', 'Confirmed overdue digital issue evidence')
+    isolated.fulfilment.advance('shp-digital', 'sent', 'Confirmed overdue digital send evidence')
+    isolated.auth.oneClick('customer')
+    digitalNow = '2026-07-31T03:59:59.000Z'
+    expect(() => isolated.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'non_delivery',
+      shipmentId: 'shp-digital',
+      note: 'DEMO digital delivery is not yet three days overdue',
+    })).toThrow(expect.objectContaining({ code: 'CLAIM_NOT_OVERDUE' }))
+
+    digitalNow = '2026-07-31T04:00:00.000Z'
+    expect(isolated.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'non_delivery',
+      shipmentId: 'shp-digital',
+      note: 'DEMO digital delivery is now three days overdue',
+    })).toMatchObject({
+      changed: true,
+      data: {
+        kind: 'non_delivery',
+        shipmentId: 'shp-digital',
+      },
+    })
+    expect(() => validateDemoState(isolated.repository.getSnapshot())).not.toThrow()
   })
 
   it('stores every eligible sealed physical shipment canonically and keeps duplicate creation harmless', () => {
@@ -1743,7 +2270,7 @@ describe('customer, payment, allocation and admin services', () => {
     expect(scenario.services.repository.getSnapshot()).toEqual(before)
   })
 
-  it('returns an existing order-level claim when a later exact shipment scope overlaps it', () => {
+  it('keeps an unresolved order-level scope on hold and blocks opening it', () => {
     let now = FIXED_NOW
     const scoped = new AppServices(new MemoryStorage(), () => now)
     scoped.repository.update((state) => {
@@ -1757,18 +2284,10 @@ describe('customer, payment, allocation and admin services', () => {
       note: 'DEMO sealed order-level overlap evidence',
     })
     now = '2026-07-28T05:00:00.000Z'
-    scoped.openBox('box-shipped-01')
-    const beforeExactRetry = structuredClone(scoped.repository.getSnapshot())
-    const exactRetry = scoped.claims.submit({
-      orderId: 'ord-shipped',
-      kind: 'non_delivery',
-      shipmentId: 'shp-shipped',
-      note: 'DEMO later exact scope overlaps the open claim',
-    })
-
-    expect(exactRetry).toMatchObject({ changed: false, data: { id: orderLevel.data.id } })
-    expect(exactRetry.data).not.toHaveProperty('shipmentCandidateIds')
-    expect(scoped.repository.getSnapshot()).toEqual(beforeExactRetry)
+    const beforeOpen = structuredClone(scoped.repository.getSnapshot())
+    expect(() => scoped.openBox('box-shipped-01')).toThrow(/financial hold/i)
+    expect(scoped.repository.getSnapshot()).toEqual(beforeOpen)
+    expect(scoped.repository.getSnapshot().claims[0].id).toBe(orderLevel.data.id)
     expect(scoped.repository.getSnapshot().claims).toHaveLength(1)
   })
 
@@ -1809,14 +2328,14 @@ describe('customer, payment, allocation and admin services', () => {
     services.claims.review(
       claim.id,
       'resolve',
-      'Support resolved fictional replacement path',
-      { outcome: 'replacement_authorized', reference: `DEMO-${claim.id.toUpperCase()}` },
+      'Support resolved a sound fictional no-remedy path',
+      { outcome: 'no_remedy', reference: `DEMO-${claim.id.toUpperCase()}` },
     )
     const snapshot = services.repository.getSnapshot()
     const resolved = snapshot.claims.find((entry) => entry.id === claim.id)!
     expect(resolved.status).toBe('resolved')
     expect(resolved).toMatchObject({
-      resolutionOutcome: 'replacement_authorized',
+      resolutionOutcome: 'no_remedy',
       resolutionReference: `DEMO-${claim.id.toUpperCase()}`,
     })
     expect(resolved.history.map((entry) => entry.status)).toEqual(['submitted', 'reviewing', 'approved', 'resolved'])
@@ -1853,7 +2372,7 @@ describe('customer, payment, allocation and admin services', () => {
       'resolve',
       'Replacement note is sufficiently descriptive',
       { outcome: 'replacement_authorized', reference: 'REAL-REF-001' },
-    )).toThrow(/DEMO-/i)
+    )).toThrow(expect.objectContaining({ code: 'TYPED_REMEDY_REQUIRED' }))
 
     services.payments.refund(
       'pay-delivered',
@@ -2064,8 +2583,8 @@ describe('customer, payment, allocation and admin services', () => {
         isolated.claims.review(
           claim.id,
           'resolve',
-          'Resolved through a sufficiently descriptive replacement path',
-          { outcome: 'replacement_authorized', reference: `DEMO-${claim.id.toUpperCase()}` },
+          'Resolved through a sufficiently descriptive no-remedy path',
+          { outcome: 'no_remedy', reference: `DEMO-${claim.id.toUpperCase()}` },
         )
       }
       const before = structuredClone(isolated.repository.getSnapshot())
@@ -2297,8 +2816,8 @@ describe('customer, payment, allocation and admin services', () => {
     services.claims.review(
       resolved.id,
       'resolve',
-      'Confirmed resolved metric fictional replacement',
-      { outcome: 'replacement_authorized', reference: `DEMO-${resolved.id.toUpperCase()}` },
+      'Confirmed resolved metric fictional no-remedy path',
+      { outcome: 'no_remedy', reference: `DEMO-${resolved.id.toUpperCase()}` },
     )
     expect(services.admin.dashboard().openClaims).toBe(0)
     expect(() => services.admin.changeOrderStatus(
@@ -2323,7 +2842,7 @@ describe('customer, payment, allocation and admin services', () => {
       before: { carrier: 'Demo Bulky Freight' },
       after: { trackingNumber: 'DEMO-TRACK-9001' },
     })
-    expect(() => services.fulfilment.setTracking('shp-digital', 'Real Courier', 'REAL-1234', 'Unsafe tracking test')).toThrow(/clearly fictional/i)
+    expect(() => services.fulfilment.setTracking('shp-digital', 'Real Courier', 'REAL-1234', 'Unsafe tracking test')).toThrow(/digital fulfilment never uses editable/i)
     expect(() => services.fulfilment.setTracking('shp-shipped', 'Demo Express', 'DEMO-LOCKED-1', 'Locked tracking test')).toThrow(/lock after shipment/i)
   })
 

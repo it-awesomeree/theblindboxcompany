@@ -6,16 +6,15 @@ import {
   isValidDemoTracking,
   makeId,
   sanitizeText,
-  transitionOrder,
-  transitionBoxForShipment,
-  transitionShipment,
+  transitionShipmentForKind,
 } from '../domain/guards'
 import {
   shipmentStatusActionEligibility,
   shipmentTrackingActionEligibility,
 } from '../domain/fulfillmentEligibility'
 import { prizeForBox } from '../domain/selectors'
-import { deriveOrderStatusFromShipments } from '../domain/orderStatus'
+import { refreshOrderFulfillment } from '../domain/orderFulfillment'
+import { REPLACEMENT_DELIVERED_ACTION } from '../domain/remedyEvidence'
 import type { DemoState, FulfilmentKind, Order, Shipment, ShipmentStatus } from '../domain/types'
 import type { MockRepository } from '../data/MockRepository'
 import { AuditService } from './AuditService'
@@ -35,8 +34,10 @@ export class FulfillmentService {
   ) {}
 
   createForPaidOrder(state: DemoState, order: Order, at: string) {
-    if (state.shipments.some((shipment) => shipment.orderId === order.id)) {
-      return state.shipments.filter((shipment) => shipment.orderId === order.id)
+    if (state.shipments.some((shipment) =>
+      shipment.orderId === order.id && shipment.purpose === 'original')) {
+      return state.shipments.filter((shipment) =>
+        shipment.orderId === order.id && shipment.purpose === 'original')
     }
     const grouped = new Map<FulfilmentKind, string[]>()
     for (const boxId of order.boxIds) {
@@ -57,6 +58,7 @@ export class FulfillmentService {
         orderId: order.id,
         boxIds,
         kind,
+        purpose: 'original',
         status: 'unfulfilled',
         carrier: carrierFor(kind),
         trackingNumber: `DEMO-${shipmentId.slice(4).toUpperCase()}`,
@@ -89,7 +91,7 @@ export class FulfillmentService {
       const cleanReason = sanitizeText(reason, 220)
       assert(cleanReason.length >= 6, 'Give a short reason for this shipment change.', 'REASON_REQUIRED')
       const before = shipment.status
-      shipment.status = transitionShipment(shipment.status, next)
+      shipment.status = transitionShipmentForKind(shipment.kind, shipment.status, next)
       const now = this.now()
       const sequence = state.nextSequence
       state.nextSequence += 1
@@ -99,24 +101,35 @@ export class FulfillmentService {
         label: cleanReason,
         at: now,
       })
-      if (!financiallyStopped) {
-        for (const boxId of shipment.boxIds) {
-          const box = state.boxes.find((entry) => entry.id === boxId)
-          if (!box) continue
-          box.status = transitionBoxForShipment(box.status, next)
-        }
-        const related = state.shipments.filter((entry) => entry.orderId === order.id)
-        const derived = deriveOrderStatusFromShipments(related.map((entry) => entry.status))
-        if (order.status !== derived) {
-          order.status = transitionOrder(order.status, derived)
-        }
-        order.updatedAt = now
-        order.timeline.push({
-          id: makeId('tl', `${order.id}:${shipment.id}:${next}:${now}:${sequence}`),
-          status: order.status,
-          label: cleanReason,
+      let deliveredClaim: DemoState['claims'][number] | undefined
+      if (shipment.purpose === 'replacement' && next === 'delivered') {
+        const claim = state.claims.find((entry) => entry.id === shipment.sourceClaimId)
+        assert(
+          claim &&
+            claim.status === 'approved' &&
+            claim.remedyState === 'replacement_authorized' &&
+            claim.replacementShipmentId === shipment.id,
+          'Replacement delivery requires its approved bidirectionally linked claim.',
+          'REPLACEMENT_CLAIM_INVALID',
+        )
+        claim.status = 'resolved'
+        claim.remedyState = 'replacement_delivered'
+        claim.resolutionOutcome = 'replacement_authorized'
+        claim.resolutionReference = shipment.id
+        claim.resolutionNote = cleanReason
+        claim.updatedAt = now
+        claim.history.push({
+          id: `${claim.id}-h-${String(claim.history.length + 1).padStart(2, '0')}`,
+          status: 'resolved',
+          note: cleanReason,
+          actorId: actor.id,
+          actorRole: actor.role,
           at: now,
         })
+        deliveredClaim = claim
+      }
+      if (!financiallyStopped) {
+        refreshOrderFulfillment(state, order, now, cleanReason)
       }
       this.audit.append(state, {
         actorId: actor.id,
@@ -134,6 +147,29 @@ export class FulfillmentService {
           financialHoldPreserved: financiallyStopped,
         },
       })
+      if (deliveredClaim) {
+        this.audit.append(state, {
+          actorId: actor.id,
+          actorRole: actor.role,
+          action: REPLACEMENT_DELIVERED_ACTION,
+          targetType: 'claim',
+          targetId: deliveredClaim.id,
+          reason: cleanReason,
+          at: now,
+          requestId: makeId('req', `${deliveredClaim.id}:replacement-delivered:${now}:${sequence}`),
+          before: {
+            remedyState: 'replacement_authorized',
+            status: 'approved',
+          },
+          after: {
+            remedyState: 'replacement_delivered',
+            replacementShipmentId: shipment.id,
+            resolutionOutcome: 'replacement_authorized',
+            resolutionReference: shipment.id,
+            status: 'resolved',
+          },
+        })
+      }
       return shipment
     })
   }

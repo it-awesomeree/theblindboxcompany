@@ -2,6 +2,7 @@ import {
   assert,
   assertRole,
   getSessionUser,
+  makeId,
   stableHash,
   sanitizeText,
   validateDemoClaimNote,
@@ -16,12 +17,22 @@ import {
   isOpenClaimStatus,
 } from '../domain/claimStatus'
 import { matchingAppliedPaymentRefundAudit } from '../domain/refundLink'
+import { refreshOrderFulfillment } from '../domain/orderFulfillment'
+import {
+  REPLACEMENT_AUTHORIZED_ACTION,
+  RMA_CREATED_ACTION,
+  RMA_INSPECTED_ACTION,
+  RMA_RECEIVED_ACTION,
+} from '../domain/remedyEvidence'
 import type {
   Claim,
   ClaimKind,
+  ClaimRemedyState,
   ClaimResolutionOutcome,
   ClaimStatus,
   DemoState,
+  RmaStatus,
+  Shipment,
 } from '../domain/types'
 import type { MockRepository } from '../data/MockRepository'
 import { formatMYR } from '../lib/format'
@@ -106,6 +117,38 @@ function customerClaimReceipt(claim: Claim) {
   delete receipt.shipmentCandidateIds
   delete receipt.shipmentCandidateEvidenceAt
   return receipt
+}
+
+const DEMO_REMEDY_REFERENCE = /^DEMO-[A-Z0-9][A-Z0-9-]{2,96}$/
+
+function remedyReference(value: string) {
+  const reference = sanitizeText(value, 100).toUpperCase()
+  assert(
+    reference === value && DEMO_REMEDY_REFERENCE.test(reference),
+    'Use an obvious fictional DEMO- remedy reference.',
+    'DEMO_DATA_ONLY',
+  )
+  return reference
+}
+
+function remedyReason(value: string) {
+  const reason = sanitizeText(value, 500)
+  assert(reason.length >= 8, 'A remedy reason of at least 8 characters is required.', 'REASON_REQUIRED')
+  return reason
+}
+
+function originalForClaim(state: DemoState, claim: Claim): Shipment | undefined {
+  const shipmentId =
+    claim.shipmentId ??
+    (claim.shipmentCandidateIds?.length === 1 ? claim.shipmentCandidateIds[0] : undefined) ??
+    (claim.boxId
+      ? state.boxes.find((box) => box.id === claim.boxId && box.orderId === claim.orderId)?.shipmentId
+      : undefined)
+  return state.shipments.find((shipment) =>
+    shipment.id === shipmentId &&
+    shipment.orderId === claim.orderId &&
+    shipment.purpose === 'original',
+  )
 }
 
 export class ClaimService {
@@ -295,6 +338,7 @@ export class ClaimService {
             shipmentCandidateIds: duplicate.shipmentCandidateIds,
           },
         })
+        refreshOrderFulfillment(state, order, now, CLAIM_EVIDENCE_WIDENING_NOTE)
         return {
           data: customerClaimReceipt(duplicate),
           changed: true,
@@ -321,6 +365,7 @@ export class ClaimService {
           : undefined,
         boxId: input.kind === 'value_floor' ? selectedBox!.id : undefined,
         status: 'submitted',
+        remedyState: 'none',
         createdAt: now,
         updatedAt: now,
         history: [{
@@ -334,6 +379,7 @@ export class ClaimService {
       }
       state.claims.push(claim)
       order.claimIds.push(claim.id)
+      refreshOrderFulfillment(state, order, now, 'Demo claim submitted for review')
       this.audit.append(state, {
         actorId: user.id,
         actorRole: user.role,
@@ -423,12 +469,22 @@ export class ClaimService {
     resolution?: ClaimResolutionInput,
   ) {
     assert(resolution, 'Choose a structured resolution outcome and reference.', 'RESOLUTION_EVIDENCE_REQUIRED')
-    const outcomes: ClaimResolutionOutcome[] = [
-      'replacement_authorized',
-      'return_rma_created',
-      'refund_recorded',
-      'no_remedy',
-    ]
+    const outcomes: ClaimResolutionOutcome[] = ['refund_recorded', 'no_remedy']
+    if (
+      resolution.outcome === 'replacement_authorized' ||
+      resolution.outcome === 'return_rma_created'
+    ) {
+      assert(
+        claim.linkedRefundEventId === undefined,
+        'A claim linked to a refund event must use the refund-recorded resolution.',
+        'RESOLUTION_REFUND_LINK_MISMATCH',
+      )
+      assert(
+        false,
+        'Replacement authorization and RMA creation must use their guarded typed APIs.',
+        'TYPED_REMEDY_REQUIRED',
+      )
+    }
     assert(outcomes.includes(resolution.outcome), 'Choose a valid resolution outcome.', 'RESOLUTION_OUTCOME_INVALID')
     const reference = sanitizeText(resolution.reference, 100)
     assert(reference.length >= 4, 'Enter the fictional resolution reference.', 'RESOLUTION_REFERENCE_REQUIRED')
@@ -463,6 +519,11 @@ export class ClaimService {
         'Refund resolution must reference this claim’s accepted and audited linked refund event.',
         'RESOLUTION_REFUND_MISSING',
       )
+      assert(
+        claim.remedyState === 'refund_linked',
+        'Refund resolution requires the claim refund remedy link.',
+        'RESOLUTION_REFUND_LINK_MISMATCH',
+      )
     } else {
       assert(
         claim.linkedRefundEventId === undefined,
@@ -475,6 +536,13 @@ export class ClaimService {
         'DEMO_DATA_ONLY',
       )
       assert(note.length >= 16, 'Describe the fictional resolution in at least 16 characters.', 'RESOLUTION_NOTE_REQUIRED')
+      assert(
+        claim.replacementShipmentId === undefined &&
+          claim.rma === undefined &&
+          claim.remedyState === 'none',
+        'A selected RMA path must finish through its linked refund or delivered replacement.',
+        'REMEDY_INCOMPLETE',
+      )
     }
     return { outcome: resolution.outcome, reference }
   }
@@ -511,6 +579,9 @@ export class ClaimService {
       if (structured) {
         claim.resolutionOutcome = structured.outcome
         claim.resolutionReference = structured.reference
+        claim.remedyState = structured.outcome === 'refund_recorded'
+          ? 'refund_completed'
+          : 'no_remedy'
       }
       claim.history.push({
         id: `${claim.id}-h-${String(claim.history.length + 1).padStart(2, '0')}`,
@@ -520,6 +591,9 @@ export class ClaimService {
         actorRole: actor.role,
         at: now,
       })
+      const order = state.orders.find((entry) => entry.id === claim.orderId)
+      assert(order, 'Claim order was not found.', 'ORDER_MISSING')
+      refreshOrderFulfillment(state, order, now, note)
       const requestId = `req-${claim.id}-${action}-${claim.history.length}`
       this.audit.append(state, {
         actorId: actor.id,
@@ -546,6 +620,307 @@ export class ClaimService {
         },
       })
       return { data: claim, changed: true, message: `Claim is now ${claim.status}. No refund was created.` }
+    })
+  }
+
+  private rmaReplay(
+    claimId: string,
+    reference: string,
+    reason: string,
+    step: RmaStatus,
+  ) {
+    const state = this.repository.getSnapshot()
+    const actor = getSessionUser(state)
+    assertRole(actor, ['support', 'admin', 'super_admin'], 'record RMA evidence')
+    const claim = state.claims.find((entry) => entry.id === claimId)
+    assert(claim, 'Claim was not found.', 'CLAIM_MISSING')
+    const rma = claim.rma
+    if (!rma) return undefined
+    const stored = step === 'created'
+      ? { reference: rma.reference, reason: rma.createdReason }
+      : step === 'received' && rma.receivedAt
+        ? { reference: rma.reference, reason: rma.receivedReason }
+        : step === 'inspected' && rma.inspectedAt
+          ? { reference: rma.reference, reason: rma.inspectedReason }
+          : undefined
+    if (!stored) return undefined
+    assert(
+      stored.reference === reference && stored.reason === reason,
+      `The ${step} RMA step was already recorded with different evidence.`,
+      'IDEMPOTENCY_CONFLICT',
+    )
+    return {
+      data: claim,
+      changed: false,
+      message: `Exact RMA ${step} replay returned the original result.`,
+    }
+  }
+
+  private recordRmaStep(
+    claimId: string,
+    rawReference: string,
+    rawReason: string,
+    step: RmaStatus,
+  ) {
+    const reference = remedyReference(rawReference)
+    const reason = remedyReason(rawReason)
+    const replay = this.rmaReplay(claimId, reference, reason, step)
+    if (replay) return replay
+
+    return this.repository.update((state) => {
+      const actor = getSessionUser(state)
+      assertRole(actor, ['support', 'admin', 'super_admin'], 'record RMA evidence')
+      const claim = state.claims.find((entry) => entry.id === claimId)
+      assert(claim, 'Claim was not found.', 'CLAIM_MISSING')
+      assert(claim.status === 'approved', 'RMA evidence requires an approved claim.', 'CLAIM_NOT_APPROVED')
+      assert(claim.linkedRefundEventId === undefined, 'A refund-linked claim cannot start an RMA path.', 'REMEDY_CONFLICT')
+      const now = this.now()
+      assert(
+        Date.parse(now) >= Date.parse(claim.updatedAt),
+        'RMA evidence cannot precede the claim history.',
+        'RMA_CHRONOLOGY_INVALID',
+      )
+      let action: string
+      let beforeState: ClaimRemedyState
+      let beforeStatus: RmaStatus | null
+      let afterState: ClaimRemedyState
+      if (step === 'created') {
+        const original = originalForClaim(state, claim)
+        assert(
+          original &&
+            original.kind !== 'DIGITAL' &&
+            original.timeline.some((entry) =>
+              entry.status === 'delivered' &&
+              Date.parse(entry.at) <= Date.parse(claim.createdAt)),
+          'RMA creation requires physical delivery evidence that existed when the claim was submitted.',
+          'RMA_PHYSICAL_DELIVERY_REQUIRED',
+        )
+        assert(
+          claim.remedyState === 'none' && claim.rma === undefined,
+          'This claim already selected a remedy path.',
+          'REMEDY_CONFLICT',
+        )
+        assert(
+          !state.claims.some((entry) => entry.id !== claim.id && entry.rma?.reference === reference),
+          'That RMA reference is already in use.',
+          'RMA_REFERENCE_REUSED',
+        )
+        claim.rma = {
+          reference,
+          status: 'created',
+          createdAt: now,
+          createdReason: reason,
+        }
+        action = RMA_CREATED_ACTION
+        beforeState = 'none'
+        beforeStatus = null
+        afterState = 'rma_created'
+      } else {
+        assert(claim.rma?.reference === reference, 'RMA reference does not match this claim.', 'RMA_REFERENCE_MISMATCH')
+        if (step === 'received') {
+          assert(
+            claim.remedyState === 'rma_created' && claim.rma.status === 'created',
+            'RMA receipt must follow RMA creation.',
+            'RMA_ORDER_INVALID',
+          )
+          claim.rma.receivedAt = now
+          claim.rma.receivedReason = reason
+          claim.rma.status = 'received'
+          action = RMA_RECEIVED_ACTION
+          beforeState = 'rma_created'
+          beforeStatus = 'created'
+          afterState = 'rma_received'
+        } else {
+          assert(
+            claim.remedyState === 'rma_received' && claim.rma.status === 'received',
+            'RMA inspection must follow recorded receipt.',
+            'RMA_ORDER_INVALID',
+          )
+          claim.rma.inspectedAt = now
+          claim.rma.inspectedReason = reason
+          claim.rma.status = 'inspected'
+          action = RMA_INSPECTED_ACTION
+          beforeState = 'rma_received'
+          beforeStatus = 'received'
+          afterState = 'rma_inspected'
+        }
+      }
+      claim.remedyState = afterState
+      claim.updatedAt = now
+      claim.history.push({
+        id: `${claim.id}-h-${String(claim.history.length + 1).padStart(2, '0')}`,
+        status: claim.status,
+        note: reason,
+        actorId: actor.id,
+        actorRole: actor.role,
+        at: now,
+      })
+      const order = state.orders.find((entry) => entry.id === claim.orderId)
+      assert(order, 'Claim order was not found.', 'ORDER_MISSING')
+      refreshOrderFulfillment(state, order, now, reason)
+      this.audit.append(state, {
+        actorId: actor.id,
+        actorRole: actor.role,
+        action,
+        targetType: 'claim',
+        targetId: claim.id,
+        reason,
+        at: now,
+        requestId: makeId('req', `${claim.id}:rma:${step}:${now}`),
+        before: { remedyState: beforeState, rmaStatus: beforeStatus },
+        after: {
+          remedyState: afterState,
+          rmaReference: reference,
+          rmaStatus: step,
+        },
+      })
+      return {
+        data: claim,
+        changed: true,
+        message: `RMA ${step} evidence was recorded without resolving the claim.`,
+      }
+    })
+  }
+
+  createRma(claimId: string, reference: string, reason: string) {
+    return this.recordRmaStep(claimId, reference, reason, 'created')
+  }
+
+  recordRmaReceived(claimId: string, reference: string, reason: string) {
+    return this.recordRmaStep(claimId, reference, reason, 'received')
+  }
+
+  recordRmaInspected(claimId: string, reference: string, reason: string) {
+    return this.recordRmaStep(claimId, reference, reason, 'inspected')
+  }
+
+  authorizeReplacement(claimId: string, rawReason: string) {
+    const reason = remedyReason(rawReason)
+    const snapshot = this.repository.getSnapshot()
+    const currentActor = getSessionUser(snapshot)
+    assertRole(currentActor, ['fulfilment', 'admin', 'super_admin'], 'authorize a replacement')
+    const existing = snapshot.claims.find((entry) => entry.id === claimId)
+    assert(existing, 'Claim was not found.', 'CLAIM_MISSING')
+    if (existing.replacementShipmentId) {
+      assert(
+        existing.replacementAuthorization?.reason === reason,
+        'This claim already authorized a replacement with different evidence.',
+        'IDEMPOTENCY_CONFLICT',
+      )
+      const shipment = snapshot.shipments.find((entry) => entry.id === existing.replacementShipmentId)
+      assert(shipment, 'Authorized replacement shipment is missing.', 'REPLACEMENT_LINK_INVALID')
+      return {
+        data: shipment,
+        changed: false,
+        message: 'Exact replacement authorization replay returned the original shipment.',
+      }
+    }
+
+    return this.repository.update((state) => {
+      const actor = getSessionUser(state)
+      assertRole(actor, ['fulfilment', 'admin', 'super_admin'], 'authorize a replacement')
+      const claim = state.claims.find((entry) => entry.id === claimId)
+      assert(claim, 'Claim was not found.', 'CLAIM_MISSING')
+      assert(claim.status === 'approved', 'Replacement requires an approved claim.', 'CLAIM_NOT_APPROVED')
+      assert(claim.linkedRefundEventId === undefined, 'A refund-linked claim cannot authorize a replacement.', 'REMEDY_CONFLICT')
+      assert(
+        claim.remedyState === 'none' || claim.remedyState === 'rma_inspected',
+        'A selected RMA path must be inspected before replacement authorization.',
+        'RMA_INSPECTION_REQUIRED',
+      )
+      assert(
+        !claim.shipmentCandidateIds || claim.shipmentCandidateIds.length === 1,
+        'Replacement authorization requires one exact original shipment scope.',
+        'REPLACEMENT_SCOPE_AMBIGUOUS',
+      )
+      const original = originalForClaim(state, claim)
+      assert(original, 'Replacement original shipment scope was not found.', 'REPLACEMENT_ORIGINAL_MISSING')
+      assert(
+        !state.shipments.some((shipment) =>
+          shipment.purpose === 'replacement' &&
+          (
+            shipment.sourceClaimId === claim.id ||
+            shipment.replacementForShipmentId === original.id
+          )),
+        'A replacement shipment already uses this claim or original shipment.',
+        'REPLACEMENT_REUSED',
+      )
+      const now = this.now()
+      assert(
+        Date.parse(now) >= Date.parse(claim.updatedAt) &&
+          Date.parse(now) >= Date.parse(original.createdAt),
+        'Replacement authorization cannot precede the claim, approval, or original shipment.',
+        'REPLACEMENT_CHRONOLOGY_INVALID',
+      )
+      const shipmentId = makeId('shp', `${claim.id}:replacement`)
+      const replacement: Shipment = {
+        id: shipmentId,
+        orderId: original.orderId,
+        boxIds: [...original.boxIds],
+        kind: original.kind,
+        purpose: 'replacement',
+        sourceClaimId: claim.id,
+        replacementForShipmentId: original.id,
+        status: 'unfulfilled',
+        carrier: original.carrier,
+        trackingNumber: `DEMO-${shipmentId.slice(4).toUpperCase()}`,
+        insured: original.insured,
+        signatureRequired: original.signatureRequired,
+        createdAt: now,
+        timeline: [{
+          id: makeId('stl', `${shipmentId}:authorized`),
+          status: 'unfulfilled',
+          label: reason,
+          at: now,
+        }],
+      }
+      assert(
+        !state.shipments.some((shipment) =>
+          shipment.id === replacement.id ||
+          shipment.trackingNumber === replacement.trackingNumber),
+        'Replacement shipment identity is already in use.',
+        'REPLACEMENT_REUSED',
+      )
+      const beforeState = claim.remedyState
+      state.shipments.push(replacement)
+      claim.remedyState = 'replacement_authorized'
+      claim.replacementShipmentId = replacement.id
+      claim.replacementAuthorization = { at: now, reason }
+      claim.updatedAt = now
+      claim.history.push({
+        id: `${claim.id}-h-${String(claim.history.length + 1).padStart(2, '0')}`,
+        status: claim.status,
+        note: reason,
+        actorId: actor.id,
+        actorRole: actor.role,
+        at: now,
+      })
+      const order = state.orders.find((entry) => entry.id === claim.orderId)
+      assert(order, 'Claim order was not found.', 'ORDER_MISSING')
+      refreshOrderFulfillment(state, order, now, reason)
+      this.audit.append(state, {
+        actorId: actor.id,
+        actorRole: actor.role,
+        action: REPLACEMENT_AUTHORIZED_ACTION,
+        targetType: 'claim',
+        targetId: claim.id,
+        reason,
+        at: now,
+        requestId: makeId('req', `${claim.id}:replacement:${now}`),
+        before: {
+          originalShipmentId: original.id,
+          remedyState: beforeState,
+        },
+        after: {
+          remedyState: 'replacement_authorized',
+          replacementShipmentId: replacement.id,
+        },
+      })
+      return {
+        data: replacement,
+        changed: true,
+        message: 'Replacement shipment was authorized; the claim remains incomplete until delivery.',
+      }
     })
   }
 }

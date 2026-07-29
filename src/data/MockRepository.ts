@@ -2,7 +2,11 @@ import { SCHEMA_VERSION, VALUE_FLOOR_SEN } from '../domain/constants'
 import { canonicalizeAuditEvidence } from '../domain/auditEvidence'
 import { cloneState, DomainError } from '../domain/guards'
 import { exactOddsLabel } from '../domain/odds'
-import type { AuditEntry, DemoState } from '../domain/types'
+import {
+  expectedBoxStatusForScope,
+  resolveOrderFulfillment,
+} from '../domain/orderFulfillment'
+import type { AuditEntry, Claim, DemoState, Shipment } from '../domain/types'
 import { createDemoState } from './fixtures'
 import { isDemoState, validateDemoState } from './StateValidator'
 
@@ -15,9 +19,25 @@ export interface StorageLike {
   removeItem(key: string): void
 }
 
+type LegacyShipmentV6 = Omit<
+  Shipment,
+  'purpose' | 'sourceClaimId' | 'replacementForShipmentId'
+>
+type LegacyClaimV6 = Omit<
+  Claim,
+  'remedyState' | 'rma' | 'replacementShipmentId' | 'replacementAuthorization' | 'legacyTypedResolution'
+>
+type LegacyDemoStateV6 = Omit<
+  DemoState,
+  'schemaVersion' | 'shipments' | 'claims'
+> & {
+  schemaVersion: 6
+  shipments: LegacyShipmentV6[]
+  claims: LegacyClaimV6[]
+}
 type LegacyAuditEntryV5 = Omit<AuditEntry, 'sequence' | 'previousId' | 'outcome'>
 type LegacyDemoStateV5 = Omit<
-  DemoState,
+  LegacyDemoStateV6,
   'schemaVersion' | 'auditCount' | 'auditHeadId' | 'audits'
 > & {
   schemaVersion: 5
@@ -29,6 +49,7 @@ interface LoadedState {
   notice: string | null
   needsPersist: boolean
   migratedFromRaw?: string
+  migratedFromVersion?: 5 | 6
   protectedRaw?: string
   requiresConfirmedReset?: boolean
   storageWasMissing?: boolean
@@ -100,7 +121,7 @@ function migrationAuditAnchor(): AuditEntry {
   }
 }
 
-export function migrateDemoStateV5(value: unknown): DemoState {
+function migrateDemoStateV5ToV6(value: unknown): LegacyDemoStateV6 {
   if (!record(value) || value.schemaVersion !== 5 || !Array.isArray(value.audits)) {
     throw new DomainError('Stored data is not a version 5 demo state.', 'MIGRATION_SOURCE_INVALID')
   }
@@ -145,17 +166,168 @@ export function migrateDemoStateV5(value: unknown): DemoState {
       valueFloorSen: VALUE_FLOOR_SEN,
     },
   }))
-  const candidate = {
+  return {
     ...legacy,
     series,
     orders,
-    schemaVersion: SCHEMA_VERSION,
+    schemaVersion: 6,
     auditCount: audits.length,
     auditHeadId: audits.at(-1)?.id ?? '',
     audits,
+  } as LegacyDemoStateV6
+}
+
+function migrateDigitalShipmentV6(shipment: LegacyShipmentV6): Shipment {
+  let terminal: 'delivered' | 'failed' | undefined
+  const timeline: Shipment['timeline'] = []
+  shipment.timeline.forEach((entry) => {
+    let status: Shipment['status']
+    if (terminal) {
+      status = terminal
+    } else if (entry.status === 'unfulfilled') {
+      status = 'unfulfilled'
+    } else if (['picking', 'packed'].includes(entry.status)) {
+      status = 'issued'
+    } else if (['label_created', 'shipped'].includes(entry.status)) {
+      status = 'sent'
+    } else if (entry.status === 'delivered') {
+      status = 'delivered'
+      terminal = 'delivered'
+    } else if (entry.status === 'returned' && shipment.timeline
+      .slice(0, shipment.timeline.indexOf(entry))
+      .some((prior) => prior.status === 'delivered')) {
+      status = 'delivered'
+      terminal = 'delivered'
+    } else {
+      status = 'failed'
+      terminal = 'failed'
+    }
+    if (status === 'failed') {
+      if (timeline.at(-1)?.status === 'unfulfilled') {
+        timeline.push({
+          ...entry,
+          id: `${entry.id}-migration-issued`,
+          status: 'issued',
+          label: `${entry.label} — migrated digital issue evidence`,
+        })
+      }
+      if (timeline.at(-1)?.status === 'issued') {
+        timeline.push({
+          ...entry,
+          id: `${entry.id}-migration-sent`,
+          status: 'sent',
+          label: `${entry.label} — migrated digital send evidence`,
+        })
+      }
+    }
+    timeline.push({ ...entry, status })
+  })
+  return {
+    ...shipment,
+    purpose: 'original',
+    status: timeline.at(-1)?.status ?? 'unfulfilled',
+    carrier: 'Digital Vault',
+    trackingNumber: `DEMO-${shipment.id.slice(4).toUpperCase()}`,
+    timeline,
+  }
+}
+
+function migratePhysicalShipmentV6(shipment: LegacyShipmentV6): Shipment {
+  let exception: Extract<Shipment['status'], 'failed_delivery' | 'lost' | 'returned'> | undefined
+  const timeline = shipment.timeline.map((entry) => {
+    if (['failed_delivery', 'lost', 'returned'].includes(entry.status)) {
+      exception = entry.status as typeof exception
+      return { ...entry }
+    }
+    if (exception && (entry.status === 'shipped' || entry.status === 'delivered')) {
+      return { ...entry, status: exception }
+    }
+    return { ...entry }
+  })
+  return {
+    ...shipment,
+    purpose: 'original',
+    status: timeline.at(-1)?.status ?? shipment.status,
+    timeline,
+  }
+}
+
+function normalizeMigratedFulfillment(candidate: DemoState) {
+  for (const order of candidate.orders) {
+    if (
+      order.status === 'pending_payment' ||
+      ['cancelled', 'refunded', 'disputed'].includes(order.status)
+    ) {
+      continue
+    }
+    const resolution = resolveOrderFulfillment(candidate, order)
+    const target = order.status === 'closed' && resolution.status === 'fulfilled'
+      ? 'closed'
+      : resolution.status
+    order.status = target
+    if (order.timeline.length > 0) order.timeline.at(-1)!.status = target
+    for (const scope of resolution.scopes) {
+      for (const boxId of scope.boxIds) {
+        const box = candidate.boxes.find((entry) => entry.id === boxId)
+        if (!box) continue
+        box.status = expectedBoxStatusForScope(
+          candidate,
+          scope,
+          box.status,
+          Boolean(box.revealedAt),
+        )
+      }
+    }
+  }
+}
+
+export function migrateDemoStateV6(value: unknown): DemoState {
+  if (
+    !record(value) ||
+    value.schemaVersion !== 6 ||
+    !Array.isArray(value.shipments) ||
+    !Array.isArray(value.claims)
+  ) {
+    throw new DomainError('Stored data is not a version 6 demo state.', 'MIGRATION_SOURCE_INVALID')
+  }
+  const legacy = structuredClone(value) as LegacyDemoStateV6
+  const shipments: Shipment[] = legacy.shipments.map((shipment) =>
+    shipment.kind === 'DIGITAL'
+      ? migrateDigitalShipmentV6(shipment)
+      : migratePhysicalShipmentV6(shipment))
+  const claims: Claim[] = legacy.claims.map((claim) => ({
+    ...claim,
+    remedyState:
+      claim.status === 'resolved' && claim.resolutionOutcome === 'refund_recorded'
+        ? 'refund_completed'
+        : claim.linkedRefundEventId
+          ? 'refund_linked'
+          : claim.status === 'resolved' && claim.resolutionOutcome === 'no_remedy'
+            ? 'no_remedy'
+            : 'none',
+    ...(
+      claim.status === 'resolved' &&
+      (
+        claim.resolutionOutcome === 'replacement_authorized' ||
+        claim.resolutionOutcome === 'return_rma_created'
+      )
+        ? { legacyTypedResolution: true as const }
+        : {}
+    ),
+  }))
+  const candidate = {
+    ...legacy,
+    schemaVersion: SCHEMA_VERSION,
+    shipments,
+    claims,
   } as DemoState
+  normalizeMigratedFulfillment(candidate)
   validateDemoState(candidate)
   return candidate
+}
+
+export function migrateDemoStateV5(value: unknown): DemoState {
+  return migrateDemoStateV6(migrateDemoStateV5ToV6(value))
 }
 
 export class MockRepository {
@@ -195,7 +367,7 @@ export class MockRepository {
         this.recoveryNotice = loaded.migratedFromRaw
           ? `${loaded.notice ?? 'Demo data was upgraded in memory.'} Browser storage could not save the upgrade. ${
               preserved
-                ? 'The original version 5 data was left unchanged, and this tab is continuing safely in memory only.'
+                ? `The original version ${loaded.migratedFromVersion ?? 5} data was left unchanged, and this tab is continuing safely in memory only.`
                 : 'This tab is continuing safely in memory only.'
             }`
           : `${loaded.notice ?? 'Safe demo data was loaded.'} Browser storage could not save it, so this tab is continuing in memory only.`
@@ -229,13 +401,27 @@ export class MockRepository {
       if (isDemoState(parsed)) {
         return { state: parsed, notice: null, needsPersist: false }
       }
+      if (record(parsed) && parsed.schemaVersion === 6) {
+        try {
+          return {
+            state: migrateDemoStateV6(parsed),
+            notice: 'Demo data was upgraded safely from version 6 to version 7.',
+            needsPersist: true,
+            migratedFromRaw: raw,
+            migratedFromVersion: 6,
+          }
+        } catch {
+          // Invalid version 6 data follows the same safe fixture recovery path below.
+        }
+      }
       if (record(parsed) && parsed.schemaVersion === 5) {
         try {
           return {
             state: migrateDemoStateV5(parsed),
-            notice: 'Demo data was upgraded safely from version 5 to version 6.',
+            notice: 'Demo data was upgraded safely from version 5 through version 6 to version 7.',
             needsPersist: true,
             migratedFromRaw: raw,
+            migratedFromVersion: 5,
           }
         } catch {
           return this.protectedRecovery(

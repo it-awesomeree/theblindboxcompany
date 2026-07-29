@@ -1,4 +1,4 @@
-import { canTransitionShipment } from './guards'
+import { canTransitionShipmentForKind } from './guards'
 import type { OrderStatus, Shipment, ShipmentStatus } from './types'
 
 const FINANCIAL_HOLD_STATUSES: readonly OrderStatus[] = [
@@ -17,7 +17,7 @@ const TRACKING_EDITABLE_STATUSES: readonly ShipmentStatus[] = [
 const FINANCIAL_HOLD_CARRIER_EDGES: Partial<
   Record<ShipmentStatus, readonly ShipmentStatus[]>
 > = {
-  failed_delivery: ['shipped'],
+  failed_delivery: ['lost', 'returned'],
   shipped: ['delivered', 'failed_delivery', 'lost', 'returned'],
   delivered: ['returned'],
 }
@@ -51,7 +51,7 @@ export function shipmentStatusActionEligibility(
           code: 'FINANCIAL_HOLD',
         }
   }
-  return canTransitionShipment(shipment.status, next)
+  return canTransitionShipmentForKind(shipment.kind, shipment.status, next)
     ? {
         eligible: true,
         reason: 'This shipment transition is graph-legal.',
@@ -68,6 +68,13 @@ export function shipmentTrackingActionEligibility(
   orderStatus: OrderStatus,
   shipment: Shipment,
 ): FulfillmentActionEligibility {
+  if (shipment.kind === 'DIGITAL') {
+    return {
+      eligible: false,
+      reason: 'Digital fulfilment never uses editable carrier tracking.',
+      code: 'DIGITAL_TRACKING_FORBIDDEN',
+    }
+  }
   if (FINANCIAL_HOLD_STATUSES.includes(orderStatus)) {
     return {
       eligible: false,

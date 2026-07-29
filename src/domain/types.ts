@@ -44,12 +44,16 @@ export type ShipmentStatus =
   | 'packed'
   | 'label_created'
   | 'shipped'
+  | 'issued'
+  | 'sent'
   | 'delivered'
+  | 'failed'
   | 'failed_delivery'
   | 'lost'
   | 'returned'
   | 'cancelled'
 export type FulfilmentKind = 'PARCEL' | 'BULKY' | 'DIGITAL' | 'SELF_COLLECT'
+export type ShipmentPurpose = 'original' | 'replacement'
 export type ShippingMethod = 'standard' | 'priority' | 'self_collect'
 export type PaymentMethod = 'FPX' | 'DUITNOW' | 'CARD' | 'GRABPAY' | 'TNG'
 
@@ -212,6 +216,9 @@ export interface Shipment {
   orderId: string
   boxIds: string[]
   kind: FulfilmentKind
+  purpose: ShipmentPurpose
+  sourceClaimId?: string
+  replacementForShipmentId?: string
   status: ShipmentStatus
   carrier: string
   trackingNumber: string
@@ -228,6 +235,33 @@ export type ClaimResolutionOutcome =
   | 'return_rma_created'
   | 'refund_recorded'
   | 'no_remedy'
+export type RmaStatus = 'created' | 'received' | 'inspected'
+export type ClaimRemedyState =
+  | 'none'
+  | 'refund_linked'
+  | 'refund_completed'
+  | 'rma_created'
+  | 'rma_received'
+  | 'rma_inspected'
+  | 'replacement_authorized'
+  | 'replacement_delivered'
+  | 'no_remedy'
+
+export interface ClaimRmaEvidence {
+  reference: string
+  status: RmaStatus
+  createdAt: string
+  createdReason: string
+  receivedAt?: string
+  receivedReason?: string
+  inspectedAt?: string
+  inspectedReason?: string
+}
+
+export interface ReplacementAuthorizationEvidence {
+  at: string
+  reason: string
+}
 
 export interface ClaimHistoryEntry {
   id: string
@@ -250,6 +284,11 @@ export interface Claim {
   shipmentCandidateEvidenceAt?: Record<string, string>
   boxId?: string
   status: ClaimStatus
+  remedyState: ClaimRemedyState
+  rma?: ClaimRmaEvidence
+  replacementShipmentId?: string
+  replacementAuthorization?: ReplacementAuthorizationEvidence
+  legacyTypedResolution?: true
   createdAt: string
   updatedAt: string
   resolutionNote?: string
@@ -278,7 +317,7 @@ export interface AuditEntry {
 }
 
 export interface DemoState {
-  schemaVersion: 6
+  schemaVersion: 7
   revision: number
   nextSequence: number
   auditCount: number

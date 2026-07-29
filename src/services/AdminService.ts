@@ -16,6 +16,7 @@ import {
 } from '../domain/guards'
 import { publishedPrizesFor } from '../domain/selectors'
 import { isValidPrizeDefinition } from '../domain/prizeValidation'
+import { resolveOrderFulfillment } from '../domain/orderFulfillment'
 import type { DemoState, OrderStatus } from '../domain/types'
 import type { MockRepository } from '../data/MockRepository'
 import { AuditService } from './AuditService'
@@ -51,7 +52,9 @@ export class AdminService {
         .reduce((sum, payment) => sum + payment.amountSen, 0),
       openOrders: state.orders.filter((order) => !['closed', 'cancelled', 'refunded'].includes(order.status)).length,
       paymentExceptions: state.payments.filter((payment) => ['failed', 'expired', 'disputed'].includes(payment.status)).length,
-      fulfilmentExceptions: state.shipments.filter((shipment) => ['failed_delivery', 'lost', 'returned'].includes(shipment.status)).length,
+      fulfilmentExceptions: state.shipments.filter((shipment) =>
+        ['failed', 'failed_delivery', 'lost', 'returned'].includes(shipment.status),
+      ).length,
       assigned,
       remaining: (published?.allocationTotal ?? 0) - assigned - (published?.reservedBoxes ?? 0),
       reserved: published?.reservedBoxes ?? 0,
@@ -139,11 +142,15 @@ export class AdminService {
         'Payment and shipment services own this transition; a manual order change would create inconsistent records.',
         'SERVICE_OWNED_TRANSITION',
       )
-      const relatedShipments = state.shipments.filter((shipment) => shipment.orderId === order.id)
       const openClaims = state.claims.some((claim) =>
         claim.orderId === order.id && isOpenClaimStatus(claim.status),
       )
-      assert(relatedShipments.length > 0 && relatedShipments.every((shipment) => shipment.status === 'delivered'), 'All shipments must be delivered before closing.', 'FULFILMENT_INCOMPLETE')
+      const resolution = resolveOrderFulfillment(state, order)
+      assert(
+        resolution.scopes.length > 0 && resolution.status === 'fulfilled',
+        'Every original delivery scope needs completed delivery or an exact linked remedy before closing.',
+        'FULFILMENT_INCOMPLETE',
+      )
       assert(!openClaims, 'Resolve or reject open claims before closing.', 'CLAIM_OPEN')
       order.status = transitionOrder(order.status, status)
       order.updatedAt = now

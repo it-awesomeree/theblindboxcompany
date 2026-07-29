@@ -15,6 +15,7 @@ import {
 import { validateCanonicalAuditEvidence } from '../domain/auditEvidence'
 import {
   assert,
+  canTransitionShipmentForKind,
   CHECKOUT_REQUEST_ID_PATTERN,
   isClearlyFictionalCarrier,
   isValidDemoTracking,
@@ -32,17 +33,30 @@ import {
   CLAIM_EVIDENCE_WIDENING_NOTE,
   isOpenClaimStatus,
 } from '../domain/claimStatus'
-import { deriveOrderStatusFromShipments } from '../domain/orderStatus'
+import {
+  expectedBoxStatusForScope,
+  resolveOrderFulfillment,
+} from '../domain/orderFulfillment'
 import { isValidPrizeDefinition } from '../domain/prizeValidation'
 import {
   claimRefundLinkedHistoryNote,
   matchingAppliedClaimRefundLinkAudit,
   matchingAppliedPaymentRefundAudit,
 } from '../domain/refundLink'
+import {
+  matchingReplacementAuthorizationAudit,
+  matchingReplacementDeliveryAudit,
+  matchingReplacementTransitionAudit,
+  matchingRmaAudit,
+  RMA_CREATED_ACTION,
+  RMA_INSPECTED_ACTION,
+  RMA_RECEIVED_ACTION,
+} from '../domain/remedyEvidence'
 import type {
   Box,
   BoxStatus,
   ClaimKind,
+  ClaimRemedyState,
   ClaimResolutionOutcome,
   ClaimStatus,
   DemoState,
@@ -52,9 +66,11 @@ import type {
   PaymentMethod,
   PaymentStatus,
   Role,
+  RmaStatus,
   SeriesStatus,
   ShippingMethod,
   ShipmentStatus,
+  ShipmentPurpose,
 } from '../domain/types'
 
 const ROLES: Role[] = ['customer', ...ADMIN_ROLES]
@@ -72,6 +88,38 @@ const CLAIM_RESOLUTION_OUTCOMES = new Set<ClaimResolutionOutcome>([
   'return_rma_created',
   'refund_recorded',
   'no_remedy',
+])
+const CLAIM_REMEDY_STATES = new Set<ClaimRemedyState>([
+  'none',
+  'refund_linked',
+  'refund_completed',
+  'rma_created',
+  'rma_received',
+  'rma_inspected',
+  'replacement_authorized',
+  'replacement_delivered',
+  'no_remedy',
+])
+const RMA_STATUSES = new Set<RmaStatus>(['created', 'received', 'inspected'])
+const SHIPMENT_PURPOSES = new Set<ShipmentPurpose>(['original', 'replacement'])
+const PHYSICAL_SHIPMENT_STATUSES = new Set<ShipmentStatus>([
+  'unfulfilled',
+  'picking',
+  'packed',
+  'label_created',
+  'shipped',
+  'delivered',
+  'failed_delivery',
+  'lost',
+  'returned',
+  'cancelled',
+])
+const DIGITAL_SHIPMENT_STATUSES = new Set<ShipmentStatus>([
+  'unfulfilled',
+  'issued',
+  'sent',
+  'delivered',
+  'failed',
 ])
 const SERIES_STATUSES = new Set<SeriesStatus>(['draft', 'published'])
 const FULFILMENT_KINDS = new Set<FulfilmentKind>(['PARCEL', 'BULKY', 'DIGITAL', 'SELF_COLLECT'])
@@ -206,12 +254,44 @@ function eligibleClaimShipmentIds(
     .sort((left, right) => left.localeCompare(right))
 }
 
+function matchingLegacyTypedResolutionAudit(state: DemoState, claim: DemoState['claims'][number]) {
+  const history = claim.history.at(-1)
+  if (
+    !history ||
+    history.status !== 'resolved' ||
+    !claim.resolutionOutcome ||
+    !claim.resolutionReference ||
+    !claim.resolutionNote
+  ) {
+    return undefined
+  }
+  return state.audits.find((audit) =>
+    audit.outcome === 'applied' &&
+    ['support', 'admin', 'super_admin'].includes(audit.actorRole) &&
+    audit.action === 'claim.resolve' &&
+    audit.targetType === 'claim' &&
+    audit.targetId === claim.id &&
+    audit.reason === claim.resolutionNote &&
+    audit.at === history.at &&
+    audit.actorId === history.actorId &&
+    audit.actorRole === history.actorRole &&
+    JSON.stringify(audit.before) === JSON.stringify({ status: 'approved' }) &&
+    JSON.stringify(audit.after) === JSON.stringify({
+      refundCreated: false,
+      resolutionOutcome: claim.resolutionOutcome,
+      resolutionReference: claim.resolutionReference,
+      status: 'resolved',
+    }),
+  )
+}
+
 function validateOrderFulfilment(state: DemoState, orderId: string) {
   const order = state.orders.find((entry) => entry.id === orderId)!
   const shipments = state.shipments.filter((entry) => entry.orderId === order.id)
   if (FINANCIAL_STOP.has(order.status)) {
     assert(
-      shipments.every((shipment) => !UNSHIPPED.has(shipment.status)),
+      shipments.every((shipment) =>
+        shipment.kind === 'DIGITAL' || !UNSHIPPED.has(shipment.status)),
       'A financially stopped order cannot retain eligible unshipped fulfilment.',
     )
     return
@@ -221,14 +301,18 @@ function validateOrderFulfilment(state: DemoState, orderId: string) {
     return
   }
   assert(shipments.length > 0, 'A paid order must have coherent fulfilment records.')
-  const derived = deriveOrderStatusFromShipments(shipments.map((shipment) => shipment.status))
+  const resolution = resolveOrderFulfillment(state, order)
+  assert(resolution.scopes.length > 0, 'A paid order must have original fulfilment scopes.')
   if (order.status === 'closed') {
-    assert(derived === 'fulfilled', 'A closed order requires every shipment to be delivered.')
+    assert(
+      resolution.status === 'fulfilled',
+      'A closed order requires every original scope to have completed delivery or remedy.',
+    )
     return
   }
   assert(
-    order.status === derived,
-    `Order ${order.id} status must be ${derived} for its shipment progress.`,
+    order.status === resolution.status,
+    `Order ${order.id} status must be ${resolution.status} for its original scope and remedy progress.`,
   )
 }
 
@@ -239,17 +323,30 @@ function validateBoxShipment(state: DemoState, box: Box) {
   }
   assert(box.shipmentId, 'Every allocated box needs a documented fulfilment record.')
   const shipment = state.shipments.find((entry) => entry.id === box.shipmentId)
-  assert(shipment && shipment.boxIds.includes(box.id), 'Box shipment reference is inconsistent.')
+  assert(
+    shipment &&
+      shipment.purpose === 'original' &&
+      shipment.boxIds.includes(box.id),
+    'Box shipment reference must preserve its original shipment provenance.',
+  )
   const order = state.orders.find((entry) => entry.id === box.orderId)!
   if (FINANCIAL_STOP.has(order.status)) {
     if (!box.revealedAt) assert(box.status === 'on_hold', 'An unopened allocated box must stay on financial hold.')
     return
   }
-  if (shipment.status === 'shipped') assert(box.status === 'fulfillment_pending', 'A shipped box must be in fulfilment.')
-  if (shipment.status === 'delivered') assert(box.status === 'fulfilled', 'A delivered box must be fulfilled.')
-  if (['failed_delivery', 'lost', 'returned', 'cancelled'].includes(shipment.status)) {
-    assert(box.status === 'on_hold', 'A shipment exception must put its box on hold.')
-  }
+  const resolution = resolveOrderFulfillment(state, order)
+  const scope = resolution.scopes.find((entry) => entry.originalShipmentId === shipment.id)
+  assert(scope, 'Box original fulfilment scope is missing.')
+  const expected = expectedBoxStatusForScope(
+    state,
+    scope,
+    box.status,
+    Boolean(box.revealedAt),
+  )
+  assert(
+    box.status === expected,
+    `Box ${box.id} status must be ${expected} for its original scope and remedy progress.`,
+  )
 }
 
 export function validateDemoState(value: unknown): asserts value is DemoState {
@@ -698,14 +795,108 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
 
   unique(state.boxes.map((box) => box.manifestId), 'Box manifest')
   unique(state.shipments.map((shipment) => shipment.trackingNumber), 'Shipment tracking')
+  const replacementClaimIds: string[] = []
+  const replacementOriginalIds: string[] = []
   for (const shipment of state.shipments) {
-    assert(SHIPMENT_STATUSES.has(shipment.status) && FULFILMENT_KINDS.has(shipment.kind), 'Shipment status or kind is invalid.')
+    assert(
+      SHIPMENT_STATUSES.has(shipment.status) &&
+        FULFILMENT_KINDS.has(shipment.kind) &&
+        SHIPMENT_PURPOSES.has(shipment.purpose),
+      'Shipment status, kind, or purpose is invalid.',
+    )
     const order = state.orders.find((entry) => entry.id === shipment.orderId)
     assert(order, 'Shipment order reference is invalid.')
     assert(Array.isArray(shipment.boxIds) && Array.isArray(shipment.timeline), 'Shipment links and timeline must be collections.')
     unique(shipment.boxIds, `Shipment ${shipment.id} box`)
     assert(shipment.boxIds.length > 0, 'Shipment must contain a box.')
-    assert(shipment.boxIds.every((id) => state.boxes.some((box) => box.id === id && box.shipmentId === shipment.id && box.orderId === order.id)), 'Shipment box reference is invalid.')
+    assert(
+      shipment.boxIds.every((id) => state.boxes.some((box) =>
+        box.id === id && box.orderId === order.id)),
+      'Shipment box reference is invalid.',
+    )
+    if (shipment.purpose === 'original') {
+      assert(
+        shipment.sourceClaimId === undefined &&
+          shipment.replacementForShipmentId === undefined,
+        'Original shipments cannot carry replacement provenance.',
+      )
+      assert(
+        shipment.boxIds.every((id) => state.boxes.some((box) =>
+          box.id === id && box.shipmentId === shipment.id)),
+        'Original shipment must own each box provenance link.',
+      )
+    } else {
+      assert(
+        normalizedText(shipment.sourceClaimId, 120) &&
+          normalizedText(shipment.replacementForShipmentId, 120),
+        'Replacement shipment requires claim and original reverse links.',
+      )
+      const original = state.shipments.find((entry) =>
+        entry.id === shipment.replacementForShipmentId)
+      const claim = state.claims.find((entry) => entry.id === shipment.sourceClaimId)
+      assert(
+        original &&
+          original.purpose === 'original' &&
+          original.orderId === shipment.orderId &&
+          claim &&
+          claim.orderId === shipment.orderId &&
+          claim.userId === order.userId &&
+          claim.replacementShipmentId === shipment.id,
+        'Replacement shipment reverse links must match one same-order original and claim.',
+      )
+      assert(
+        JSON.stringify(shipment.boxIds) === JSON.stringify(original.boxIds) &&
+          shipment.kind === original.kind &&
+          shipment.insured === original.insured &&
+          shipment.signatureRequired === original.signatureRequired,
+        'Replacement shipment must preserve the exact original box scope, kind, and flags.',
+      )
+      assert(
+        shipment.boxIds.every((id) => state.boxes.some((box) =>
+          box.id === id && box.shipmentId === original.id)),
+        'Replacement boxes must retain their original box shipment provenance.',
+      )
+      assert(
+        timestamp(shipment.createdAt) >= timestamp(original.createdAt) &&
+          timestamp(shipment.createdAt) >= timestamp(claim.createdAt),
+        'Replacement shipment cannot precede its original or claim.',
+      )
+      const approvedAt = claim.history.find((entry) => entry.status === 'approved')?.at
+      assert(
+        approvedAt && timestamp(shipment.createdAt) >= timestamp(approvedAt),
+        'Replacement shipment cannot precede claim approval.',
+      )
+      assert(
+        claim.replacementAuthorization?.at === shipment.createdAt &&
+          matchingReplacementAuthorizationAudit(state, claim, original, shipment) &&
+          claim.history.some((entry) =>
+            entry.status === 'approved' &&
+            entry.at === shipment.createdAt &&
+            entry.note === claim.replacementAuthorization?.reason &&
+            ['fulfilment', 'admin', 'super_admin'].includes(entry.actorRole)),
+        'Replacement authorization requires matching immutable claim history and audit evidence.',
+      )
+      if (shipment.status === 'delivered') {
+        assert(
+          claim.status === 'resolved' &&
+            claim.remedyState === 'replacement_delivered' &&
+            claim.resolutionOutcome === 'replacement_authorized' &&
+            claim.resolutionReference === shipment.id &&
+            matchingReplacementDeliveryAudit(state, claim, shipment),
+          'Delivered replacement requires exact resolved claim history and audit evidence.',
+        )
+      } else {
+        assert(
+          claim.status === 'approved' &&
+            claim.remedyState === 'replacement_authorized' &&
+            claim.resolutionOutcome === undefined &&
+            claim.resolutionReference === undefined,
+          'Undelivered replacement must keep its claim approved and incomplete.',
+        )
+      }
+      replacementClaimIds.push(claim.id)
+      replacementOriginalIds.push(original.id)
+    }
     const linkedPrizes = shipment.boxIds.map((boxId) => {
       const box = state.boxes.find((entry) => entry.id === boxId)!
       const series = state.series.find((entry) => entry.id === box.seriesId)
@@ -728,6 +919,22 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
     )
     assert(isClearlyFictionalCarrier(shipment.carrier), 'Shipment carrier must remain clearly fictional.')
     assert(isValidDemoTracking(shipment.trackingNumber), 'Shipment tracking must remain a valid DEMO- code.')
+    if (shipment.kind === 'DIGITAL') {
+      assert(
+        shipment.timeline.every((entry) => DIGITAL_SHIPMENT_STATUSES.has(entry.status)),
+        'Digital shipment history can only use unfulfilled, issued, sent, delivered, or failed.',
+      )
+      assert(
+        shipment.carrier === 'Digital Vault' &&
+          shipment.trackingNumber === `DEMO-${shipment.id.slice(4).toUpperCase()}`,
+        'Digital carrier and tracking must remain at their immutable generated values.',
+      )
+    } else {
+      assert(
+        shipment.timeline.every((entry) => PHYSICAL_SHIPMENT_STATUSES.has(entry.status)),
+        'Physical shipment history cannot use digital issued, sent, or failed statuses.',
+      )
+    }
     assert(validIso(shipment.createdAt), 'Shipment time is invalid.')
     assert(shipment.timeline.length > 0 && shipment.timeline[0].status === 'unfulfilled' && shipment.timeline.at(-1)?.status === shipment.status, 'Shipment timeline is incomplete.')
     assert(
@@ -750,14 +957,65 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
       .map(capturedAt)
       .find(Boolean)
     assert(captureTime && timestamp(shipment.createdAt) >= timestamp(captureTime), 'Shipment cannot precede captured payment.')
-    changedStatusesAreLegal(shipment.timeline.map((entry) => entry.status), SHIPMENT_TRANSITIONS, `Shipment ${shipment.id}`)
+    for (let index = 1; index < shipment.timeline.length; index += 1) {
+      const before = shipment.timeline[index - 1].status
+      const after = shipment.timeline[index].status
+      if (before !== after) {
+        assert(
+          canTransitionShipmentForKind(shipment.kind, before, after),
+          `Shipment ${shipment.id} timeline has an illegal ${before} to ${after} jump.`,
+        )
+      }
+      if (shipment.purpose === 'replacement') {
+        assert(
+          matchingReplacementTransitionAudit(state, shipment, index),
+          'Replacement shipment progress requires matching applied transition audit evidence.',
+        )
+      }
+    }
+    const firstNonDelivery = shipment.timeline.findIndex((entry) =>
+      ['failed', 'failed_delivery', 'lost', 'returned'].includes(entry.status))
+    if (shipment.purpose === 'original' && firstNonDelivery >= 0) {
+      assert(
+        !shipment.timeline
+          .slice(firstNonDelivery + 1)
+          .some((entry) => entry.status === 'delivered'),
+        'An original shipment exception cannot be rewritten to successful delivery.',
+      )
+    }
+  }
+  unique(replacementClaimIds, 'Replacement claim')
+  unique(replacementOriginalIds, 'Replacement original shipment')
+  for (const order of state.orders) {
+    const allocatedBoxIds = order.boxIds.filter((boxId) =>
+      state.boxes.some((box) => box.id === boxId && box.prizeId))
+    if (allocatedBoxIds.length === 0) continue
+    const originalBoxIds = state.shipments
+      .filter((shipment) =>
+        shipment.orderId === order.id && shipment.purpose === 'original')
+      .flatMap((shipment) => shipment.boxIds)
+    unique(originalBoxIds, `Order ${order.id} original shipment box`)
+    assert(
+      JSON.stringify([...originalBoxIds].sort()) ===
+        JSON.stringify([...allocatedBoxIds].sort()),
+      'Original shipment scopes must cover each paid order box exactly once; replacements add no scopes.',
+    )
   }
 
   unique(state.claims.map((claim) => claim.requestId), 'Claim request')
   const claimLinkedRefundEventIds: string[] = []
   const refundResolutionReferences: string[] = []
   for (const claim of state.claims) {
-    assert(CLAIM_KINDS.has(claim.kind) && CLAIM_STATUSES.has(claim.status), 'Claim kind or status is invalid.')
+    assert(
+      CLAIM_KINDS.has(claim.kind) &&
+        CLAIM_STATUSES.has(claim.status) &&
+        CLAIM_REMEDY_STATES.has(claim.remedyState),
+      'Claim kind, status, or remedy state is invalid.',
+    )
+    assert(
+      claim.legacyTypedResolution === undefined || claim.legacyTypedResolution === true,
+      'Legacy typed-resolution marker is invalid.',
+    )
     const order = state.orders.find((entry) => entry.id === claim.orderId)
     assert(order?.userId === claim.userId && order.claimIds.includes(claim.id), 'Claim order reference is invalid.')
     assert(customerClaimNoteIsSafe(claim.note), 'Customer claim note must be fictional and include DEMO without email or phone data.')
@@ -784,6 +1042,144 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
     )
     assert(timestamp(claim.history.at(-1)!.at) <= timestamp(claim.updatedAt), 'Claim history cannot end after its updated time.')
     changedStatusesAreLegal(claim.history.map((entry) => entry.status), CLAIM_TRANSITIONS, `Claim ${claim.id}`)
+    if (claim.rma !== undefined) {
+      assert(record(claim.rma), 'Claim RMA evidence must be a structured record.')
+      const rmaOriginalId =
+        claim.shipmentId ??
+        (claim.shipmentCandidateIds?.length === 1
+          ? claim.shipmentCandidateIds[0]
+          : undefined) ??
+        (claim.boxId
+          ? state.boxes.find((box) =>
+              box.id === claim.boxId && box.orderId === claim.orderId)?.shipmentId
+          : undefined)
+      const rmaOriginal = state.shipments.find((shipment) =>
+        shipment.id === rmaOriginalId &&
+        shipment.orderId === claim.orderId &&
+        shipment.purpose === 'original')
+      assert(
+        rmaOriginal &&
+          rmaOriginal.kind !== 'DIGITAL' &&
+          rmaOriginal.timeline.some((entry) =>
+            entry.status === 'delivered' &&
+            timestamp(entry.at) <= timestamp(claim.createdAt)),
+        'RMA evidence requires a physical original delivered by claim creation.',
+      )
+      assert(
+        /^DEMO-[A-Z0-9][A-Z0-9-]{2,96}$/.test(claim.rma.reference) &&
+          RMA_STATUSES.has(claim.rma.status) &&
+          validIso(claim.rma.createdAt) &&
+          normalizedText(claim.rma.createdReason, 500),
+        'Claim RMA creation evidence is invalid.',
+      )
+      const approvedAt = claim.history.find((entry) => entry.status === 'approved')?.at
+      assert(
+        approvedAt &&
+          timestamp(claim.rma.createdAt) >= timestamp(approvedAt) &&
+          timestamp(claim.rma.createdAt) <= timestamp(claim.updatedAt),
+        'RMA creation cannot precede approval or end after the claim update.',
+      )
+      const createdAudit = matchingRmaAudit(
+        state,
+        claim,
+        RMA_CREATED_ACTION,
+        claim.rma.createdAt,
+        claim.rma.createdReason,
+        'none',
+        null,
+        'rma_created',
+        'created',
+      )
+      assert(
+        createdAudit &&
+          claim.history.some((entry) =>
+            entry.status === 'approved' &&
+            entry.at === claim.rma!.createdAt &&
+            entry.note === claim.rma!.createdReason &&
+            entry.actorId === createdAudit.actorId &&
+            entry.actorRole === createdAudit.actorRole),
+        'RMA creation requires matching immutable same-status history and audit evidence.',
+      )
+      if (claim.rma.status === 'created') {
+        assert(
+          claim.rma.receivedAt === undefined &&
+            claim.rma.receivedReason === undefined &&
+            claim.rma.inspectedAt === undefined &&
+            claim.rma.inspectedReason === undefined,
+          'Created RMA evidence cannot contain receipt or inspection fields.',
+        )
+      } else {
+        assert(
+          validIso(claim.rma.receivedAt) &&
+            normalizedText(claim.rma.receivedReason, 500) &&
+            timestamp(claim.rma.receivedAt!) >= timestamp(claim.rma.createdAt) &&
+            timestamp(claim.rma.receivedAt!) <= timestamp(claim.updatedAt),
+          'RMA receipt evidence or chronology is invalid.',
+        )
+        const receivedAudit = matchingRmaAudit(
+          state,
+          claim,
+          RMA_RECEIVED_ACTION,
+          claim.rma.receivedAt!,
+          claim.rma.receivedReason!,
+          'rma_created',
+          'created',
+          'rma_received',
+          'received',
+        )
+        assert(
+          receivedAudit &&
+            claim.history.some((entry) =>
+              entry.status === 'approved' &&
+              entry.at === claim.rma!.receivedAt &&
+              entry.note === claim.rma!.receivedReason &&
+              entry.actorId === receivedAudit.actorId &&
+              entry.actorRole === receivedAudit.actorRole),
+          'RMA receipt requires matching immutable same-status history and audit evidence.',
+        )
+        if (claim.rma.status === 'received') {
+          assert(
+            claim.rma.inspectedAt === undefined &&
+              claim.rma.inspectedReason === undefined,
+            'Received RMA evidence cannot contain inspection fields.',
+          )
+        } else {
+          assert(
+            validIso(claim.rma.inspectedAt) &&
+              normalizedText(claim.rma.inspectedReason, 500) &&
+              timestamp(claim.rma.inspectedAt!) >= timestamp(claim.rma.receivedAt!) &&
+              timestamp(claim.rma.inspectedAt!) <= timestamp(claim.updatedAt),
+            'RMA inspection evidence or chronology is invalid.',
+          )
+          const inspectedAudit = matchingRmaAudit(
+            state,
+            claim,
+            RMA_INSPECTED_ACTION,
+            claim.rma.inspectedAt!,
+            claim.rma.inspectedReason!,
+            'rma_received',
+            'received',
+            'rma_inspected',
+            'inspected',
+          )
+          assert(
+            inspectedAudit &&
+              claim.history.some((entry) =>
+                entry.status === 'approved' &&
+                entry.at === claim.rma!.inspectedAt &&
+                entry.note === claim.rma!.inspectedReason &&
+                entry.actorId === inspectedAudit.actorId &&
+                entry.actorRole === inspectedAudit.actorRole),
+            'RMA inspection requires matching immutable same-status history and audit evidence.',
+          )
+        }
+      }
+    } else {
+      assert(
+        !['rma_created', 'rma_received', 'rma_inspected'].includes(claim.remedyState),
+        'RMA remedy state requires ordered RMA evidence.',
+      )
+    }
     const hasLinkedRefundEventId = Object.prototype.hasOwnProperty.call(
       claim,
       'linkedRefundEventId',
@@ -829,11 +1225,22 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
         'A refund-linked claim must remain approved or resolve with that exact refund event.',
       )
       assert(
+        claim.remedyState === (
+          claim.status === 'resolved' ? 'refund_completed' : 'refund_linked'
+        ),
+        'Claim refund remedy state must match its approved or completed linked refund.',
+      )
+      assert(
         matchingAppliedPaymentRefundAudit(state, payment, event, claim) &&
           matchingAppliedClaimRefundLinkAudit(state, payment, event, claim),
         'Claim reverse refund link requires matching applied payment and claim audit evidence.',
       )
       claimLinkedRefundEventIds.push(claim.linkedRefundEventId)
+    } else {
+      assert(
+        !['refund_linked', 'refund_completed'].includes(claim.remedyState),
+        'Refund remedy state requires the exact bidirectional refund event link.',
+      )
     }
     const hasBoxLink = claim.boxId !== undefined
     const hasExactShipmentLink = claim.shipmentId !== undefined
@@ -864,7 +1271,10 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
         everyOrderBoxRevealedAt(state, claim.orderId, claim.createdAt),
         'Exact shipment claims require every order box to be revealed by claim creation.',
       )
-      const shipment = state.shipments.find((entry) => entry.id === claim.shipmentId && entry.orderId === claim.orderId)
+      const shipment = state.shipments.find((entry) =>
+        entry.id === claim.shipmentId &&
+        entry.orderId === claim.orderId &&
+        entry.purpose === 'original')
       assert(shipment, 'Claim shipment reference is invalid.')
       assert(
         shipmentClaimEligibility(shipment, claim.kind, claim.createdAt).eligible,
@@ -996,8 +1406,79 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
         )
       }
     }
-    if (claim.shipmentId) assert(state.shipments.some((shipment) => shipment.id === claim.shipmentId && shipment.orderId === claim.orderId), 'Claim shipment reference is invalid.')
+    if (claim.shipmentId) {
+      assert(
+        state.shipments.some((shipment) =>
+          shipment.id === claim.shipmentId &&
+          shipment.orderId === claim.orderId &&
+          shipment.purpose === 'original'),
+        'Claim shipment reference must use an original shipment.',
+      )
+    }
     if (claim.boxId) assert(state.boxes.some((box) => box.id === claim.boxId && box.orderId === claim.orderId && box.ownerId === claim.userId), 'Claim box reference is invalid.')
+    if (claim.replacementShipmentId !== undefined) {
+      assert(
+        normalizedText(claim.replacementShipmentId, 120) &&
+          record(claim.replacementAuthorization) &&
+          validIso(claim.replacementAuthorization.at) &&
+          normalizedText(claim.replacementAuthorization.reason, 500),
+        'Claim replacement reverse link and authorization evidence are invalid.',
+      )
+      const replacements = state.shipments.filter((shipment) =>
+        shipment.id === claim.replacementShipmentId &&
+        shipment.purpose === 'replacement' &&
+        shipment.sourceClaimId === claim.id)
+      assert(
+        replacements.length === 1,
+        'Claim replacement reverse link must point to exactly one replacement shipment.',
+      )
+      assert(
+        !claim.rma || claim.rma.status === 'inspected',
+        'A selected RMA path must be inspected before replacement authorization.',
+      )
+      assert(
+        claim.remedyState === (
+          claim.status === 'resolved'
+            ? 'replacement_delivered'
+            : 'replacement_authorized'
+        ),
+        'Claim replacement remedy state must match its delivery completion.',
+      )
+    } else {
+      assert(
+        claim.replacementAuthorization === undefined &&
+          !['replacement_authorized', 'replacement_delivered'].includes(claim.remedyState),
+        'Replacement remedy state and authorization require the exact reverse shipment link.',
+      )
+    }
+    if (
+      claim.rma &&
+      claim.replacementShipmentId === undefined &&
+      claim.status !== 'resolved' &&
+      ['rma_created', 'rma_received', 'rma_inspected'].includes(claim.remedyState)
+    ) {
+      const expectedRmaState: ClaimRemedyState =
+        claim.rma.status === 'created'
+          ? 'rma_created'
+          : claim.rma.status === 'received'
+            ? 'rma_received'
+            : 'rma_inspected'
+      assert(
+        claim.remedyState === expectedRmaState,
+        'Claim RMA remedy state must match its latest ordered evidence.',
+      )
+    }
+    if (
+      claim.rma === undefined &&
+      claim.linkedRefundEventId === undefined &&
+      claim.replacementShipmentId === undefined &&
+      claim.status !== 'resolved'
+    ) {
+      assert(
+        claim.remedyState === 'none',
+        'A claim without remedy evidence must remain in the none remedy state.',
+      )
+    }
     if (claim.status === 'resolved') {
       assert(
         CLAIM_RESOLUTION_OUTCOMES.has(claim.resolutionOutcome as ClaimResolutionOutcome) &&
@@ -1006,6 +1487,10 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
         'Resolved claims require structured outcome, reference, and note evidence.',
       )
       if (claim.resolutionOutcome === 'refund_recorded') {
+        assert(
+          claim.legacyTypedResolution === undefined,
+          'Refund resolutions cannot use the legacy typed-resolution marker.',
+        )
         assert(
           claim.linkedRefundEventId !== undefined &&
             claim.resolutionReference === claim.linkedRefundEventId,
@@ -1030,7 +1515,35 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
             matchingAppliedPaymentRefundAudit(state, payment, event, claim),
           'Refund-recorded resolution must reference its linked audited refund event.',
         )
-      } else {
+      } else if (claim.resolutionOutcome === 'replacement_authorized') {
+        const replacement = state.shipments.find((shipment) =>
+          shipment.id === claim.replacementShipmentId &&
+          shipment.purpose === 'replacement' &&
+          shipment.sourceClaimId === claim.id &&
+          shipment.status === 'delivered')
+        if (claim.legacyTypedResolution) {
+          assert(
+            claim.remedyState === 'none' &&
+              claim.replacementShipmentId === undefined &&
+              /^DEMO-[A-Z0-9][A-Z0-9-]{2,96}$/.test(claim.resolutionReference!) &&
+              claim.resolutionNote!.length >= 16 &&
+              matchingLegacyTypedResolutionAudit(state, claim),
+            'Migrated version 6 replacement completion requires its exact immutable legacy history and audit.',
+          )
+        } else {
+          assert(
+            replacement &&
+              claim.remedyState === 'replacement_delivered' &&
+              claim.resolutionReference === replacement.id &&
+              matchingReplacementDeliveryAudit(state, claim, replacement),
+            'Replacement resolution requires its exact delivered shipment, reverse link, history, and audit.',
+          )
+        }
+      } else if (claim.resolutionOutcome === 'no_remedy') {
+        assert(
+          claim.legacyTypedResolution === undefined,
+          'No-remedy resolutions cannot use the legacy typed-resolution marker.',
+        )
         assert(
           claim.linkedRefundEventId === undefined,
           'Non-refund claim resolutions cannot carry a refund event link.',
@@ -1040,14 +1553,38 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
             claim.resolutionNote!.length >= 16,
           'Non-refund resolutions require a descriptive note and fictional DEMO- reference.',
         )
+        assert(
+          claim.remedyState === 'no_remedy' &&
+            claim.replacementShipmentId === undefined &&
+            claim.rma === undefined,
+          'No-remedy resolution cannot bypass a selected RMA refund or replacement outcome.',
+        )
+      } else {
+        assert(
+          claim.legacyTypedResolution === true &&
+            claim.resolutionOutcome === 'return_rma_created' &&
+            claim.remedyState === 'none' &&
+            claim.rma === undefined &&
+            claim.replacementShipmentId === undefined &&
+            /^DEMO-[A-Z0-9][A-Z0-9-]{2,96}$/.test(claim.resolutionReference!) &&
+            claim.resolutionNote!.length >= 16 &&
+            matchingLegacyTypedResolutionAudit(state, claim),
+          'RMA creation is an incomplete typed step; only exact immutable version 6 history may remain grandfathered.',
+        )
       }
     } else {
       assert(
-        claim.resolutionOutcome === undefined && claim.resolutionReference === undefined,
+        claim.resolutionOutcome === undefined &&
+          claim.resolutionReference === undefined &&
+          claim.legacyTypedResolution === undefined,
         'Only resolved claims may store structured resolution evidence.',
       )
     }
   }
+  unique(
+    state.claims.flatMap((claim) => claim.rma ? [claim.rma.reference] : []),
+    'RMA reference',
+  )
   unique(claimLinkedRefundEventIds, 'Claim-linked refund event')
   unique(refundResolutionReferences, 'Refund resolution reference')
   const openClaims = state.claims.filter((claim) => isOpenClaimStatus(claim.status))

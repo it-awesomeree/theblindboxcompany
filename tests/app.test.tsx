@@ -435,8 +435,8 @@ describe('app components', () => {
     services.claims.review(
       resolvedClaim.id,
       'resolve',
-      'Confirmed resolved queue replacement regression',
-      { outcome: 'replacement_authorized', reference: `DEMO-${resolvedClaim.id.toUpperCase()}` },
+      'Confirmed resolved queue no-remedy regression',
+      { outcome: 'no_remedy', reference: `DEMO-${resolvedClaim.id.toUpperCase()}` },
     )
     window.history.replaceState({}, '', '#/admin')
     render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
@@ -970,7 +970,7 @@ describe('app components', () => {
     services.auth.oneClick('admin')
     for (const [shipmentId, path] of [
       ['shp-processing', ['packed', 'label_created', 'shipped']],
-      ['shp-digital', ['picking', 'packed', 'label_created', 'shipped']],
+      ['shp-digital', ['issued', 'sent']],
     ] as const) {
       for (const status of path) {
         services.fulfilment.advance(shipmentId, status, `Confirmed Account privacy ${status}`)
@@ -1018,7 +1018,7 @@ describe('app components', () => {
     expect(within(revealedRecord).getByText(/record 1:/i)).toBeVisible()
     expect(within(revealedRecord).getByText(/record 2:/i)).toBeVisible()
     expect(within(revealedRecord).getByText('Delivered')).toBeVisible()
-    expect(within(revealedRecord).getByText('Shipped')).toBeVisible()
+    expect(within(revealedRecord).getByText('Sent')).toBeVisible()
     expect(within(revealedRecord).getByText(/maggi/i)).toBeVisible()
     expect(within(revealedRecord).getByText(/tng reload/i)).toBeVisible()
   })
@@ -1304,7 +1304,7 @@ describe('app components', () => {
       services.auth.oneClick('admin')
       for (const [shipmentId, path] of [
         ['shp-processing', ['packed', 'label_created', 'shipped']],
-        ['shp-digital', ['picking', 'packed', 'label_created', 'shipped']],
+        ['shp-digital', ['issued', 'sent']],
       ] as const) {
         for (const status of path) {
           services.fulfilment.advance(
@@ -1360,20 +1360,20 @@ describe('app components', () => {
     services.claims.review(
       claim.id,
       'resolve',
-      'Confirmed fictional RMA record for component display',
-      { outcome: 'return_rma_created', reference: `DEMO-RMA-${claim.id.toUpperCase()}` },
+      'Confirmed fictional no-remedy record for component display',
+      { outcome: 'no_remedy', reference: `DEMO-NO-${claim.id.toUpperCase()}` },
     )
     window.history.replaceState({}, '', '#/admin/claims')
     render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
     expect(screen.getByText(/structured resolution recorded/i)).toBeVisible()
-    expect(screen.getByText(`DEMO-RMA-${claim.id.toUpperCase()}`, { exact: false })).toBeVisible()
+    expect(screen.getByText(`DEMO-NO-${claim.id.toUpperCase()}`, { exact: false })).toBeVisible()
 
     cleanup()
     services.auth.oneClick('customer')
     window.history.replaceState({}, '', '#/order/ord-delivered')
     render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
     expect(screen.getByText(/recorded resolution/i)).toBeVisible()
-    expect(screen.getByText(/return rma created/i)).toBeVisible()
+    expect(screen.getByText(/no remedy/i)).toBeVisible()
   })
 
   it('guards checkout double-submit in flight and creates only one order', async () => {
@@ -1414,7 +1414,7 @@ describe('app components', () => {
     view.unmount()
     window.history.replaceState({}, '', '#/order/ord-shipped')
     render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
-    expect(screen.getByText('DEMO-P-SHIPPED')).toBeVisible()
+    expect(screen.getByText('DEMO-SHIPPED')).toBeVisible()
     expect(screen.getByText('Demo Express')).toBeVisible()
     expect(screen.getByText(/signature required/i)).toBeVisible()
   })

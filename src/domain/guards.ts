@@ -12,6 +12,7 @@ import type {
   OrderStatus,
   PaymentStatus,
   Role,
+  FulfilmentKind,
   ShipmentStatus,
   User,
 } from './types'
@@ -49,6 +50,30 @@ export function canTransitionShipment(from: ShipmentStatus, to: ShipmentStatus) 
   return SHIPMENT_TRANSITIONS[from].includes(to)
 }
 
+export function canTransitionShipmentForKind(
+  kind: FulfilmentKind,
+  from: ShipmentStatus,
+  to: ShipmentStatus,
+) {
+  if (kind === 'DIGITAL') {
+    return (
+      (from === 'unfulfilled' && to === 'issued') ||
+      (from === 'issued' && to === 'sent') ||
+      (from === 'sent' && (to === 'delivered' || to === 'failed'))
+    )
+  }
+  return (
+    (from === 'unfulfilled' && (to === 'picking' || to === 'cancelled')) ||
+    (from === 'picking' && (to === 'packed' || to === 'cancelled')) ||
+    (from === 'packed' && (to === 'label_created' || to === 'cancelled')) ||
+    (from === 'label_created' && (to === 'shipped' || to === 'cancelled')) ||
+    (from === 'shipped' && ['delivered', 'failed_delivery', 'lost', 'returned'].includes(to)) ||
+    (from === 'delivered' && to === 'returned') ||
+    (from === 'failed_delivery' && ['returned', 'lost'].includes(to)) ||
+    (from === 'cancelled' && to === 'unfulfilled')
+  )
+}
+
 export function canTransitionBox(from: BoxStatus, to: BoxStatus) {
   return BOX_TRANSITIONS[from].includes(to)
 }
@@ -68,6 +93,19 @@ export function transitionShipment(from: ShipmentStatus, to: ShipmentStatus) {
   return to
 }
 
+export function transitionShipmentForKind(
+  kind: FulfilmentKind,
+  from: ShipmentStatus,
+  to: ShipmentStatus,
+) {
+  assert(
+    canTransitionShipmentForKind(kind, from, to),
+    `${kind} shipment cannot move from ${from} to ${to}.`,
+    'INVALID_TRANSITION',
+  )
+  return to
+}
+
 export function transitionBox(from: BoxStatus, to: BoxStatus) {
   assert(canTransitionBox(from, to), `Box cannot move from ${from} to ${to}.`, 'INVALID_TRANSITION')
   return to
@@ -83,8 +121,8 @@ export function transitionBoxForReveal(from: BoxStatus) {
 }
 
 export function transitionBoxForShipment(from: BoxStatus, shipment: ShipmentStatus) {
-  if (['unfulfilled', 'picking', 'packed', 'label_created'].includes(shipment)) return from
-  const target: BoxStatus = shipment === 'shipped'
+  if (['unfulfilled', 'picking', 'packed', 'label_created', 'issued'].includes(shipment)) return from
+  const target: BoxStatus = ['shipped', 'sent'].includes(shipment)
     ? 'fulfillment_pending'
     : shipment === 'delivered'
       ? 'fulfilled'

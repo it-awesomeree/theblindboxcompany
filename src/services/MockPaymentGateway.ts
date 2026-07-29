@@ -18,6 +18,7 @@ import {
   CLAIM_REFUND_LINK_ACTION,
   claimRefundLinkedHistoryNote,
 } from '../domain/refundLink'
+import { refreshOrderFulfillment } from '../domain/orderFulfillment'
 import { prizeForBox } from '../domain/selectors'
 import type {
   DemoState,
@@ -623,6 +624,21 @@ export class MockPaymentGateway {
           'CLAIM_REFUND_ALREADY_LINKED',
         )
         assert(
+          (
+            (
+              linkedClaim.remedyState === 'none' &&
+              linkedClaim.rma === undefined
+            ) ||
+            (
+              linkedClaim.remedyState === 'rma_inspected' &&
+              linkedClaim.rma?.status === 'inspected'
+            )
+          ) &&
+            linkedClaim.replacementShipmentId === undefined,
+          'A claim can link a refund only before another remedy or after its RMA inspection.',
+          'REMEDY_CONFLICT',
+        )
+        assert(
           !state.claims.some((claim) =>
             claim.id !== linkedClaim.id &&
             (
@@ -691,6 +707,7 @@ export class MockPaymentGateway {
       })
       if (linkedClaim) {
         linkedClaim.linkedRefundEventId = eventId
+        linkedClaim.remedyState = 'refund_linked'
         linkedClaim.updatedAt = now
         linkedClaim.history.push({
           id: `${linkedClaim.id}-h-${String(linkedClaim.history.length + 1).padStart(2, '0')}`,
@@ -717,6 +734,12 @@ export class MockPaymentGateway {
             status: 'approved',
           },
         })
+        refreshOrderFulfillment(
+          state,
+          order,
+          now,
+          claimRefundLinkedHistoryNote(eventId),
+        )
       }
       return { payment, changed: true, message: full ? 'Full demo refund recorded.' : 'Partial demo refund recorded.' }
     })

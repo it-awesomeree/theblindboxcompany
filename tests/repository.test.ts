@@ -180,6 +180,31 @@ function toVersion5(state: DemoState = createDemoState()) {
   }
 }
 
+function toVersion6(state: DemoState = createDemoState()) {
+  const legacy = structuredClone(state) as unknown as Omit<
+    DemoState,
+    'schemaVersion' | 'shipments' | 'claims'
+  > & {
+    schemaVersion: number
+    shipments: Array<Partial<DemoState['shipments'][number]>>
+    claims: Array<Partial<DemoState['claims'][number]>>
+  }
+  legacy.schemaVersion = 6
+  for (const shipment of legacy.shipments) {
+    delete shipment.purpose
+    delete shipment.sourceClaimId
+    delete shipment.replacementForShipmentId
+  }
+  for (const claim of legacy.claims) {
+    delete claim.remedyState
+    delete claim.rma
+    delete claim.replacementShipmentId
+    delete claim.replacementAuthorization
+    delete claim.legacyTypedResolution
+  }
+  return legacy
+}
+
 function ordersWithoutValueFloor(orders: DemoState['orders']) {
   return structuredClone(orders).map((order) => {
     delete (order.snapshot as Partial<typeof order.snapshot>).valueFloorSen
@@ -230,6 +255,69 @@ function stateWithLinkedRefundClaim(resolved = false) {
     )
   }
   return services.repository.exportForTest()
+}
+
+function stateWithReplacement(delivered = true) {
+  const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+  services.auth.oneClick('customer')
+  const claim = services.claims.submit({
+    orderId: 'ord-failed',
+    kind: 'non_delivery',
+    shipmentId: 'shp-failed',
+    note: 'DEMO validator replacement provenance claim',
+  }).data
+  services.auth.oneClick('admin')
+  services.claims.review(claim.id, 'acknowledge', 'Confirmed validator replacement acknowledgement')
+  services.claims.review(claim.id, 'approve', 'Confirmed validator replacement approval')
+  const replacement = services.claims.authorizeReplacement(
+    claim.id,
+    'Confirmed validator replacement authorization',
+  ).data
+  if (delivered) {
+    for (const status of ['picking', 'packed', 'label_created', 'shipped', 'delivered'] as const) {
+      services.fulfilment.advance(
+        replacement.id,
+        status,
+        `Confirmed validator replacement ${status}`,
+      )
+    }
+  }
+  return services.repository.exportForTest()
+}
+
+function stateWithInspectedRma() {
+  const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+  services.auth.oneClick('customer')
+  const claim = services.claims.submit({
+    orderId: 'ord-delivered',
+    kind: 'damage',
+    shipmentId: 'shp-delivered',
+    note: 'DEMO validator ordered RMA evidence claim',
+  }).data
+  services.auth.oneClick('admin')
+  services.claims.review(claim.id, 'acknowledge', 'Confirmed validator RMA acknowledgement')
+  services.claims.review(claim.id, 'approve', 'Confirmed validator RMA approval')
+  services.claims.createRma(claim.id, 'DEMO-RMA-VALIDATOR-01', 'Confirmed validator RMA creation')
+  services.claims.recordRmaReceived(claim.id, 'DEMO-RMA-VALIDATOR-01', 'Confirmed validator RMA receipt')
+  services.claims.recordRmaInspected(claim.id, 'DEMO-RMA-VALIDATOR-01', 'Confirmed validator RMA inspection')
+  return services.repository.exportForTest()
+}
+
+function removeAudit(
+  state: DemoState,
+  predicate: (audit: DemoState['audits'][number]) => boolean,
+) {
+  state.audits = state.audits.filter((audit) => !predicate(audit))
+  state.audits.forEach((audit, index) => {
+    audit.sequence = index + 1
+    if (index === 0) {
+      delete audit.previousId
+    } else {
+      audit.previousId = state.audits[index - 1].id
+    }
+  })
+  state.auditCount = state.audits.length
+  state.auditHeadId = state.audits.at(-1)!.id
 }
 
 describe('MockRepository recovery and persistence', () => {
@@ -297,6 +385,187 @@ describe('MockRepository recovery and persistence', () => {
   )
 
   it.each([
+    ['missing claim reverse link', (state: DemoState) => {
+      delete state.claims[0].replacementShipmentId
+    }],
+    ['wrong original reverse link', (state: DemoState) => {
+      state.shipments.find((shipment) => shipment.purpose === 'replacement')!
+        .replacementForShipmentId = 'shp-delivered'
+    }],
+    ['reused replacement claim and original', (state: DemoState) => {
+      const replacement = state.shipments.find((shipment) => shipment.purpose === 'replacement')!
+      state.shipments.push({
+        ...structuredClone(replacement),
+        id: 'shp-reused-replacement',
+        trackingNumber: 'DEMO-REUSED-REPLACEMENT',
+      })
+    }],
+    ['mismatched replacement box scope', (state: DemoState) => {
+      state.shipments.find((shipment) => shipment.purpose === 'replacement')!
+        .boxIds = ['box-delivered-01']
+    }],
+    ['mismatched replacement flags', (state: DemoState) => {
+      const replacement = state.shipments.find((shipment) => shipment.purpose === 'replacement')!
+      replacement.insured = !replacement.insured
+    }],
+    ['mismatched replacement kind', (state: DemoState) => {
+      const replacement = state.shipments.find((shipment) => shipment.purpose === 'replacement')!
+      replacement.kind = 'DIGITAL'
+    }],
+    ['mismatched replacement order', (state: DemoState) => {
+      const replacement = state.shipments.find((shipment) => shipment.purpose === 'replacement')!
+      replacement.orderId = 'ord-delivered'
+    }],
+    ['replacement cycle', (state: DemoState) => {
+      const replacement = state.shipments.find((shipment) => shipment.purpose === 'replacement')!
+      replacement.replacementForShipmentId = replacement.id
+    }],
+    ['replacement before claim and approval', (state: DemoState) => {
+      const replacement = state.shipments.find((shipment) => shipment.purpose === 'replacement')!
+      replacement.createdAt = '2026-07-18T00:00:00.000Z'
+      replacement.timeline[0].at = replacement.createdAt
+    }],
+    ['missing replacement authorization audit', (state: DemoState) => {
+      removeAudit(state, (audit) => audit.action === 'claim.replacement_authorized')
+    }],
+    ['missing delivered replacement transition audit', (state: DemoState) => {
+      const replacement = state.shipments.find((shipment) => shipment.purpose === 'replacement')!
+      const deliveredAt = replacement.timeline.at(-1)!.at
+      removeAudit(state, (audit) =>
+        audit.action === 'shipment.transitioned' &&
+        audit.targetId === replacement.id &&
+        audit.at === deliveredAt &&
+        (audit.after as { status?: string })?.status === 'delivered')
+    }],
+    ['missing replacement delivery claim audit', (state: DemoState) => {
+      removeAudit(state, (audit) => audit.action === 'claim.replacement_delivered')
+    }],
+    ['replacement scope inflation', (state: DemoState) => {
+      const replacement = state.shipments.find((shipment) => shipment.purpose === 'replacement')!
+      state.orders.find((order) => order.id === replacement.orderId)!.boxIds.push('box-delivered-01')
+    }],
+  ] as Array<[string, (state: DemoState) => void]>)(
+    'rejects delivered replacement corruption: %s',
+    (_label, mutate) => {
+      const state = stateWithReplacement(true)
+      mutate(state)
+      expect(() => validateDemoState(state)).toThrow()
+    },
+  )
+
+  it('rejects a claim marked resolved before its authorized replacement is delivered', () => {
+    const state = stateWithReplacement(false)
+    const claim = state.claims[0]
+    const replacement = state.shipments.find((shipment) => shipment.purpose === 'replacement')!
+    claim.status = 'resolved'
+    claim.remedyState = 'replacement_delivered'
+    claim.resolutionOutcome = 'replacement_authorized'
+    claim.resolutionReference = replacement.id
+    claim.resolutionNote = 'Tampered premature replacement completion'
+    claim.history.push({
+      id: `${claim.id}-tampered-resolved`,
+      status: 'resolved',
+      note: claim.resolutionNote,
+      actorId: 'usr-fulfilment',
+      actorRole: 'fulfilment',
+      at: claim.updatedAt,
+    })
+
+    expect(() => validateDemoState(state)).toThrow(/undelivered replacement|delivered shipment|audit/i)
+  })
+
+  it.each([
+    ['receipt before creation', (state: DemoState) => {
+      const rma = state.claims[0].rma!
+      rma.receivedAt = '2026-07-27T23:59:59.000Z'
+    }],
+    ['inspection before receipt', (state: DemoState) => {
+      const rma = state.claims[0].rma!
+      rma.inspectedAt = '2026-07-27T23:59:59.000Z'
+    }],
+    ['missing receipt evidence', (state: DemoState) => {
+      delete state.claims[0].rma!.receivedAt
+    }],
+    ['mismatched inspection audit', (state: DemoState) => {
+      const audit = state.audits.find((entry) => entry.action === 'claim.rma_inspected')!
+      audit.reason = 'Tampered inspection audit reason'
+    }],
+    ['missing immutable receipt audit', (state: DemoState) => {
+      removeAudit(state, (audit) => audit.action === 'claim.rma_received')
+    }],
+  ] as Array<[string, (state: DemoState) => void]>)(
+    'rejects ordered RMA corruption: %s',
+    (_label, mutate) => {
+      const state = stateWithInspectedRma()
+      mutate(state)
+      expect(() => validateDemoState(state)).toThrow()
+    },
+  )
+
+  it.each([
+    ['physical history using digital issued', (state: DemoState) => {
+      const shipment = state.shipments.find((entry) => entry.id === 'shp-processing')!
+      shipment.status = 'issued'
+      shipment.timeline.push({
+        id: 'physical-issued-tamper',
+        status: 'issued',
+        label: 'Tampered physical digital status',
+        at: FIXED_NOW,
+      })
+    }],
+    ['digital history using physical shipped', (state: DemoState) => {
+      const shipment = state.shipments.find((entry) => entry.id === 'shp-digital')!
+      shipment.status = 'shipped'
+      shipment.timeline.push({
+        id: 'digital-shipped-tamper',
+        status: 'shipped',
+        label: 'Tampered digital physical status',
+        at: FIXED_NOW,
+      })
+    }],
+    ['digital carrier edited directly', (state: DemoState) => {
+      state.shipments.find((entry) => entry.id === 'shp-digital')!.carrier = 'Demo Express'
+    }],
+    ['digital tracking edited directly', (state: DemoState) => {
+      state.shipments.find((entry) => entry.id === 'shp-digital')!.trackingNumber =
+        'DEMO-DIGITAL-TAMPER'
+    }],
+    ['failed original rewritten delivered', (state: DemoState) => {
+      const shipment = state.shipments.find((entry) => entry.id === 'shp-failed')!
+      shipment.status = 'delivered'
+      shipment.timeline.push(
+        {
+          id: 'failed-original-retry-tamper',
+          status: 'shipped',
+          label: 'Tampered original retry',
+          at: FIXED_NOW,
+        },
+        {
+          id: 'failed-original-delivered-tamper',
+          status: 'delivered',
+          label: 'Tampered original delivered',
+          at: FIXED_NOW,
+        },
+      )
+      state.orders.find((order) => order.id === shipment.orderId)!.status = 'fulfilled'
+      state.orders.find((order) => order.id === shipment.orderId)!.timeline.push({
+        id: 'failed-original-order-tamper',
+        status: 'fulfilled',
+        label: 'Tampered original order fulfilment',
+        at: FIXED_NOW,
+      })
+      state.boxes.find((box) => box.id === 'box-failed-01')!.status = 'fulfilled'
+    }],
+  ] as Array<[string, (state: DemoState) => void]>)(
+    'rejects kind-specific or immutable original history corruption: %s',
+    (_label, mutate) => {
+      const state = createDemoState()
+      mutate(state)
+      expect(() => validateDemoState(state)).toThrow()
+    },
+  )
+
+  it.each([
     ['mismatched resolution reference', (state: DemoState) => {
       state.claims[0].resolutionReference = 'evt-ord-delivered-success'
     }],
@@ -321,9 +590,9 @@ describe('MockRepository recovery and persistence', () => {
   it('recovers missing data with current schema fixtures', () => {
     const storage = new MemoryStorage()
     const repository = new MockRepository(storage)
-    expect(repository.getSnapshot().schemaVersion).toBe(6)
+    expect(repository.getSnapshot().schemaVersion).toBe(7)
     expect(repository.recoveryNotice).toMatch(/missing/i)
-    expect(JSON.parse(storage.getItem(STORAGE_KEY)!).schemaVersion).toBe(6)
+    expect(JSON.parse(storage.getItem(STORAGE_KEY)!).schemaVersion).toBe(7)
   })
 
   it('keeps corrupt bytes untouched and requires an explicit confirmed reset', () => {
@@ -344,7 +613,7 @@ describe('MockRepository recovery and persistence', () => {
     const raw = '{ "schemaVersion": 2, "revision": 14, "users": [] }'
     storage.seed(STORAGE_KEY, raw)
     const repository = new MockRepository(storage)
-    expect(repository.getSnapshot().schemaVersion).toBe(6)
+    expect(repository.getSnapshot().schemaVersion).toBe(7)
     expect(repository.recoveryNotice).toMatch(/unsupported old version 2.+left unchanged.+explicit confirmed reset/i)
     expect(storage.getItem(STORAGE_KEY)).toBe(raw)
   })
@@ -371,7 +640,7 @@ describe('MockRepository recovery and persistence', () => {
         return JSON.stringify(invalid)
       })(),
       expectedRevision: 42,
-      notice: /version 6.+failed the safety checks.+exact original browser bytes.+explicit confirmed reset/i,
+      notice: /version 7.+failed the safety checks.+exact original browser bytes.+explicit confirmed reset/i,
     },
     {
       label: 'future schema',
@@ -407,7 +676,7 @@ describe('MockRepository recovery and persistence', () => {
       repository.reset()
 
       expect(repository.getSnapshot()).toMatchObject({
-        schemaVersion: 6,
+        schemaVersion: 7,
         revision: expectedRevision,
         sessionUserId: null,
         cart: [{ quantity: 1 }],
@@ -502,7 +771,7 @@ describe('MockRepository recovery and persistence', () => {
 
     const repository = new MockRepository(storage, { writeAuthority: false })
 
-    expect(repository.getSnapshot()).toMatchObject({ schemaVersion: 6, revision: 19 })
+    expect(repository.getSnapshot()).toMatchObject({ schemaVersion: 7, revision: 19 })
     expect(storage.getItem(STORAGE_KEY)).toBe(raw)
     expect(storage.writes).toBe(0)
 
@@ -531,7 +800,7 @@ describe('MockRepository recovery and persistence', () => {
     expect(repository.recoveryNotice).toMatch(/original version 5 bytes were restored exactly/i)
   })
 
-  it('migrates valid custom version 5 business data once and then loads version 6 without writes', () => {
+  it('migrates valid custom version 5 business data through version 6 once and then loads version 7 without writes', () => {
     const customServices = servicesWithClaim('damage')
     customServices.auth.oneClick('admin')
     customServices.admin.copyPublishedToDraft()
@@ -548,7 +817,7 @@ describe('MockRepository recovery and persistence', () => {
     const migrated = new MockRepository(storage)
     const snapshot = migrated.getSnapshot()
 
-    expect(snapshot.schemaVersion).toBe(6)
+    expect(snapshot.schemaVersion).toBe(7)
     expect(snapshot.revision).toBe(legacy.revision)
     expect(snapshot.users).toEqual(legacy.users)
     expect(ordersWithoutValueFloor(snapshot.orders)).toEqual(legacy.orders)
@@ -585,7 +854,7 @@ describe('MockRepository recovery and persistence', () => {
     expect(snapshot.auditCount).toBe(snapshot.audits.length)
     expect(snapshot.auditHeadId).toBe(snapshot.audits.at(-1)?.id)
     expect(storage.writes).toBe(1)
-    expect(migrated.recoveryNotice).toMatch(/upgraded safely from version 5 to version 6/i)
+    expect(migrated.recoveryNotice).toMatch(/version 5 through version 6 to version 7/i)
 
     const persistedAfterMigration = storage.getItem(STORAGE_KEY)
     const loadedAgain = new MockRepository(storage)
@@ -609,7 +878,7 @@ describe('MockRepository recovery and persistence', () => {
     const snapshot = repository.getSnapshot()
 
     expect(snapshot).toMatchObject({
-      schemaVersion: 6,
+      schemaVersion: 7,
       revision: 73,
       sessionUserId: 'usr-demo-customer',
       cart: [{ quantity: 4 }],
@@ -650,7 +919,187 @@ describe('MockRepository recovery and persistence', () => {
     expect(loadedAgain.getSnapshot()).toEqual(snapshot)
   })
 
-  it('keeps original version 5 bytes when migration persistence fails and continues with frozen version 6 memory', () => {
+  it('migrates valid version 6 linked-refund business data to version 7 without editing audit history', () => {
+    const current = stateWithLinkedRefundClaim(true)
+    current.revision = 87
+    current.cart[0].quantity = 2
+    const legacy = toVersion6(current)
+    const legacyAudits = structuredClone(legacy.audits)
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(legacy))
+
+    const repository = new MockRepository(storage)
+    const snapshot = repository.getSnapshot()
+
+    expect(snapshot.schemaVersion).toBe(7)
+    expect(snapshot.revision).toBe(87)
+    expect(snapshot.cart[0].quantity).toBe(2)
+    expect(snapshot.shipments.every((shipment) => shipment.purpose === 'original')).toBe(true)
+    expect(snapshot.claims[0]).toMatchObject({
+      status: 'resolved',
+      remedyState: 'refund_completed',
+      linkedRefundEventId: current.claims[0].linkedRefundEventId,
+      resolutionReference: current.claims[0].resolutionReference,
+    })
+    expect(snapshot.audits).toEqual(legacyAudits)
+    expect(snapshot.auditCount).toBe(current.auditCount)
+    expect(snapshot.auditHeadId).toBe(current.auditHeadId)
+    expect(storage.writes).toBe(1)
+    expect(repository.recoveryNotice).toMatch(/version 6 to version 7/i)
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+
+    const persisted = storage.getItem(STORAGE_KEY)
+    const loadedAgain = new MockRepository(storage)
+    expect(storage.writes).toBe(1)
+    expect(storage.getItem(STORAGE_KEY)).toBe(persisted)
+    expect(loadedAgain.getSnapshot()).toEqual(snapshot)
+    expect(loadedAgain.recoveryNotice).toBeNull()
+  })
+
+  it('deterministically maps a valid version 6 digital physical-style retry history to terminal failed', () => {
+    const current = createDemoState()
+    const digital = current.shipments.find((shipment) => shipment.id === 'shp-digital')!
+    digital.carrier = 'Demo Legacy Digital Courier'
+    digital.trackingNumber = 'DEMO-LEGACY-DIGITAL-EDIT'
+    digital.status = 'delivered'
+    digital.timeline = [
+      'unfulfilled',
+      'picking',
+      'packed',
+      'label_created',
+      'shipped',
+      'failed_delivery',
+      'shipped',
+      'delivered',
+    ].map((status, index) => ({
+      id: `legacy-digital-${index}`,
+      status: status as DemoState['shipments'][number]['status'],
+      label: `Legacy digital ${status}`,
+      at: `2026-07-22T${String(index + 2).padStart(2, '0')}:00:00.000Z`,
+    }))
+    current.boxes.find((box) => box.id === 'box-processing-02')!.status = 'on_hold'
+    const storage = new MemoryStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(toVersion6(current)))
+
+    const snapshot = new MockRepository(storage).getSnapshot()
+    const migrated = snapshot.shipments.find((shipment) => shipment.id === digital.id)!
+
+    expect(migrated.status).toBe('failed')
+    expect(migrated.carrier).toBe('Digital Vault')
+    expect(migrated.trackingNumber).toBe('DEMO-DIGITAL')
+    expect(migrated.timeline.map((entry) => entry.status)).toEqual([
+      'unfulfilled',
+      'issued',
+      'issued',
+      'sent',
+      'sent',
+      'failed',
+      'failed',
+      'failed',
+    ])
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+  })
+
+  it('deterministically keeps a retried version 6 physical original as terminal failed evidence', () => {
+    const current = createDemoState()
+    const original = current.shipments.find((shipment) => shipment.id === 'shp-failed')!
+    original.timeline.push(
+      {
+        id: 'legacy-physical-retry',
+        status: 'shipped',
+        label: 'Legacy physical retry on the original row',
+        at: '2026-07-28T03:00:00.000Z',
+      },
+      {
+        id: 'legacy-physical-redelivery',
+        status: 'delivered',
+        label: 'Legacy physical delivery on the original row',
+        at: '2026-07-28T04:00:00.000Z',
+      },
+    )
+    original.status = 'delivered'
+    const order = current.orders.find((entry) => entry.id === original.orderId)!
+    order.status = 'fulfilled'
+    order.updatedAt = FIXED_NOW
+    order.timeline.push({
+      id: 'legacy-physical-order-fulfilled',
+      status: 'fulfilled',
+      label: 'Legacy physical original marked fulfilled',
+      at: FIXED_NOW,
+    })
+    current.boxes.find((box) => box.id === 'box-failed-01')!.status = 'fulfilled'
+    const legacy = toVersion6(current)
+    const legacyAudits = structuredClone(legacy.audits)
+    const storage = new MemoryStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(legacy))
+
+    const snapshot = new MockRepository(storage).getSnapshot()
+    const migrated = snapshot.shipments.find((shipment) => shipment.id === original.id)!
+
+    expect(migrated.purpose).toBe('original')
+    expect(migrated.status).toBe('failed_delivery')
+    expect(migrated.timeline.slice(-3).map((entry) => entry.status)).toEqual([
+      'failed_delivery',
+      'failed_delivery',
+      'failed_delivery',
+    ])
+    expect(snapshot.orders.find((entry) => entry.id === order.id)?.status).toBe('processing')
+    expect(snapshot.boxes.find((box) => box.id === 'box-failed-01')?.status).toBe('on_hold')
+    expect(snapshot.audits).toEqual(legacyAudits)
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+  })
+
+  it('preserves exact immutable version 6 typed-resolution history without treating it as a completed new remedy', () => {
+    const services = servicesWithClaim('damage')
+    const claim = services.repository.getSnapshot().claims[0]
+    services.auth.oneClick('admin')
+    services.claims.review(claim.id, 'acknowledge', 'Confirmed legacy typed acknowledgement')
+    services.claims.review(claim.id, 'approve', 'Confirmed legacy typed approval')
+    services.claims.review(
+      claim.id,
+      'resolve',
+      'Confirmed sufficiently descriptive legacy typed resolution',
+      { outcome: 'no_remedy', reference: 'DEMO-LEGACY-TYPED-01' },
+    )
+    const current = services.repository.exportForTest()
+    const resolved = current.claims[0]
+    resolved.resolutionOutcome = 'replacement_authorized'
+    resolved.remedyState = 'none'
+    const resolveAudit = current.audits.find((audit) => audit.action === 'claim.resolve')!
+    ;(resolveAudit.after as Record<string, unknown>).resolutionOutcome = 'replacement_authorized'
+    const storage = new MemoryStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(toVersion6(current)))
+
+    const snapshot = new MockRepository(storage).getSnapshot()
+
+    expect(snapshot.claims[0]).toMatchObject({
+      status: 'resolved',
+      remedyState: 'none',
+      resolutionOutcome: 'replacement_authorized',
+      legacyTypedResolution: true,
+    })
+    expect(snapshot.shipments.filter((shipment) => shipment.purpose === 'replacement')).toHaveLength(0)
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+  })
+
+  it('keeps original version 6 bytes when migration persistence fails', () => {
+    const legacy = toVersion6(createDemoState())
+    const raw = JSON.stringify(legacy)
+    const storage = new FaultStorage()
+    storage.seed(STORAGE_KEY, raw)
+    storage.failNextWrites = 1
+
+    const repository = new MockRepository(storage)
+
+    expect(repository.getSnapshot().schemaVersion).toBe(7)
+    expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+    expect(storage.successfulWrites).toBe(0)
+    expect(repository.recoveryNotice).toMatch(
+      /could not save the upgrade.+original version 6 data was left unchanged.+memory only/i,
+    )
+  })
+
+  it('keeps original version 5 bytes when migration persistence fails and continues with frozen version 7 memory', () => {
     const custom = createDemoState()
     custom.revision = 17
     custom.cart[0].quantity = 2
@@ -662,7 +1111,7 @@ describe('MockRepository recovery and persistence', () => {
     const repository = new MockRepository(storage)
 
     expect(repository.getSnapshot()).toMatchObject({
-      schemaVersion: 6,
+      schemaVersion: 7,
       revision: 17,
       cart: [{ quantity: 2 }],
     })
@@ -1155,7 +1604,7 @@ describe('MockRepository recovery and persistence', () => {
   it('uses the deterministic tracking convention for shipped fixtures', () => {
     const repository = new MockRepository(new MemoryStorage())
     const shipment = repository.getSnapshot().shipments.find((entry) => entry.id === 'shp-shipped')
-    expect(shipment?.trackingNumber).toBe('DEMO-P-SHIPPED')
+    expect(shipment?.trackingNumber).toBe('DEMO-SHIPPED')
   })
 
   it('keeps seeded paid boxes, timelines, shipments and order fulfilment coherent', () => {
@@ -1338,6 +1787,21 @@ describe('MockRepository recovery and persistence', () => {
     order.updatedAt = '2026-07-22T07:00:00.000Z'
 
     expect(() => validateDemoState(state)).toThrow(/status must be partially_fulfilled/i)
+  })
+
+  it('rejects a mixed order falsely closed while every original scope remains incomplete', () => {
+    const state = createDemoState()
+    const order = state.orders.find((entry) => entry.id === 'ord-processing')!
+    order.status = 'closed'
+    order.updatedAt = FIXED_NOW
+    order.timeline.push({
+      id: 'mixed-order-false-close',
+      status: 'closed',
+      label: 'Tampered early mixed-order closure',
+      at: FIXED_NOW,
+    })
+
+    expect(() => validateDemoState(state)).toThrow(/closed/i)
   })
 
   it('rejects an illegal accepted payment event jump', () => {
@@ -1528,16 +1992,20 @@ describe('MockRepository recovery and persistence', () => {
     expect(() => validateDemoState(services.repository.getSnapshot())).not.toThrow()
   })
 
-  it('accepts a fresh reship when failed-delivery evidence already existed', () => {
+  it('keeps failed original evidence immutable and still accepts its non-delivery claim', () => {
     const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
     services.auth.oneClick('admin')
-    services.fulfilment.advance('shp-failed', 'shipped', 'DEMO reship after failed delivery evidence')
+    expect(() => services.fulfilment.advance(
+      'shp-failed',
+      'shipped',
+      'DEMO forbidden rewrite after failed delivery evidence',
+    )).toThrow(expect.objectContaining({ code: 'INVALID_TRANSITION' }))
     services.auth.oneClick('customer')
     expect(() => services.claims.submit({
       orderId: 'ord-failed',
       kind: 'non_delivery',
       shipmentId: 'shp-failed',
-      note: 'DEMO failed delivery evidence before reship',
+      note: 'DEMO immutable failed delivery evidence',
     })).not.toThrow()
     expect(() => validateDemoState(services.repository.getSnapshot())).not.toThrow()
   })
@@ -1580,6 +2048,7 @@ describe('MockRepository recovery and persistence', () => {
       note: 'DEMO post-delivery customer return is not non-delivery',
       shipmentId: 'shp-delivered',
       status: 'submitted',
+      remedyState: 'none',
       createdAt: FIXED_NOW,
       updatedAt: FIXED_NOW,
       history: [{
@@ -1951,8 +2420,9 @@ describe('MockRepository recovery and persistence', () => {
         userId: order.userId,
         kind: 'damage',
         note: 'DEMO chronology claim',
-        shipmentId: 'shp-delivered',
-        status: 'reviewing',
+      shipmentId: 'shp-delivered',
+      status: 'reviewing',
+      remedyState: 'none',
         createdAt: '2026-07-28T01:00:00.000Z',
         updatedAt: '2026-07-28T02:00:00.000Z',
         history: [
@@ -2042,8 +2512,8 @@ describe('MockRepository recovery and persistence', () => {
     services.claims.review(
       claim.id,
       'resolve',
-      'Confirmed sufficiently descriptive fictional replacement resolution',
-      { outcome: 'replacement_authorized', reference: `DEMO-${claim.id.toUpperCase()}` },
+      'Confirmed sufficiently descriptive fictional no-remedy resolution',
+      { outcome: 'no_remedy', reference: `DEMO-${claim.id.toUpperCase()}` },
     )
     const malformed = services.repository.exportForTest()
     mutate(malformed.claims[0])

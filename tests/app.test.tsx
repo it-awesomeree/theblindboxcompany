@@ -54,6 +54,131 @@ describe('app components', () => {
     expect(await screen.findByRole('heading', { name: 'Aina Demo' })).toBeVisible()
   })
 
+  it.each([
+    ['#/', 'Home', /the blind box that always wins/i],
+    ['#/auth', 'Auth', /enter the demo vault/i],
+    ['#/cart', 'Cart', /demo cargo list/i],
+    ['#/checkout', 'Checkout', /seal the demo order/i],
+    ['#/pay/ord-unopened/new', 'Mock Payment', /mock hitpay payment/i],
+    ['#/pay/ord-unopened/pay-unopened', 'Mock Payment', /mock hitpay payment/i],
+    ['#/payment-return/pay-unopened', 'Payment Return', /payment confirmed by event/i],
+    ['#/order/ord-unopened', 'Order', /ord-unopened/i],
+    ['#/open/box-unopened-01', 'Open Box', /open exactly once/i],
+    ['#/account?name=Aina%20Demo&email=aina%40example.test&address=1%20DEMO%20Vault%20Street', 'Account', /aina demo/i],
+    ['#/claim/new?order=ord-shipped', 'Claim', /start a fake claim/i],
+    ['#/unauthorized', 'Unauthorized', /admin access blocked/i],
+    ['#/not-found', 'Not Found', /nothing is sealed here/i],
+    ['#/order/%E0%A4%A?user=Aina%20Demo', 'Not Found', /nothing is sealed here/i],
+  ])('uses one h1, safe title metadata and initial focus for %s', async (route, label, headingName) => {
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    services.auth.oneClick('customer')
+    window.history.replaceState({}, '', route)
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+
+    const heading = screen.getByRole('heading', { level: 1, name: headingName })
+    expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1)
+    expect(heading).toBeVisible()
+    await waitFor(() => {
+      expect(document.title).toBe(`${label} | The Blind Box Company | Demo / No Real Charge`)
+      expect(document.activeElement).toBe(heading)
+    })
+    for (const unsafeValue of [
+      'ord-unopened',
+      'pay-unopened',
+      'box-unopened-01',
+      'Aina Demo',
+      'aina@example.test',
+      '1 DEMO Vault Street',
+    ]) {
+      expect(document.title).not.toContain(unsafeValue)
+    }
+  })
+
+  it.each([
+    ['/admin', 'Admin Overview'],
+    ['/admin/users', 'Admin Users'],
+    ['/admin/orders', 'Admin Orders'],
+    ['/admin/payments', 'Admin Payments'],
+    ['/admin/inventory', 'Admin Inventory'],
+    ['/admin/fulfilment', 'Admin Fulfilment'],
+    ['/admin/claims', 'Admin Claims'],
+    ['/admin/audit', 'Admin Audit'],
+  ])('gives %s one h1 and its own fixed admin title', async (route, label) => {
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    services.auth.oneClick('admin')
+    window.history.replaceState({}, '', `#${route}?user=usr-admin&email=admin%40demo.local`)
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+
+    const heading = screen.getByRole('heading', { level: 1 })
+    expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1)
+    expect(heading).toBeVisible()
+    await waitFor(() => {
+      expect(document.title).toBe(`${label} | The Blind Box Company | Demo / No Real Charge`)
+      expect(document.activeElement).toBe(heading)
+    })
+    expect(document.title).not.toMatch(/usr-admin|admin@demo\.local|Vault Admin/)
+    const navigation = screen.getByRole('navigation', { name: /main navigation/i })
+    expect(within(navigation).getByRole('link', { name: 'Admin' })).toBeVisible()
+    expect(within(navigation).queryByRole('link', { name: 'Account' })).not.toBeInTheDocument()
+  })
+
+  it('keeps anonymous navigation unchanged and shows only the customer account destination after sign-in', async () => {
+    const user = userEvent.setup()
+    renderApp()
+    const navigation = screen.getByRole('navigation', { name: /main navigation/i })
+    expect(within(navigation).queryByRole('link', { name: 'Account' })).not.toBeInTheDocument()
+    expect(within(navigation).queryByRole('link', { name: 'Admin' })).not.toBeInTheDocument()
+    expect(screen.getAllByRole('link', { name: /demo sign in/i }).length).toBeGreaterThan(0)
+
+    await user.click(document.querySelector<HTMLAnchorElement>('.nav-session-desktop .nav-action')!)
+    await user.click(screen.getByRole('button', { name: /one-click aina demo/i }))
+
+    expect(within(navigation).getByRole('link', { name: 'Account' })).toBeVisible()
+    expect(within(navigation).queryByRole('link', { name: 'Admin' })).not.toBeInTheDocument()
+  })
+
+  it('restores safe titles and h1 focus on browser back and forward', async () => {
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    services.auth.oneClick('customer')
+    window.history.replaceState({}, '', '#/account?email=aina%40example.test')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+
+    const accountHeading = screen.getByRole('heading', { level: 1, name: 'Aina Demo' })
+    await waitFor(() => {
+      expect(document.title).toBe('Account | The Blind Box Company | Demo / No Real Charge')
+      expect(document.activeElement).toBe(accountHeading)
+    })
+
+    act(() => {
+      window.history.pushState({}, '', '#/cart?order=ord-unopened')
+      window.dispatchEvent(new PopStateEvent('popstate'))
+    })
+    const cartHeading = await screen.findByRole('heading', { level: 1, name: /demo cargo list/i })
+    await waitFor(() => {
+      expect(document.title).toBe('Cart | The Blind Box Company | Demo / No Real Charge')
+      expect(document.activeElement).toBe(cartHeading)
+    })
+
+    act(() => window.history.back())
+    await waitFor(() => {
+      expect(window.location.hash).toBe('#/account?email=aina%40example.test')
+      expect(document.title).toBe('Account | The Blind Box Company | Demo / No Real Charge')
+      expect(document.activeElement).toBe(
+        screen.getByRole('heading', { level: 1, name: 'Aina Demo' }),
+      )
+    })
+
+    act(() => window.history.forward())
+    await waitFor(() => {
+      expect(window.location.hash).toBe('#/cart?order=ord-unopened')
+      expect(document.title).toBe('Cart | The Blind Box Company | Demo / No Real Charge')
+      expect(document.activeElement).toBe(
+        screen.getByRole('heading', { level: 1, name: /demo cargo list/i }),
+      )
+    })
+    expect(document.title).not.toMatch(/aina@example\.test|ord-unopened/)
+  })
+
   it('shows constructor storage fallback while keeping its memory-only demo session usable', async () => {
     const user = userEvent.setup()
     const storage = new MemoryStorage()
@@ -71,6 +196,104 @@ describe('app components', () => {
     expect(services.auth.currentUser()?.role).toBe('customer')
     expect(await screen.findByText(/could not save it.+continuing in memory only/i)).toBeVisible()
     expect(await screen.findByRole('heading', { name: 'Aina Demo' })).toBeVisible()
+  })
+
+  it('keeps the cart visible for a blank quantity draft, commits 2, and restores 2 on blank blur', async () => {
+    const user = userEvent.setup()
+    const storage = new MemoryStorage()
+    const services = new AppServices(storage, () => FIXED_NOW)
+    const setCartQuantity = vi.spyOn(services.orders, 'setCartQuantity')
+    window.history.replaceState({}, '', '#/cart')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+    const quantityInput = screen.getByRole('spinbutton', { name: /quantity/i })
+    const storedQuantityOne = storage.getItem(STORAGE_KEY)
+
+    await user.clear(quantityInput)
+
+    expect(quantityInput).toHaveValue(null)
+    expect(screen.queryByRole('heading', { name: /your demo cart is empty/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /sign in to checkout/i })).toBeVisible()
+    expect(screen.getByText(/current subtotal/i).closest('div')).toHaveTextContent('RM 100.00')
+    expect(setCartQuantity).not.toHaveBeenCalled()
+    expect(services.repository.getSnapshot().cart[0].quantity).toBe(1)
+    expect(storage.getItem(STORAGE_KEY)).toBe(storedQuantityOne)
+
+    await user.type(quantityInput, '2')
+
+    expect(quantityInput).toHaveValue(2)
+    expect(setCartQuantity).toHaveBeenCalledTimes(1)
+    expect(setCartQuantity).toHaveBeenLastCalledWith(2)
+    expect(services.repository.getSnapshot().cart[0].quantity).toBe(2)
+    expect(screen.getByText(/current subtotal/i).closest('div')).toHaveTextContent('RM 200.00')
+    const storedQuantityTwo = storage.getItem(STORAGE_KEY)
+
+    await user.clear(quantityInput)
+    fireEvent.blur(quantityInput)
+
+    expect(quantityInput).toHaveValue(2)
+    expect(setCartQuantity).toHaveBeenCalledTimes(1)
+    expect(services.repository.getSnapshot().cart[0].quantity).toBe(2)
+    expect(storage.getItem(STORAGE_KEY)).toBe(storedQuantityTwo)
+    expect(screen.queryByRole('heading', { name: /your demo cart is empty/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /sign in to checkout/i })).toBeVisible()
+  })
+
+  it.each(['1.5', '-1', '11'])('restores invalid quantity draft %s without changing storage', (invalidDraft) => {
+    const storage = new MemoryStorage()
+    const services = new AppServices(storage, () => FIXED_NOW)
+    services.orders.setCartQuantity(2)
+    const setCartQuantity = vi.spyOn(services.orders, 'setCartQuantity')
+    const storedQuantityTwo = storage.getItem(STORAGE_KEY)
+    window.history.replaceState({}, '', '#/cart')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+    const quantityInput = screen.getByRole('spinbutton', { name: /quantity/i })
+
+    fireEvent.change(quantityInput, { target: { value: invalidDraft } })
+    fireEvent.blur(quantityInput)
+
+    expect(quantityInput).toHaveValue(2)
+    expect(setCartQuantity).not.toHaveBeenCalled()
+    expect(services.repository.getSnapshot().cart[0].quantity).toBe(2)
+    expect(storage.getItem(STORAGE_KEY)).toBe(storedQuantityTwo)
+  })
+
+  it('keeps the step buttons synchronized and reserves cart removal for Remove', async () => {
+    const user = userEvent.setup()
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    services.orders.setCartQuantity(2)
+    const setCartQuantity = vi.spyOn(services.orders, 'setCartQuantity')
+    window.history.replaceState({}, '', '#/cart')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+    const quantityInput = screen.getByRole('spinbutton', { name: /quantity/i })
+
+    await user.clear(quantityInput)
+    await user.click(screen.getByRole('button', { name: /decrease quantity/i }))
+
+    expect(quantityInput).toHaveValue(1)
+    expect(setCartQuantity).toHaveBeenCalledTimes(1)
+    expect(setCartQuantity).toHaveBeenLastCalledWith(1)
+    expect(services.repository.getSnapshot().cart[0].quantity).toBe(1)
+    expect(screen.queryByRole('heading', { name: /your demo cart is empty/i })).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: /decrease quantity/i }))
+
+    expect(quantityInput).toHaveValue(1)
+    expect(setCartQuantity).toHaveBeenCalledTimes(1)
+    expect(services.repository.getSnapshot().cart[0].quantity).toBe(1)
+
+    await user.clear(quantityInput)
+    await user.click(screen.getByRole('button', { name: /increase quantity/i }))
+
+    expect(quantityInput).toHaveValue(2)
+    expect(setCartQuantity).toHaveBeenCalledTimes(2)
+    expect(setCartQuantity).toHaveBeenLastCalledWith(2)
+    expect(services.repository.getSnapshot().cart[0].quantity).toBe(2)
+
+    await user.click(screen.getByRole('button', { name: /remove from cart/i }))
+
+    expect(setCartQuantity).toHaveBeenCalledTimes(3)
+    expect(setCartQuantity).toHaveBeenLastCalledWith(0)
+    expect(screen.getByRole('heading', { name: /your demo cart is empty/i })).toBeVisible()
   })
 
   it('requires styled confirmation before resetting demo data', async () => {
@@ -145,9 +368,13 @@ describe('app components', () => {
   it('redirects a support role to its first allowed section and hides other departments', async () => {
     const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
     services.repository.update((state) => { state.sessionUserId = 'usr-support' })
-    window.history.replaceState({}, '', '#/admin')
+    window.history.replaceState({}, '', '#/account')
     render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
     expect(await screen.findByRole('heading', { name: 'Users' })).toBeVisible()
+    expect(window.location.hash).toBe('#/admin/users')
+    const mainNavigation = screen.getByRole('navigation', { name: /main navigation/i })
+    expect(within(mainNavigation).getByRole('link', { name: 'Admin' })).toBeVisible()
+    expect(within(mainNavigation).queryByRole('link', { name: 'Account' })).not.toBeInTheDocument()
     const adminNavigation = screen.getByRole('navigation', { name: /admin navigation/i })
     expect(adminNavigation).toHaveTextContent('Users')
     expect(adminNavigation).toHaveTextContent('Claims')
@@ -341,10 +568,17 @@ describe('app components', () => {
     render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
 
     const card = screen.getByRole('radio', { name: /card no card number/i })
+    const newAttemptHeading = screen.getByRole('heading', { level: 1, name: /mock hitpay payment/i })
+    expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1)
+    await waitFor(() => expect(document.activeElement).toBe(newAttemptHeading))
     await user.click(card)
+    expect(document.activeElement).toBe(card)
     await user.click(screen.getByRole('button', { name: /create pending demo attempt/i }))
 
     const selectedCard = await screen.findByRole('radio', { name: /card no card number/i })
+    const existingAttemptHeading = screen.getByRole('heading', { level: 1, name: /mock hitpay payment/i })
+    expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1)
+    await waitFor(() => expect(document.activeElement).toBe(existingAttemptHeading))
     expect(selectedCard).toBeChecked()
     expect(selectedCard).toBeDisabled()
     expect(services.repository.getSnapshot().payments.at(-1)?.method).toBe('CARD')

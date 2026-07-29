@@ -94,6 +94,7 @@ export function MockPaymentPage() {
       <div className="content narrow">
         <div className="no-money-banner"><b>DEMO · NO REAL CHARGE</b><span>This is a hosted-checkout-style simulator. Never enter payment information.</span></div>
         <div className="mock-provider-bar"><span className="mock-hitpay">HITPAY / MOCK</span><span>ORDER {order.id.toUpperCase()}</span></div>
+        <h1>Mock HitPay payment.</h1>
         {error && <Notice tone="danger">{error}</Notice>}
         {message && <Notice tone="success">{message}</Notice>}
         <div className="payment-amount"><span>Demo amount</span><strong>{formatMYR(order.snapshot.totals.totalSen)}</strong><small>MYR · cannot be edited</small></div>

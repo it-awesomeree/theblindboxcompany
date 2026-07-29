@@ -24,6 +24,37 @@ async function reachCheckout(page: Page) {
 test.describe('desktop customer journeys', () => {
   test.skip(({ isMobile }) => isMobile, 'Detailed journeys run once in installed Chrome.')
 
+  test('safe customer titles and h1 focus survive browser history', async ({ page }) => {
+    await clearAndOpen(page)
+    await page.getByRole('link', { name: /demo sign in/i }).click()
+    await page.getByRole('button', { name: /one-click aina demo/i }).click()
+
+    const accountHeading = page.getByRole('heading', { level: 1, name: 'Aina Demo' })
+    await expect(accountHeading).toBeFocused()
+    await expect(page).toHaveTitle('Account | The Blind Box Company | Demo / No Real Charge')
+    expect(await page.title()).not.toMatch(/Aina Demo|aina@example\.test/)
+
+    await page.getByRole('link', { name: /^Cart\b/ }).click()
+    const cartHeading = page.getByRole('heading', { level: 1, name: /demo cargo list/i })
+    await expect(cartHeading).toBeFocused()
+    await expect(page).toHaveTitle('Cart | The Blind Box Company | Demo / No Real Charge')
+
+    await page.goBack()
+    await expect(accountHeading).toBeFocused()
+    await expect(page).toHaveTitle('Account | The Blind Box Company | Demo / No Real Charge')
+
+    await page.goForward()
+    await expect(cartHeading).toBeFocused()
+    await expect(page).toHaveTitle('Cart | The Blind Box Company | Demo / No Real Charge')
+
+    await page.goto('#/pay/ord-unopened/new')
+    const paymentHeading = page.getByRole('heading', { level: 1, name: /mock hitpay payment/i })
+    await expect(paymentHeading).toBeFocused()
+    await expect(page.getByRole('heading', { level: 1 })).toHaveCount(1)
+    await expect(page).toHaveTitle('Mock Payment | The Blind Box Company | Demo / No Real Charge')
+    expect(await page.title()).not.toMatch(/ord-unopened|Aina Demo|aina@example\.test/)
+  })
+
   test('successful mock checkout, valid event and immutable reveal', async ({ page }) => {
     await reachCheckout(page)
     await page.getByRole('button', { name: /approve \+ valid mock webhook/i }).click()

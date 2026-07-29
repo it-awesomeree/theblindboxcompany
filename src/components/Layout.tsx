@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import type { PropsWithChildren } from 'react'
 import { NavLink } from '../lib/router'
 import { useLocation, useNavigate } from '../lib/router-core'
+import { titleForRoute } from '../lib/route-metadata'
 import { ADMIN_ROLES } from '../domain/constants'
 import { useAppState } from '../state/AppStateContext'
 import { Brand } from './Brand'
@@ -36,8 +37,8 @@ export function Layout({ children }: PropsWithChildren) {
   const user = state.users.find((entry) => entry.id === state.sessionUserId)
   const cartCount = state.cart.reduce((sum, item) => sum + item.quantity, 0)
   const navigate = useNavigate()
-  const { pathname } = useLocation()
-  const previousPathname = useRef(pathname)
+  const { pathname, search } = useLocation()
+  const previousPathname = useRef<string | null>(null)
   const [resetPending, setResetPending] = useState(false)
   const [resetError, setResetError] = useState('')
   const [sessionError, setSessionError] = useState('')
@@ -47,6 +48,10 @@ export function Layout({ children }: PropsWithChildren) {
     main?.scrollIntoView({ block: 'start' })
     main?.focus({ preventScroll: true })
   }
+
+  useEffect(() => {
+    document.title = titleForRoute(pathname)
+  }, [pathname, search])
 
   useEffect(() => {
     window.scrollTo({ top: 0, left: 0, behavior: 'auto' })
@@ -95,7 +100,7 @@ export function Layout({ children }: PropsWithChildren) {
           <nav className="nav-links" aria-label="Main navigation">
             <NavLink to="/">Vault</NavLink>
             <NavLink to="/cart">Cart <span className="nav-count">{cartCount}</span></NavLink>
-            {user && <NavLink to="/account">Account</NavLink>}
+            {user?.role === 'customer' && <NavLink to="/account">Account</NavLink>}
             {user && ADMIN_ROLES.includes(user.role) && <NavLink to="/admin">Admin</NavLink>}
           </nav>
           <SessionControls className="nav-session-desktop" user={user} onLogout={logout} />

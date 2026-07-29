@@ -138,6 +138,44 @@ test('responsive shell preserves navigation, legal text, input sizing and import
   await expectNoRootOverflow(page)
 })
 
+test('360px cart keeps a blank quantity draft visible and restores the last committed quantity', async ({ page }) => {
+  test.skip(page.viewportSize()?.width !== 360, 'This focused cart regression runs only at 360px.')
+  await page.addInitScript(() => localStorage.clear())
+  await page.goto('#/cart')
+  const quantityInput = page.getByRole('spinbutton', { name: /quantity/i })
+  const orderSummary = page.locator('.order-summary')
+
+  await expect(quantityInput).toHaveValue('1')
+  await quantityInput.fill('')
+
+  await expect(quantityInput).toHaveValue('')
+  await expect(page.getByRole('heading', { name: /your demo cart is empty/i })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: /sign in to checkout/i })).toBeVisible()
+  await expect(orderSummary).toContainText('RM 100.00')
+  await expectNoRootOverflow(page)
+
+  await quantityInput.fill('2')
+
+  await expect(quantityInput).toHaveValue('2')
+  await expect(orderSummary).toContainText('RM 200.00')
+  await expect.poll(() => page.evaluate(() => {
+    const state = JSON.parse(localStorage.getItem('tbbc:demo:repository:v5')!)
+    return state.cart[0].quantity
+  })).toBe(2)
+
+  await quantityInput.fill('')
+  await quantityInput.blur()
+
+  await expect(quantityInput).toHaveValue('2')
+  await expect(page.getByRole('heading', { name: /your demo cart is empty/i })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: /sign in to checkout/i })).toBeVisible()
+  await expect.poll(() => page.evaluate(() => {
+    const state = JSON.parse(localStorage.getItem('tbbc:demo:repository:v5')!)
+    return state.cart[0].quantity
+  })).toBe(2)
+  await expectNoRootOverflow(page)
+})
+
 test('WebGL-disabled fallback is the single keyboard opener and visibly opens', async ({ page }) => {
   await page.goto('?nogl=1#/')
   const fallback = page.getByRole('button', { name: /activate boosted demo vault opener/i })

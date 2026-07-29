@@ -6,18 +6,42 @@ import { useAppState } from '../state/AppStateContext'
 import { Notice } from '../components/Notice'
 import { useState } from 'react'
 
+function isValidQuantityDraft(value: string) {
+  return /^(?:[1-9]|10)$/.test(value)
+}
+
 export function CartPage() {
   const { state, services } = useAppState()
   const navigate = useNavigate()
   const item = state.cart[0]
   const quantity = item?.quantity ?? 0
   const [error, setError] = useState('')
+  const [quantityDraft, setQuantityDraft] = useState(String(quantity))
   const changeQuantity = (next: number) => {
     setError('')
     try {
       services.orders.setCartQuantity(next)
+      return true
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : 'The cart change was blocked. Nothing changed; please try again.')
+      return false
+    }
+  }
+  const commitQuantity = (next: number) => {
+    setQuantityDraft(String(next))
+    if (next === quantity) {
+      setError('')
+      return
+    }
+    if (!changeQuantity(next)) {
+      setQuantityDraft(String(quantity))
+    }
+  }
+  const editQuantity = (nextDraft: string) => {
+    setError('')
+    setQuantityDraft(nextDraft)
+    if (isValidQuantityDraft(nextDraft)) {
+      commitQuantity(Number(nextDraft))
     }
   }
 
@@ -40,9 +64,13 @@ export function CartPage() {
                 <h2>Series 001 Blind Box</h2>
                 <p>One immutable paid prize after a valid mock webhook. Every declared value is at least RM100.</p>
                 <div className="quantity-control" aria-label="Cart quantity">
-                  <button type="button" aria-label="Decrease quantity" onClick={() => changeQuantity(Math.max(0, quantity - 1))}>−</button>
-                  <label><span>Quantity</span><input type="number" min="1" max={MAX_CART_QUANTITY} value={quantity} onChange={(event) => changeQuantity(Number(event.target.value))} /></label>
-                  <button type="button" aria-label="Increase quantity" onClick={() => changeQuantity(Math.min(MAX_CART_QUANTITY, quantity + 1))}>+</button>
+                  <button type="button" aria-label="Decrease quantity" onClick={() => commitQuantity(Math.max(1, quantity - 1))}>−</button>
+                  <label><span>Quantity</span><input type="number" min="1" max={MAX_CART_QUANTITY} step="1" value={quantityDraft} onChange={(event) => editQuantity(event.target.value)} onBlur={() => {
+                    if (!isValidQuantityDraft(quantityDraft)) {
+                      setQuantityDraft(String(quantity))
+                    }
+                  }} /></label>
+                  <button type="button" aria-label="Increase quantity" onClick={() => commitQuantity(Math.min(MAX_CART_QUANTITY, quantity + 1))}>+</button>
                 </div>
                 <button className="text-button" type="button" onClick={() => changeQuantity(0)}>Remove from cart</button>
               </div>

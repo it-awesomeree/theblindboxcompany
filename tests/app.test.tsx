@@ -1029,6 +1029,46 @@ describe('app components', () => {
     expect(screen.queryByRole('button', { name: /delayed valid webhook/i })).not.toBeInTheDocument()
   })
 
+  it('replaces a delayed-webhook unchanged info status with a sole assertive error notice', async () => {
+    const user = userEvent.setup()
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    services.auth.oneClick('customer')
+    const order = services.orders.create({
+      requestId: 'checkout_0000000000000000000000000000e001',
+      quantity: 1,
+      shippingMethod: 'standard',
+      address: DEMO_ADDRESS,
+      acknowledged: true,
+      displayedTotalSen: 11_200,
+    })
+    const payment = services.payments.createAttempt(order.id)
+    const processingPayment = services.payments.act(payment.id, 'delayed').payment
+    vi.spyOn(services.payments, 'act')
+      .mockReturnValueOnce({
+        payment: processingPayment,
+        changed: false,
+        message: 'Delayed webhook accepted for announcement testing.',
+      })
+      .mockImplementationOnce(() => {
+        throw new Error('Delayed webhook was blocked safely.')
+      })
+    window.history.replaceState({}, '', `#/payment-return/${payment.id}`)
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+
+    const confirm = screen.getByRole('button', { name: /simulate delayed valid webhook arriving/i })
+    await user.click(confirm)
+    const unchangedNotice = await within(screen.getByRole('main')).findByRole('status')
+    expect(unchangedNotice).toHaveTextContent('Delayed webhook accepted for announcement testing.')
+    expect(unchangedNotice).toHaveClass('notice-info')
+    expect(unchangedNotice).toHaveAttribute('aria-live', 'polite')
+
+    await user.click(confirm)
+    const errorNotice = await screen.findByRole('alert')
+    expect(errorNotice).toHaveTextContent('Delayed webhook was blocked safely.')
+    expect(screen.getAllByRole('alert')).toHaveLength(1)
+    expect(within(screen.getByRole('main')).queryByRole('status')).not.toBeInTheDocument()
+  })
+
   it.each([
     ['failed', /payment failed/i],
     ['cancelled', /payment cancelled/i],
@@ -1133,7 +1173,27 @@ describe('app components', () => {
     }
   })
 
-  it('shows guarded order cancellation and closure controls and completes a valid closure', async () => {
+  it('names the order status filter and reflects each pressed toggle', async () => {
+    const user = userEvent.setup()
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    services.auth.oneClick('admin')
+    window.history.replaceState({}, '', '#/admin/orders')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+
+    const group = screen.getByRole('group', { name: /order status filter/i })
+    const all = within(group).getByRole('button', { name: 'All' })
+    const disputed = within(group).getByRole('button', { name: 'Disputed' })
+    expect(all).toHaveAttribute('aria-pressed', 'true')
+    expect(disputed).toHaveAttribute('aria-pressed', 'false')
+    expect(within(group).getAllByRole('button').every((button) => button.hasAttribute('aria-pressed'))).toBe(true)
+
+    await user.click(disputed)
+    expect(all).toHaveAttribute('aria-pressed', 'false')
+    expect(disputed).toHaveAttribute('aria-pressed', 'true')
+    expect(disputed).toHaveClass('active')
+  })
+
+  it('announces a completed order action politely and clears it before the next blocked action', async () => {
     const user = userEvent.setup()
     const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
     services.auth.oneClick('customer')
@@ -1146,6 +1206,7 @@ describe('app components', () => {
       acknowledged: true,
       displayedTotalSen: 11_200,
     })
+    services.payments.createAttempt(unpaid.id)
     services.auth.oneClick('admin')
     window.history.replaceState({}, '', '#/admin/orders')
     render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
@@ -1162,9 +1223,15 @@ describe('app components', () => {
     await user.click(close)
     expect(screen.getByRole('dialog', { name: /close this fulfilled order/i })).toBeVisible()
     await user.click(screen.getByRole('button', { name: 'Confirm closure' }))
-    expect(await screen.findByText(/fulfilled order closed and audit evidence saved/i)).toBeVisible()
+    expect(await within(screen.getByRole('main')).findByRole('status')).toHaveTextContent(/fulfilled order closed and audit evidence saved/i)
     expect(services.repository.getSnapshot().orders.find((order) => order.id === 'ord-delivered')?.status).toBe('closed')
     expect(services.repository.getSnapshot().audits.at(-1)?.action).toBe('order.transitioned')
+
+    await user.click(within(unpaidRecord).getByRole('button', { name: 'Cancel unpaid' }))
+    expect(within(screen.getByRole('main')).queryByRole('status')).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Confirm cancellation' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent(/cancel or expire the active payment/i)
+    expect(within(screen.getByRole('main')).queryByRole('status')).not.toBeInTheDocument()
   })
 
   it('lets the cancellation service block an active payment attempt from Admin Orders', async () => {
@@ -1188,7 +1255,8 @@ describe('app components', () => {
     await user.click(record.querySelector('summary')!)
     await user.click(within(record).getByRole('button', { name: 'Cancel unpaid' }))
     await user.click(screen.getByRole('button', { name: 'Confirm cancellation' }))
-    expect(await screen.findByText(/cancel or expire the active payment/i)).toBeVisible()
+    expect(await screen.findByRole('alert')).toHaveTextContent(/cancel or expire the active payment/i)
+    expect(within(screen.getByRole('main')).queryByRole('status')).not.toBeInTheDocument()
     expect(services.repository.getSnapshot().orders.find((entry) => entry.id === order.id)?.status).toBe('pending_payment')
   })
 
@@ -1518,12 +1586,20 @@ describe('app components', () => {
     await user.click(record.querySelector('summary')!)
     await user.click(within(record).getByRole('button', { name: /reconcile succeeded/i }))
     await user.click(screen.getByRole('button', { name: /confirm and audit/i }))
-    expect(await screen.findByText('Duplicate event ignored safely.')).toBeVisible()
+    const duplicateNotice = await screen.findByText('Duplicate event ignored safely.')
+    expect(duplicateNotice).toBeVisible()
+    expect(duplicateNotice).toHaveClass('notice-info')
+    expect(duplicateNotice).not.toHaveClass('notice-success')
+    expect(duplicateNotice).toHaveAttribute('role', 'status')
+    expect(duplicateNotice).toHaveAttribute('aria-live', 'polite')
     expect(screen.queryByText(/reconcile action completed and audited/i)).not.toBeInTheDocument()
 
     await user.click(within(record).getByRole('button', { name: /reconcile succeeded/i }))
     await user.click(screen.getByRole('button', { name: /confirm and audit/i }))
-    expect(await screen.findByText('Out-of-order event was recorded without changing payment status.')).toBeVisible()
+    const outOfOrderNotice = await screen.findByText('Out-of-order event was recorded without changing payment status.')
+    expect(outOfOrderNotice).toBeVisible()
+    expect(outOfOrderNotice).toHaveClass('notice-info')
+    expect(outOfOrderNotice).not.toHaveClass('notice-success')
     expect(screen.queryByText(/reconcile action completed and audited/i)).not.toBeInTheDocument()
     expect(processEvent).toHaveBeenCalledTimes(2)
   })

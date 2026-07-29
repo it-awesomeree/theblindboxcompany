@@ -18,6 +18,8 @@ import type { ClaimReviewAction } from '../../services/ClaimService'
 import { formatDateTime, formatMYR, titleCase } from '../../lib/format'
 import { useAppState } from '../../state/AppStateContext'
 
+type ActionNotice = { text: string; tone: 'info' | 'success' | 'danger' } | null
+
 function Allowed({ section, children }: { section: AdminSection; children: React.ReactNode }) {
   const { services } = useAppState()
   try {
@@ -119,7 +121,7 @@ function AdminUsersContent() {
   const { state, services } = useAppState()
   const [query, setQuery] = useState('')
   const [pending, setPending] = useState<{ id: string; status: 'active' | 'suspended' } | null>(null)
-  const [message, setMessage] = useState('')
+  const [notice, setNotice] = useState<ActionNotice>(null)
   const users = services.admin.searchUsers(query)
   const actor = state.users.find((entry) => entry.id === state.sessionUserId)
   const canOpenCombinedOrders = Boolean(actor && ADMIN_SECTION_PERMISSIONS.orders.includes(actor.role))
@@ -127,18 +129,23 @@ function AdminUsersContent() {
 
   const confirm = () => {
     if (!pending) return
+    setNotice(null)
     try {
       services.admin.setUserStatus(pending.id, pending.status, `Confirmed demo ${pending.status} action for workflow review`)
-      setMessage(`User is now ${pending.status}.`)
+      setNotice({ text: `User is now ${pending.status}.`, tone: 'success' })
     } catch (caught) {
-      setMessage(caught instanceof Error ? caught.message : 'Action was blocked.')
+      setNotice({ text: caught instanceof Error ? caught.message : 'Action was blocked.', tone: 'danger' })
     }
     setPending(null)
+  }
+  const openAction = (action: NonNullable<typeof pending>) => {
+    setNotice(null)
+    setPending(action)
   }
 
   return <>
     <AdminHeading code="A01" title="Users" description="Search fictional identities and inspect account status. Only admins can suspend or reactivate." />
-    {message && <Notice>{message}</Notice>}
+    {notice && <Notice tone={notice.tone}>{notice.text}</Notice>}
     <label className="search-field"><span>SEARCH</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Name, fake email, role or status" /></label>
     <div className="responsive-table admin-table-wrap">
       <table className="data-table admin-table">
@@ -163,7 +170,7 @@ function AdminUsersContent() {
               <td data-label="Action">
                 {canMutateUsers
                   ? (
-                      <button className="table-action" type="button" disabled={actor?.id === user.id && user.status === 'active'} onClick={() => setPending({ id: user.id, status: user.status === 'active' ? 'suspended' : 'active' })}>
+                      <button className="table-action" type="button" disabled={actor?.id === user.id && user.status === 'active'} onClick={() => openAction({ id: user.id, status: user.status === 'active' ? 'suspended' : 'active' })}>
                         {user.status === 'active' ? 'Suspend' : 'Reactivate'}
                       </button>
                     )
@@ -188,7 +195,7 @@ export function AdminOrdersPage() {
   const [statusFilter, setStatusFilter] = useState('all')
   const [query, setQuery] = useState('')
   const [pending, setPending] = useState<OrderAction>(null)
-  const [notice, setNotice] = useState<{ text: string; tone: 'danger' | 'success' } | null>(null)
+  const [notice, setNotice] = useState<ActionNotice>(null)
   const userFilter = searchParams.get('user') ?? 'all'
   const selectedUser = state.users.find((user) => user.id === userFilter)
   const actor = state.users.find((entry) => entry.id === state.sessionUserId)
@@ -227,6 +234,7 @@ export function AdminOrdersPage() {
   }
   const perform = () => {
     if (!pending) return
+    setNotice(null)
     try {
       if (pending.kind === 'cancel') {
         services.admin.changeOrderStatus(
@@ -248,6 +256,10 @@ export function AdminOrdersPage() {
     }
     setPending(null)
   }
+  const openAction = (action: NonNullable<OrderAction>) => {
+    setNotice(null)
+    setPending(action)
+  }
   return <Allowed section="orders"><>
     <AdminHeading code="A02" title="Orders" description="Frozen totals and address snapshots, payments, boxes, hidden allocations, timelines, fulfilment and claims." />
     {notice && <Notice tone={notice.tone}>{notice.text}</Notice>}
@@ -260,8 +272,8 @@ export function AdminOrdersPage() {
       </select></label>
       <button className="button button-ghost" type="button" onClick={clearFilters}>Clear filters</button>
     </div>
-    <div className="filter-bar">
-      {['all', 'pending_payment', 'confirmed', 'processing', 'partially_fulfilled', 'fulfilled', 'closed', 'cancelled', 'refunded', 'disputed'].map((value) => <button key={value} className={statusFilter === value ? 'active' : ''} type="button" onClick={() => setStatusFilter(value)}>{titleCase(value)}</button>)}
+    <div className="filter-bar" role="group" aria-label="Order status filter">
+      {['all', 'pending_payment', 'confirmed', 'processing', 'partially_fulfilled', 'fulfilled', 'closed', 'cancelled', 'refunded', 'disputed'].map((value) => <button key={value} className={statusFilter === value ? 'active' : ''} type="button" aria-pressed={statusFilter === value} onClick={() => setStatusFilter(value)}>{titleCase(value)}</button>)}
     </div>
     <div className="admin-record-list">
       {orders.map((order) => {
@@ -281,8 +293,8 @@ export function AdminOrdersPage() {
             </div>
             {canMutateOrders && (
               <div className="record-actions">
-                {order.status === 'pending_payment' && <button className="button button-danger" type="button" onClick={() => setPending({ kind: 'cancel', id: order.id })}>Cancel unpaid</button>}
-                {order.status === 'fulfilled' && <button className="button" type="button" onClick={() => setPending({ kind: 'close', id: order.id })}>Close order</button>}
+                {order.status === 'pending_payment' && <button className="button button-danger" type="button" onClick={() => openAction({ kind: 'cancel', id: order.id })}>Cancel unpaid</button>}
+                {order.status === 'fulfilled' && <button className="button" type="button" onClick={() => openAction({ kind: 'close', id: order.id })}>Close order</button>}
               </div>
             )}
             <ol className="mini-timeline">{order.timeline.map((entry) => <li key={entry.id}><b>{entry.label}</b><small>{formatDateTime(entry.at)} · {titleCase(entry.status)}</small></li>)}</ol>
@@ -315,7 +327,7 @@ export function AdminPaymentsPage() {
   const { state, services } = useAppState()
   const [searchParams, setSearchParams] = useSearchParams()
   const [pending, setPending] = useState<PaymentAction>(null)
-  const [message, setMessage] = useState('')
+  const [notice, setNotice] = useState<ActionNotice>(null)
   const orderFilter = searchParams.get('order')
   const filteredPayments = orderFilter
     ? state.payments.filter((payment) => payment.orderId === orderFilter)
@@ -336,68 +348,78 @@ export function AdminPaymentsPage() {
       : `Confirm ${pending?.kind ?? ''} payment action?`
   const perform = () => {
     if (!pending) return
+    setNotice(null)
     try {
-      let resultMessage = ''
-      if (pending.kind === 'retry') services.payments.adminRetry(pending.id, 'Confirmed admin demo retry')
+      let result: { changed: boolean; message: string } | null = null
+      if (pending.kind === 'retry') {
+        services.payments.adminRetry(pending.id, 'Confirmed admin demo retry')
+      }
       if (pending.kind === 'reconcile') {
-        resultMessage = services.payments.processEvent(
+        result = services.payments.processEvent(
           pending.id,
           `evt-admin-${pending.id}-${state.revision}`,
           'succeeded',
           'admin_reconcile',
-        ).message
+        )
       }
       if (pending.kind === 'dispute') {
-        resultMessage = services.payments.dispute(
+        result = services.payments.dispute(
           pending.id,
           'Confirmed fictional dispute requiring fulfilment hold',
           `evt-dispute-${pending.id}-${state.revision}`,
-        ).message
+        )
       }
       if (pending.kind === 'merchant_won') {
-        resultMessage = services.payments.resolveDispute(
+        result = services.payments.resolveDispute(
           pending.id,
           'merchant_won',
           'Confirmed fictional dispute resolution restoring eligible fulfilment',
           `evt-dispute-win-${pending.id}-${state.revision}`,
-        ).message
+        )
       }
       if (pending.kind === 'dispute_refund') {
-        resultMessage = services.payments.resolveDispute(
+        result = services.payments.resolveDispute(
           pending.id,
           'refund',
           'Confirmed fictional dispute resolution with full refund',
           `evt-dispute-refund-${pending.id}-${state.revision}`,
-        ).message
+        )
       }
       const payment = state.payments.find((entry) => entry.id === pending.id)
       if (pending.kind === 'partial') {
         const remaining = (payment?.amountSen ?? 0) - (payment?.refundedSen ?? 0)
         if (remaining <= 1000) throw new Error('RM10 partial refund is unavailable when RM10 or less remains.')
-        resultMessage = services.payments.refund(
+        result = services.payments.refund(
           pending.id,
           1000,
           'Confirmed RM10 demo partial refund',
           `req-partial-${pending.id}-${state.revision}`,
-        ).message
+        )
       }
-      if (pending.kind === 'full' && payment) {
-        resultMessage = services.payments.refund(
+      if (pending.kind === 'full') {
+        if (!payment) throw new Error('Payment attempt was not found.')
+        result = services.payments.refund(
           pending.id,
           payment.amountSen - payment.refundedSen,
           'Confirmed full demo refund; allocations retained',
           `req-full-${pending.id}-${state.revision}`,
-        ).message
+        )
       }
-      setMessage(resultMessage || `${titleCase(pending.kind)} action completed and audited.`)
+      setNotice(result
+        ? { text: result.message, tone: result.changed ? 'success' : 'info' }
+        : { text: `${titleCase(pending.kind)} action completed and audited.`, tone: 'success' })
     } catch (caught) {
-      setMessage(caught instanceof Error ? caught.message : 'Payment action was blocked.')
+      setNotice({ text: caught instanceof Error ? caught.message : 'Payment action was blocked.', tone: 'danger' })
     }
     setPending(null)
   }
+  const openAction = (action: NonNullable<PaymentAction>) => {
+    setNotice(null)
+    setPending(action)
+  }
   return <Allowed section="payments"><>
     <AdminHeading code="A03" title="Payments" description="Attempts, immutable events, idempotent reconcile/retry and refunds. Redirects are never proof." />
-    {message && <Notice>{message}</Notice>}
+    {notice && <Notice tone={notice.tone}>{notice.text}</Notice>}
     {orderFilter && (
       <Notice>
         Showing only payments for exact order <b>{orderFilter}</b>. An approved claim handoff does not refund automatically.
@@ -423,13 +445,13 @@ export function AdminPaymentsPage() {
         return <details className="admin-record payment-record" key={payment.id}>
           <summary><span><b>{payment.id}</b><small>{payment.method ?? 'NO METHOD'} · attempt {payment.attempt}</small></span><span>{formatMYR(payment.amountSen)}<small>refunded {formatMYR(payment.refundedSen)}</small></span><StatusBadge value={payment.status} /></summary>
           <div className="record-actions">
-            {canRetry && <button className="button button-ghost" type="button" onClick={() => setPending({ kind: 'retry', id: payment.id })}>Retry attempt</button>}
-            {['pending', 'processing'].includes(payment.status) && <button className="button" type="button" onClick={() => setPending({ kind: 'reconcile', id: payment.id })}>Reconcile succeeded</button>}
-            {['succeeded', 'partially_refunded'].includes(payment.status) && remainingSen > 1000 && <button className="button button-ghost" type="button" onClick={() => setPending({ kind: 'partial', id: payment.id })}>Partial refund RM10</button>}
-            {['succeeded', 'partially_refunded'].includes(payment.status) && remainingSen > 0 && <button className="button button-danger" type="button" onClick={() => setPending({ kind: 'full', id: payment.id })}>Refund remaining {formatMYR(remainingSen)}</button>}
-            {['succeeded', 'partially_refunded'].includes(payment.status) && <button className="button button-danger" type="button" onClick={() => setPending({ kind: 'dispute', id: payment.id })}>Mark disputed</button>}
-            {payment.status === 'disputed' && <button className="button" type="button" onClick={() => setPending({ kind: 'merchant_won', id: payment.id })}>Resolve: merchant won</button>}
-            {payment.status === 'disputed' && <button className="button button-danger" type="button" onClick={() => setPending({ kind: 'dispute_refund', id: payment.id })}>Resolve: full refund</button>}
+            {canRetry && <button className="button button-ghost" type="button" onClick={() => openAction({ kind: 'retry', id: payment.id })}>Retry attempt</button>}
+            {['pending', 'processing'].includes(payment.status) && <button className="button" type="button" onClick={() => openAction({ kind: 'reconcile', id: payment.id })}>Reconcile succeeded</button>}
+            {['succeeded', 'partially_refunded'].includes(payment.status) && remainingSen > 1000 && <button className="button button-ghost" type="button" onClick={() => openAction({ kind: 'partial', id: payment.id })}>Partial refund RM10</button>}
+            {['succeeded', 'partially_refunded'].includes(payment.status) && remainingSen > 0 && <button className="button button-danger" type="button" onClick={() => openAction({ kind: 'full', id: payment.id })}>Refund remaining {formatMYR(remainingSen)}</button>}
+            {['succeeded', 'partially_refunded'].includes(payment.status) && <button className="button button-danger" type="button" onClick={() => openAction({ kind: 'dispute', id: payment.id })}>Mark disputed</button>}
+            {payment.status === 'disputed' && <button className="button" type="button" onClick={() => openAction({ kind: 'merchant_won', id: payment.id })}>Resolve: merchant won</button>}
+            {payment.status === 'disputed' && <button className="button button-danger" type="button" onClick={() => openAction({ kind: 'dispute_refund', id: payment.id })}>Resolve: full refund</button>}
           </div>
           <div className="event-list">{payment.events.map((event) => <div key={event.id}><StatusBadge value={event.type} /><span><b>{event.id}</b><small>{event.source} · {formatDateTime(event.processedAt)}{event.ignoredReason ? ` · ${event.ignoredReason}` : ''}</small></span></div>)}</div>
         </details>
@@ -449,32 +471,34 @@ export function AdminInventoryPage() {
   const published = state.series.find((entry) => entry.status === 'published')!
   const publishedPrizes = publishedPrizesFor(published)
   const draft = state.series.find((entry) => entry.status === 'draft')
-  const [message, setMessage] = useState('')
+  const [notice, setNotice] = useState<ActionNotice>(null)
   const [draftName, setDraftName] = useState(draft?.draftPrizes?.[0]?.name ?? publishedPrizes[0].name)
   const [draftValue, setDraftValue] = useState((draft?.draftPrizes?.[0]?.valueSen ?? publishedPrizes[0].valueSen) / 100)
   const assigned = published.inventory.reduce((sum, entry) => sum + entry.assigned, 0)
   const draftNameValid = draftName.trim().length > 0
 
   const copy = () => {
+    setNotice(null)
     try {
       const result = services.admin.copyPublishedToDraft()
       setDraftName(result.draftPrizes?.[0]?.name ?? publishedPrizes[0].name)
-      setMessage('Editable draft copied. Published Series 001 stayed unchanged.')
+      setNotice({ text: 'Editable draft copied. Published Series 001 stayed unchanged.', tone: 'success' })
     } catch (caught) {
-      setMessage(caught instanceof Error ? caught.message : 'The draft copy was blocked. Nothing changed; please try again.')
+      setNotice({ text: caught instanceof Error ? caught.message : 'The draft copy was blocked. Nothing changed; please try again.', tone: 'danger' })
     }
   }
   const saveDraft = () => {
+    setNotice(null)
     try {
       services.admin.editDraftPrize('maggi', draftName, Math.round(draftValue * 100))
-      setMessage('Draft prize edited and audited. Published Series 001 stayed unchanged.')
+      setNotice({ text: 'Draft prize edited and audited. Published Series 001 stayed unchanged.', tone: 'success' })
     } catch (caught) {
-      setMessage(caught instanceof Error ? caught.message : 'Draft edit was blocked.')
+      setNotice({ text: caught instanceof Error ? caught.message : 'Draft edit was blocked.', tone: 'danger' })
     }
   }
   return <Allowed section="inventory"><>
     <AdminHeading code="A04" title="Series inventory" description="Published Series 001 is read-only. Remaining counts are derived from compact assigned counters." />
-    {message && <Notice>{message}</Notice>}
+    {notice && <Notice tone={notice.tone}>{notice.text}</Notice>}
     <div className="inventory-summary">
       <article><span>TOTAL</span><b>10,000</b></article><article><span>REMAINING</span><b>{(published.allocationTotal - assigned - published.reservedBoxes).toLocaleString()}</b></article><article><span>RESERVED</span><b>{published.reservedBoxes}</b></article><article><span>ASSIGNED</span><b>{assigned}</b></article>
     </div>
@@ -517,7 +541,7 @@ export function AdminFulfilmentPage() {
   const { state, services } = useAppState()
   const [pending, setPending] = useState<FulfilmentAction | null>(null)
   const [editing, setEditing] = useState<{ id: string; carrier: string; trackingNumber: string } | null>(null)
-  const [message, setMessage] = useState('')
+  const [notice, setNotice] = useState<ActionNotice>(null)
   const pendingShipment = pending?.kind === 'status'
     ? state.shipments.find((shipment) => shipment.id === pending.id)
     : undefined
@@ -527,6 +551,7 @@ export function AdminFulfilmentPage() {
     pendingShipment?.status === 'delivered'
   const perform = () => {
     if (!pending) return
+    setNotice(null)
     try {
       if (pending.kind === 'status') {
         const postDeliveryReturn =
@@ -539,9 +564,12 @@ export function AdminFulfilmentPage() {
             ? 'Confirmed post-delivery return record; no claim or refund created'
             : `Confirmed demo ${pending.status.replaceAll('_', ' ')} scan`,
         )
-        setMessage(postDeliveryReturn
-          ? 'Post-delivery return recorded. No claim or refund was created.'
-          : `Shipment moved to ${pending.status}.`)
+        setNotice({
+          text: postDeliveryReturn
+            ? 'Post-delivery return recorded. No claim or refund was created.'
+            : `Shipment moved to ${pending.status}.`,
+          tone: 'success',
+        })
       } else {
         services.fulfilment.setTracking(
           pending.id,
@@ -549,17 +577,25 @@ export function AdminFulfilmentPage() {
           pending.trackingNumber,
           'Confirmed fictional carrier and tracking entry',
         )
-        setMessage('Carrier and tracking were updated and audited.')
+        setNotice({ text: 'Carrier and tracking were updated and audited.', tone: 'success' })
         setEditing(null)
       }
     } catch (caught) {
-      setMessage(caught instanceof Error ? caught.message : 'Fulfilment action was blocked.')
+      setNotice({ text: caught instanceof Error ? caught.message : 'Fulfilment action was blocked.', tone: 'danger' })
     }
     setPending(null)
   }
+  const openAction = (action: FulfilmentAction) => {
+    setNotice(null)
+    setPending(action)
+  }
+  const openTrackingEdit = (shipment: { id: string; carrier: string; trackingNumber: string }) => {
+    setNotice(null)
+    setEditing(shipment)
+  }
   return <Allowed section="fulfilment"><>
     <AdminHeading code="A05" title="Fulfilment" description="Picking, packing, split shipment, carrier, tracking, delivery and exception controls remain available on mobile." />
-    {message && <Notice>{message}</Notice>}
+    {notice && <Notice tone={notice.tone}>{notice.text}</Notice>}
     <div className="shipment-admin-grid">
       {state.shipments.map((shipment) => {
         const next = nextStatus[shipment.status]
@@ -574,16 +610,16 @@ export function AdminFulfilmentPage() {
           <div className="panel-heading"><div><span>{shipment.kind} / {shipment.id}</span><h2>{shipment.trackingNumber}</h2></div><StatusBadge value={shipment.status} /></div>
           <dl className="detail-list compact"><div><dt>Carrier</dt><dd>{shipment.carrier}</dd></div><div><dt>Boxes</dt><dd>{shipment.boxIds.join(', ')}</dd></div><div><dt>Controls</dt><dd>{shipment.insured ? 'Insured' : 'Standard'}{shipment.signatureRequired ? ' · signature required' : ''}</dd></div></dl>
           <div className="record-actions">
-            {next && canMoveTo(next) && <button className="button" type="button" onClick={() => setPending({ kind: 'status', id: shipment.id, status: next })}>Mark {titleCase(next)}</button>}
+            {next && canMoveTo(next) && <button className="button" type="button" onClick={() => openAction({ kind: 'status', id: shipment.id, status: next })}>Mark {titleCase(next)}</button>}
             {canEditTracking && (
-              <button className="button button-ghost" type="button" onClick={() => setEditing({ id: shipment.id, carrier: shipment.carrier, trackingNumber: shipment.trackingNumber })}>
+              <button className="button button-ghost" type="button" onClick={() => openTrackingEdit({ id: shipment.id, carrier: shipment.carrier, trackingNumber: shipment.trackingNumber })}>
                 Edit carrier &amp; tracking
               </button>
             )}
-            {shipment.status === 'shipped' && canMoveTo('failed_delivery') && <button className="button button-danger" type="button" onClick={() => setPending({ kind: 'status', id: shipment.id, status: 'failed_delivery' })}>Delivery exception</button>}
-            {shipment.status === 'shipped' && canMoveTo('lost') && <button className="button button-danger" type="button" onClick={() => setPending({ kind: 'status', id: shipment.id, status: 'lost' })}>Mark lost</button>}
-            {shipment.status === 'shipped' && canMoveTo('returned') && <button className="button button-ghost" type="button" onClick={() => setPending({ kind: 'status', id: shipment.id, status: 'returned' })}>Mark returned</button>}
-            {shipment.status === 'delivered' && canMoveTo('returned') && <button className="button button-ghost" type="button" onClick={() => setPending({ kind: 'status', id: shipment.id, status: 'returned' })}>Record post-delivery return</button>}
+            {shipment.status === 'shipped' && canMoveTo('failed_delivery') && <button className="button button-danger" type="button" onClick={() => openAction({ kind: 'status', id: shipment.id, status: 'failed_delivery' })}>Delivery exception</button>}
+            {shipment.status === 'shipped' && canMoveTo('lost') && <button className="button button-danger" type="button" onClick={() => openAction({ kind: 'status', id: shipment.id, status: 'lost' })}>Mark lost</button>}
+            {shipment.status === 'shipped' && canMoveTo('returned') && <button className="button button-ghost" type="button" onClick={() => openAction({ kind: 'status', id: shipment.id, status: 'returned' })}>Mark returned</button>}
+            {shipment.status === 'delivered' && canMoveTo('returned') && <button className="button button-ghost" type="button" onClick={() => openAction({ kind: 'status', id: shipment.id, status: 'returned' })}>Record post-delivery return</button>}
           </div>
           {editing?.id === shipment.id && (
             <div className="tracking-entry-form">
@@ -591,7 +627,7 @@ export function AdminFulfilmentPage() {
               <label>Fictional tracking code<input value={editing.trackingNumber} onChange={(event) => setEditing({ ...editing, trackingNumber: event.target.value })} /></label>
               <div className="record-actions">
                 <button className="button button-ghost" type="button" onClick={() => setEditing(null)}>Cancel edit</button>
-                <button className="button" type="button" onClick={() => setPending({ kind: 'tracking', ...editing })}>Review tracking change</button>
+                <button className="button" type="button" onClick={() => openAction({ kind: 'tracking', ...editing })}>Review tracking change</button>
               </div>
               <small>Safety rule: the carrier must be visibly fictional and the code must start with DEMO-.</small>
             </div>
@@ -638,8 +674,9 @@ function AdminClaimsContent() {
   const [note, setNote] = useState('Confirmed fictional claim review with no automatic refund.')
   const [resolutionOutcome, setResolutionOutcome] = useState<ClaimResolutionOutcome>('replacement_authorized')
   const [resolutionReference, setResolutionReference] = useState('DEMO-REPLACEMENT-001')
-  const [message, setMessage] = useState('')
+  const [notice, setNotice] = useState<ActionNotice>(null)
   const openReview = (id: string, action: ClaimReviewAction) => {
+    setNotice(null)
     setPending({ id, action })
     if (action === 'resolve') {
       setResolutionOutcome('replacement_authorized')
@@ -649,6 +686,7 @@ function AdminClaimsContent() {
   }
   const perform = () => {
     if (!pending) return
+    setNotice(null)
     try {
       const result = services.claims.review(
         pending.id,
@@ -658,15 +696,15 @@ function AdminClaimsContent() {
           ? { outcome: resolutionOutcome, reference: resolutionReference }
           : undefined,
       )
-      setMessage(result.message)
+      setNotice({ text: result.message, tone: 'success' })
     } catch (caught) {
-      setMessage(caught instanceof Error ? caught.message : 'Claim action was blocked.')
+      setNotice({ text: caught instanceof Error ? caught.message : 'Claim action was blocked.', tone: 'danger' })
     }
     setPending(null)
   }
   return <>
     <AdminHeading code="A06" title="Claims queue" description="Eligibility-linked customer claims with guarded review notes. Refunds stay separate in Payments." />
-    {message && <Notice>{message}</Notice>}
+    {notice && <Notice tone={notice.tone}>{notice.text}</Notice>}
     <div className="admin-record-list claims-queue">
       {claims.map((claim) => (
         <details className="admin-record claim-record" open key={claim.id}>

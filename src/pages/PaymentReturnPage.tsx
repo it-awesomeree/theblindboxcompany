@@ -5,10 +5,12 @@ import { Notice } from '../components/Notice'
 import { StatusBadge } from '../components/StatusBadge'
 import { useAppState } from '../state/AppStateContext'
 
+type ActionNotice = { text: string; tone: 'info' | 'success' | 'danger' } | null
+
 export function PaymentReturnPage() {
   const { state, services } = useAppState()
   const { paymentId = '' } = useParams()
-  const [message, setMessage] = useState('')
+  const [notice, setNotice] = useState<ActionNotice>(null)
   const payment = state.payments.find((entry) => entry.id === paymentId)
   const order = state.orders.find((entry) => entry.id === payment?.orderId)
   const user = state.users.find((entry) => entry.id === state.sessionUserId)
@@ -16,11 +18,12 @@ export function PaymentReturnPage() {
   if (!payment || !order || order.userId !== user.id) return <Navigate to="/not-found" replace />
 
   const confirmDelayed = () => {
+    setNotice(null)
     try {
       const result = services.payments.act(payment.id, 'approve')
-      setMessage(result.message)
+      setNotice({ text: result.message, tone: result.changed ? 'success' : 'info' })
     } catch (caught) {
-      setMessage(caught instanceof Error ? caught.message : 'Confirmation was blocked.')
+      setNotice({ text: caught instanceof Error ? caught.message : 'Confirmation was blocked.', tone: 'danger' })
     }
   }
 
@@ -56,7 +59,7 @@ export function PaymentReturnPage() {
           <p>A browser redirect is never proof of payment. This screen trusts only the idempotent mock webhook/event record.</p>
           <StatusBadge value={payment.status} />
         </div>
-        {message && <Notice>{message}</Notice>}
+        {notice && <Notice tone={notice.tone}>{notice.text}</Notice>}
         {!captured && ['pending', 'processing'].includes(payment.status) && (
           <button className="button button-full" type="button" onClick={confirmDelayed}>Simulate delayed valid webhook arriving</button>
         )}

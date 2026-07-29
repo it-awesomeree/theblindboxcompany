@@ -37,6 +37,10 @@ import {
 } from '../src/domain/claimEligibility'
 import { sealedCustomerTimeline } from '../src/domain/orderTimeline'
 import { resolveOrderFulfillment } from '../src/domain/orderFulfillment'
+import {
+  orderBoxSettlementAllocations,
+  requiredSettlementForBoxScope,
+} from '../src/domain/remedyPolicy'
 
 describe('Series 001 and domain guards', () => {
   it('has exactly 10,000 fixed allocations and every value clears RM100', () => {
@@ -215,9 +219,40 @@ describe('Series 001 and domain guards', () => {
     expect(canTransitionShipment('packed', 'label_created')).toBe(true)
     expect(canTransitionShipment('delivered', 'picking')).toBe(false)
     expect(canTransitionShipmentForKind('DIGITAL', 'unfulfilled', 'issued')).toBe(true)
+    expect(canTransitionShipmentForKind('DIGITAL', 'unfulfilled', 'cancelled')).toBe(true)
+    expect(canTransitionShipmentForKind('DIGITAL', 'issued', 'cancelled')).toBe(true)
+    expect(canTransitionShipmentForKind('DIGITAL', 'cancelled', 'unfulfilled')).toBe(true)
     expect(canTransitionShipmentForKind('DIGITAL', 'unfulfilled', 'picking')).toBe(false)
     expect(canTransitionShipmentForKind('PARCEL', 'unfulfilled', 'issued')).toBe(false)
     expect(canTransitionShipmentForKind('PARCEL', 'failed_delivery', 'shipped')).toBe(false)
+  })
+
+  it('allocates integer-sen shipping remainder by immutable box order and exactly covers the total', () => {
+    const order = structuredClone(createDemoState().orders[0])
+    order.boxIds = Array.from({ length: 7 }, (_, index) => `box-${index + 1}`)
+    order.snapshot.quantity = 7
+    order.snapshot.unitPriceSen = 10_000
+    order.snapshot.totals = {
+      itemSubtotalSen: 70_000,
+      shippingSen: 1200,
+      totalSen: 71_200,
+    }
+
+    const allocations = orderBoxSettlementAllocations(order)
+
+    expect(allocations.map((entry) => entry.amountSen)).toEqual([
+      10_172,
+      10_172,
+      10_172,
+      10_171,
+      10_171,
+      10_171,
+      10_171,
+    ])
+    expect(allocations.reduce((sum, entry) => sum + entry.amountSen, 0))
+      .toBe(order.snapshot.totals.totalSen)
+    expect(requiredSettlementForBoxScope(order, ['box-7', 'box-1']))
+      .toBe(20_343)
   })
 
   it('guards box transitions while keeping reveal and shipment independent', () => {

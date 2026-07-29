@@ -19,6 +19,7 @@ import {
   CountingStorage,
   FIXED_NOW,
   MemoryStorage,
+  makeProcessingOrderSingleGroupedPhysicalShipment,
   makeProcessingOrderTwoPhysicalShipments,
 } from './helpers'
 
@@ -170,6 +171,13 @@ function toVersion5(state: DemoState = createDemoState()) {
         : `legacy odds ${prize.allocation}`
     }
   }
+  for (const claim of businessState.claims ?? []) {
+    delete (claim as Partial<typeof claim>).remedyBoxIds
+    delete (claim as Partial<typeof claim>).requiredSettlementSen
+    delete (claim as Partial<typeof claim>).acceptedSettlementSen
+    delete (claim as Partial<typeof claim>).settlementPolicy
+    delete (claim as Partial<typeof claim>).legacyUnderSettledRefund
+  }
   delete businessState.auditCount
   delete businessState.auditHeadId
   delete businessState.audits
@@ -201,6 +209,30 @@ function toVersion6(state: DemoState = createDemoState()) {
     delete claim.replacementShipmentId
     delete claim.replacementAuthorization
     delete claim.legacyTypedResolution
+    delete claim.remedyBoxIds
+    delete claim.requiredSettlementSen
+    delete claim.acceptedSettlementSen
+    delete claim.settlementPolicy
+    delete claim.legacyUnderSettledRefund
+  }
+  return legacy
+}
+
+function toVersion7(state: DemoState = createDemoState()) {
+  const legacy = structuredClone(state) as unknown as Omit<
+    DemoState,
+    'schemaVersion' | 'claims'
+  > & {
+    schemaVersion: number
+    claims: Array<Partial<DemoState['claims'][number]>>
+  }
+  legacy.schemaVersion = 7
+  for (const claim of legacy.claims) {
+    delete claim.remedyBoxIds
+    delete claim.requiredSettlementSen
+    delete claim.acceptedSettlementSen
+    delete claim.settlementPolicy
+    delete claim.legacyUnderSettledRefund
   }
   return legacy
 }
@@ -225,6 +257,17 @@ function seriesWithoutOdds(series: DemoState['series']) {
   return copy
 }
 
+function claimsWithoutV8Snapshot(claims: DemoState['claims']) {
+  return structuredClone(claims).map((claim) => {
+    delete (claim as Partial<typeof claim>).remedyBoxIds
+    delete (claim as Partial<typeof claim>).requiredSettlementSen
+    delete (claim as Partial<typeof claim>).acceptedSettlementSen
+    delete (claim as Partial<typeof claim>).settlementPolicy
+    delete (claim as Partial<typeof claim>).legacyUnderSettledRefund
+    return claim
+  })
+}
+
 function stateWithTwoAudits() {
   const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
   services.auth.oneClick('customer')
@@ -240,7 +283,7 @@ function stateWithLinkedRefundClaim(resolved = false) {
   services.claims.review(claim.id, 'approve', 'Approved linked validator evidence')
   services.payments.refund(
     'pay-delivered',
-    1000,
+    claim.requiredSettlementSen,
     'Confirmed linked validator refund',
     'req-linked-validator-refund',
     claim.id,
@@ -303,6 +346,113 @@ function stateWithInspectedRma() {
   return services.repository.exportForTest()
 }
 
+function legacyUnderSettledVersion7State() {
+  const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+  makeProcessingOrderSingleGroupedPhysicalShipment(services)
+  services.auth.oneClick('customer')
+  services.openBox('box-processing-02')
+  const claim = services.claims.submit({
+    orderId: 'ord-processing',
+    kind: 'value_floor',
+    boxId: 'box-processing-01',
+    note: 'DEMO legacy under-settled value-floor evidence',
+  }).data
+  services.auth.oneClick('admin')
+  services.claims.review(
+    claim.id,
+    'acknowledge',
+    'Confirmed legacy under-settled acknowledgement',
+  )
+  services.claims.review(
+    claim.id,
+    'approve',
+    'Confirmed legacy under-settled approval',
+  )
+  services.payments.refund(
+    'pay-processing',
+    claim.requiredSettlementSen,
+    'Confirmed legacy refund evidence before downgrade',
+    'req-legacy-under-settled',
+    claim.id,
+  )
+  const linked = services.repository.getSnapshot().claims
+    .find((entry) => entry.id === claim.id)!.linkedRefundEventId!
+  services.claims.review(
+    claim.id,
+    'resolve',
+    'Confirmed legacy refund resolution evidence',
+    { outcome: 'refund_recorded', reference: linked },
+  )
+
+  const legacy = toVersion7(services.repository.exportForTest())
+  const payment = legacy.payments.find((entry) => entry.id === 'pay-processing')!
+  const event = payment.events.find((entry) => entry.id === linked)!
+  event.refundIntent!.amountSen = 1000
+  payment.refundedSen = 1000
+  const paymentAudit = legacy.audits.find((audit) =>
+    audit.eventId === linked && audit.targetType === 'payment')!
+  ;(paymentAudit.after as Record<string, unknown>).refundedSen = 1000
+  return legacy
+}
+
+function stateWithDeliveredDigitalReissue() {
+  let now = FIXED_NOW
+  const services = new AppServices(new MemoryStorage(), () => now)
+  services.auth.oneClick('customer')
+  services.openBox('box-processing-02')
+  services.auth.oneClick('admin')
+  services.fulfilment.advance(
+    'shp-digital',
+    'issued',
+    'Confirmed validator digital original issued',
+  )
+  services.fulfilment.advance(
+    'shp-digital',
+    'sent',
+    'Confirmed validator digital original sent',
+  )
+  now = '2026-08-01T04:00:00.000Z'
+  services.auth.oneClick('customer')
+  const claim = services.claims.submit({
+    orderId: 'ord-processing',
+    kind: 'non_delivery',
+    shipmentId: 'shp-digital',
+    note: 'DEMO validator digital reissue entitlement evidence',
+  }).data
+  services.auth.oneClick('admin')
+  services.claims.review(
+    claim.id,
+    'acknowledge',
+    'Confirmed validator digital reissue acknowledgement',
+  )
+  services.claims.review(
+    claim.id,
+    'approve',
+    'Confirmed validator digital reissue approval',
+  )
+  const replacement = services.claims.authorizeReplacement(
+    claim.id,
+    'Confirmed validator digital reissue authorization',
+  ).data
+  services.fulfilment.advance(
+    replacement.id,
+    'issued',
+    'Confirmed validator digital replacement issued',
+  )
+  services.fulfilment.advance(
+    replacement.id,
+    'sent',
+    'Confirmed validator digital replacement sent',
+  )
+  now = '2026-08-01T05:00:00.000Z'
+  services.fulfilment.advance(
+    replacement.id,
+    'delivered',
+    'Confirmed validator digital replacement delivered',
+  )
+  return services.repository.exportForTest()
+}
+
 function removeAudit(
   state: DemoState,
   predicate: (audit: DemoState['audits'][number]) => boolean,
@@ -343,7 +493,7 @@ describe('MockRepository recovery and persistence', () => {
     }],
     ['missing matching payment refund audit', (state: DemoState) => {
       const audit = state.audits.find((entry) =>
-        entry.action === 'payment.partially_refunded' &&
+        entry.action === 'payment.refunded' &&
         entry.requestId === 'req-linked-validator-refund')!
       audit.eventId = 'evt-missing-payment-refund-audit'
     }],
@@ -381,6 +531,99 @@ describe('MockRepository recovery and persistence', () => {
       const state = stateWithLinkedRefundClaim()
       mutate(state)
       expect(() => validateDemoState(state)).toThrow()
+    },
+  )
+
+  it.each([
+    ['authorization actorId', (claim: DemoState['claims'][number]) => {
+      const history = claim.history.find((entry) =>
+        entry.note === claim.replacementAuthorization!.reason)!
+      history.actorId = 'usr-fulfilment'
+    }],
+    ['authorization actorRole', (claim: DemoState['claims'][number]) => {
+      const history = claim.history.find((entry) =>
+        entry.note === claim.replacementAuthorization!.reason)!
+      history.actorRole = 'admin'
+    }],
+    ['delivery actorId', (claim: DemoState['claims'][number]) => {
+      claim.history.at(-1)!.actorId = 'usr-fulfilment'
+    }],
+    ['delivery actorRole', (claim: DemoState['claims'][number]) => {
+      claim.history.at(-1)!.actorRole = 'admin'
+    }],
+  ] as Array<[string, (claim: DemoState['claims'][number]) => void]>)(
+    'rejects replacement history %s tampering even when the role remains otherwise allowed',
+    (_label, mutate) => {
+      const state = stateWithReplacement(true)
+      mutate(state.claims[0])
+      expect(() => validateDemoState(state)).toThrow(
+        /matching immutable claim history|exact resolved claim history/i,
+      )
+    },
+  )
+
+  it.each([
+    ['remedy box scope', (claim: DemoState['claims'][number]) => {
+      claim.remedyBoxIds = ['box-unopened-01']
+    }],
+    ['required settlement', (claim: DemoState['claims'][number]) => {
+      claim.requiredSettlementSen -= 1
+    }],
+    ['accepted settlement', (claim: DemoState['claims'][number]) => {
+      claim.acceptedSettlementSen! -= 1
+    }],
+    ['settlement policy', (claim: DemoState['claims'][number]) => {
+      claim.settlementPolicy = 'terminal_replacement_fallback'
+    }],
+    ['legacy marker on exact current evidence', (claim: DemoState['claims'][number]) => {
+      claim.legacyUnderSettledRefund = true
+      delete claim.settlementPolicy
+    }],
+  ] as Array<[string, (claim: DemoState['claims'][number]) => void]>)(
+    'rejects exact claim snapshot corruption: %s',
+    (_label, mutate) => {
+      const state = stateWithLinkedRefundClaim()
+      mutate(state.claims[0])
+      expect(() => validateDemoState(state)).toThrow()
+    },
+  )
+
+  it('rejects two currently delivered digital rows for one immutable box entitlement', () => {
+    const state = stateWithDeliveredDigitalReissue()
+    const original = state.shipments.find((entry) => entry.id === 'shp-digital')!
+    original.status = 'delivered'
+    original.timeline.push({
+      id: 'shp-digital-tampered-second-delivery',
+      status: 'delivered',
+      label: 'Tampered duplicate digital delivery',
+      at: '2026-08-01T06:00:00.000Z',
+    })
+
+    expect(() => validateDemoState(state)).toThrow(
+      /effective delivered shipment box/i,
+    )
+  })
+
+  it.each(['unfulfilled', 'issued'] as const)(
+    'rejects financially refunded digital work corrupted back to %s',
+    (status) => {
+      const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+      services.auth.oneClick('admin')
+      services.payments.refund(
+        'pay-processing',
+        21_200,
+        'Confirmed digital stop validator fixture',
+        `req-digital-stop-validator-${status}`,
+      )
+      const state = services.repository.exportForTest()
+      const digital = state.shipments.find((entry) => entry.id === 'shp-digital')!
+      digital.status = status
+      digital.timeline.at(-1)!.status = status
+      delete digital.timeline.at(-1)!.financialHold
+
+      expect(() => validateDemoState(state)).toThrow(
+        /financially stopped order cannot retain eligible unshipped fulfilment/i,
+      )
     },
   )
 
@@ -590,9 +833,9 @@ describe('MockRepository recovery and persistence', () => {
   it('recovers missing data with current schema fixtures', () => {
     const storage = new MemoryStorage()
     const repository = new MockRepository(storage)
-    expect(repository.getSnapshot().schemaVersion).toBe(7)
+    expect(repository.getSnapshot().schemaVersion).toBe(8)
     expect(repository.recoveryNotice).toMatch(/missing/i)
-    expect(JSON.parse(storage.getItem(STORAGE_KEY)!).schemaVersion).toBe(7)
+    expect(JSON.parse(storage.getItem(STORAGE_KEY)!).schemaVersion).toBe(8)
   })
 
   it('keeps corrupt bytes untouched and requires an explicit confirmed reset', () => {
@@ -613,7 +856,7 @@ describe('MockRepository recovery and persistence', () => {
     const raw = '{ "schemaVersion": 2, "revision": 14, "users": [] }'
     storage.seed(STORAGE_KEY, raw)
     const repository = new MockRepository(storage)
-    expect(repository.getSnapshot().schemaVersion).toBe(7)
+    expect(repository.getSnapshot().schemaVersion).toBe(8)
     expect(repository.recoveryNotice).toMatch(/unsupported old version 2.+left unchanged.+explicit confirmed reset/i)
     expect(storage.getItem(STORAGE_KEY)).toBe(raw)
   })
@@ -640,7 +883,7 @@ describe('MockRepository recovery and persistence', () => {
         return JSON.stringify(invalid)
       })(),
       expectedRevision: 42,
-      notice: /version 7.+failed the safety checks.+exact original browser bytes.+explicit confirmed reset/i,
+      notice: /version 8.+failed the safety checks.+exact original browser bytes.+explicit confirmed reset/i,
     },
     {
       label: 'future schema',
@@ -676,7 +919,7 @@ describe('MockRepository recovery and persistence', () => {
       repository.reset()
 
       expect(repository.getSnapshot()).toMatchObject({
-        schemaVersion: 7,
+        schemaVersion: 8,
         revision: expectedRevision,
         sessionUserId: null,
         cart: [{ quantity: 1 }],
@@ -771,7 +1014,7 @@ describe('MockRepository recovery and persistence', () => {
 
     const repository = new MockRepository(storage, { writeAuthority: false })
 
-    expect(repository.getSnapshot()).toMatchObject({ schemaVersion: 7, revision: 19 })
+    expect(repository.getSnapshot()).toMatchObject({ schemaVersion: 8, revision: 19 })
     expect(storage.getItem(STORAGE_KEY)).toBe(raw)
     expect(storage.writes).toBe(0)
 
@@ -800,7 +1043,175 @@ describe('MockRepository recovery and persistence', () => {
     expect(repository.recoveryNotice).toMatch(/original version 5 bytes were restored exactly/i)
   })
 
-  it('migrates valid custom version 5 business data through version 6 once and then loads version 7 without writes', () => {
+  it('migrates version 7 claim snapshots directly to version 8 with the same storage key', () => {
+    const services = servicesWithClaim('damage')
+    const legacy = toVersion7(services.repository.exportForTest())
+    const raw = JSON.stringify(legacy)
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, raw)
+
+    const repository = new MockRepository(storage)
+    const snapshot = repository.getSnapshot()
+
+    expect(STORAGE_KEY).toBe('tbbc:demo:repository:v5')
+    expect(snapshot.schemaVersion).toBe(8)
+    expect(snapshot.claims[0]).toMatchObject({
+      remedyBoxIds: ['box-delivered-01'],
+      requiredSettlementSen: 11_200,
+    })
+    expect(snapshot.claims[0]).not.toHaveProperty('acceptedSettlementSen')
+    expect(storage.writes).toBe(1)
+    expect(repository.recoveryNotice).toMatch(/version 7 to version 8/i)
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+  })
+
+  it('preserves a valid version 7 grouped replacement scope as history while activating only its exact claim scope', () => {
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    makeProcessingOrderSingleGroupedPhysicalShipment(services)
+    services.auth.oneClick('customer')
+    services.openBox('box-processing-02')
+    const claim = services.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'value_floor',
+      boxId: 'box-processing-01',
+      note: 'DEMO legacy grouped replacement scope evidence',
+    }).data
+    services.auth.oneClick('admin')
+    services.claims.review(
+      claim.id,
+      'acknowledge',
+      'Confirmed legacy grouped replacement acknowledgement',
+    )
+    services.claims.review(
+      claim.id,
+      'approve',
+      'Confirmed legacy grouped replacement approval',
+    )
+    const replacement = services.claims.authorizeReplacement(
+      claim.id,
+      'Confirmed legacy grouped replacement authorization',
+    ).data
+    const current = services.repository.exportForTest()
+    const original = current.shipments.find((entry) => entry.id === 'shp-processing')!
+    const legacyReplacement = current.shipments.find((entry) =>
+      entry.id === replacement.id)!
+    legacyReplacement.boxIds = [...original.boxIds]
+    const legacy = toVersion7(current)
+    const legacyTimeline = structuredClone(legacyReplacement.timeline)
+    const legacyAudits = structuredClone(legacy.audits)
+    const storage = new MemoryStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(legacy))
+
+    const snapshot = new MockRepository(storage).getSnapshot()
+    const migratedOriginal = snapshot.shipments.find((entry) =>
+      entry.id === original.id)!
+    const migratedReplacement = snapshot.shipments.find((entry) =>
+      entry.id === replacement.id)!
+
+    expect(migratedOriginal.boxIds).toEqual([
+      'box-processing-01',
+      'box-processing-02',
+    ])
+    expect(migratedReplacement).toMatchObject({
+      boxIds: ['box-processing-01'],
+      legacyRecordedBoxIds: ['box-processing-01', 'box-processing-02'],
+      sourceClaimId: claim.id,
+      replacementForShipmentId: original.id,
+    })
+    expect(migratedReplacement.timeline).toEqual(legacyTimeline)
+    expect(snapshot.audits).toEqual(legacyAudits)
+    expect(snapshot.claims.find((entry) => entry.id === claim.id)).toMatchObject({
+      remedyBoxIds: ['box-processing-01'],
+      requiredSettlementSen: 10_600,
+      replacementShipmentId: replacement.id,
+    })
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+
+    const tamperedLegacyScope = structuredClone(snapshot)
+    tamperedLegacyScope.shipments.find((entry) => entry.id === replacement.id)!
+      .legacyRecordedBoxIds = ['box-processing-01']
+    expect(() => validateDemoState(tamperedLegacyScope)).toThrow(
+      /broader legacy original scope/i,
+    )
+
+    const tamperedOriginal = structuredClone(snapshot)
+    tamperedOriginal.shipments.find((entry) => entry.id === original.id)!
+      .legacyRecordedBoxIds = [...original.boxIds]
+    expect(() => validateDemoState(tamperedOriginal)).toThrow(
+      /original shipments cannot carry replacement provenance/i,
+    )
+  })
+
+  it('keeps original version 7 bytes exactly when migration persistence fails', () => {
+    const raw = JSON.stringify(toVersion7(servicesWithClaim('damage').repository.exportForTest()))
+    const storage = new FaultStorage()
+    storage.seed(STORAGE_KEY, raw)
+    storage.failNextWrites = 1
+
+    const repository = new MockRepository(storage)
+
+    expect(repository.getSnapshot().schemaVersion).toBe(8)
+    expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+    expect(storage.successfulWrites).toBe(0)
+    expect(repository.recoveryNotice).toMatch(
+      /could not save the upgrade.+original version 7 data was left unchanged.+memory only/i,
+    )
+  })
+
+  it('marks an under-settled version 7 refund as immutable legacy evidence that cannot complete its remedy box', () => {
+    const storage = new MemoryStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(legacyUnderSettledVersion7State()))
+
+    const snapshot = new MockRepository(storage).getSnapshot()
+    const claim = snapshot.claims[0]
+
+    expect(claim).toMatchObject({
+      status: 'resolved',
+      remedyState: 'refund_completed',
+      remedyBoxIds: ['box-processing-01'],
+      requiredSettlementSen: 10_600,
+      acceptedSettlementSen: 1000,
+      legacyUnderSettledRefund: true,
+    })
+    expect(claim.settlementPolicy).toBeUndefined()
+    expect(snapshot.orders.find((entry) => entry.id === 'ord-processing')?.status)
+      .toBe('processing')
+    expect(snapshot.boxes.find((entry) => entry.id === 'box-processing-01')?.status)
+      .toBe('opened')
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+  })
+
+  it('maps a financially cancelled version 6 digital shipment to canonical digital cancelled without fabricating delivery', () => {
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    services.auth.oneClick('admin')
+    services.payments.refund(
+      'pay-processing',
+      21_200,
+      'Confirmed legacy digital financial stop fixture',
+      'req-legacy-digital-stop',
+    )
+    const legacy = toVersion6(services.repository.exportForTest())
+    const storage = new MemoryStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(legacy))
+
+    const snapshot = new MockRepository(storage).getSnapshot()
+    const digital = snapshot.shipments.find((entry) => entry.id === 'shp-digital')!
+
+    expect(digital.status).toBe('cancelled')
+    expect(digital.timeline.at(-1)).toMatchObject({
+      status: 'cancelled',
+      financialHold: 'refunded',
+    })
+    expect(digital.timeline.some((entry) => entry.status === 'failed')).toBe(false)
+    expect(digital.timeline.some((entry) => entry.status === 'delivered')).toBe(false)
+    expect(digital).toMatchObject({
+      carrier: 'Digital Vault',
+      trackingNumber: 'DEMO-DIGITAL',
+    })
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+  })
+
+  it('migrates valid custom version 5 business data through versions 6 and 7 once and then loads version 8 without writes', () => {
     const customServices = servicesWithClaim('damage')
     customServices.auth.oneClick('admin')
     customServices.admin.copyPublishedToDraft()
@@ -817,7 +1228,7 @@ describe('MockRepository recovery and persistence', () => {
     const migrated = new MockRepository(storage)
     const snapshot = migrated.getSnapshot()
 
-    expect(snapshot.schemaVersion).toBe(7)
+    expect(snapshot.schemaVersion).toBe(8)
     expect(snapshot.revision).toBe(legacy.revision)
     expect(snapshot.users).toEqual(legacy.users)
     expect(ordersWithoutValueFloor(snapshot.orders)).toEqual(legacy.orders)
@@ -841,10 +1252,14 @@ describe('MockRepository recovery and persistence', () => {
     expect(snapshot.payments).toEqual(legacy.payments)
     expect(snapshot.boxes).toEqual(legacy.boxes)
     expect(snapshot.shipments).toEqual(legacy.shipments)
-    expect(snapshot.claims).toEqual(legacy.claims)
+    expect(claimsWithoutV8Snapshot(snapshot.claims)).toEqual(legacy.claims)
     expect(snapshot.cart).toEqual(legacy.cart)
     expect(snapshot.audits.map(auditBusinessFields)).toEqual(legacy.audits)
     expect(snapshot.claims).toHaveLength(1)
+    expect(snapshot.claims[0]).toMatchObject({
+      remedyBoxIds: ['box-delivered-01'],
+      requiredSettlementSen: 11_200,
+    })
     expect(snapshot.audits.map((audit) => audit.sequence)).toEqual(
       snapshot.audits.map((_, index) => index + 1),
     )
@@ -854,7 +1269,7 @@ describe('MockRepository recovery and persistence', () => {
     expect(snapshot.auditCount).toBe(snapshot.audits.length)
     expect(snapshot.auditHeadId).toBe(snapshot.audits.at(-1)?.id)
     expect(storage.writes).toBe(1)
-    expect(migrated.recoveryNotice).toMatch(/version 5 through version 6 to version 7/i)
+    expect(migrated.recoveryNotice).toMatch(/version 5 through version 6 and version 7 to version 8/i)
 
     const persistedAfterMigration = storage.getItem(STORAGE_KEY)
     const loadedAgain = new MockRepository(storage)
@@ -878,7 +1293,7 @@ describe('MockRepository recovery and persistence', () => {
     const snapshot = repository.getSnapshot()
 
     expect(snapshot).toMatchObject({
-      schemaVersion: 7,
+      schemaVersion: 8,
       revision: 73,
       sessionUserId: 'usr-demo-customer',
       cart: [{ quantity: 4 }],
@@ -893,7 +1308,7 @@ describe('MockRepository recovery and persistence', () => {
     expect(snapshot.payments).toEqual(legacy.payments)
     expect(snapshot.boxes).toEqual(legacy.boxes)
     expect(snapshot.shipments).toEqual(legacy.shipments)
-    expect(snapshot.claims).toEqual(legacy.claims)
+    expect(claimsWithoutV8Snapshot(snapshot.claims)).toEqual(legacy.claims)
     expect(snapshot.audits).toEqual([{
       id: 'audit-migration-v5-empty-anchor',
       sequence: 1,
@@ -919,7 +1334,7 @@ describe('MockRepository recovery and persistence', () => {
     expect(loadedAgain.getSnapshot()).toEqual(snapshot)
   })
 
-  it('migrates valid version 6 linked-refund business data to version 7 without editing audit history', () => {
+  it('migrates valid version 6 linked-refund business data through version 7 to version 8 without editing audit history', () => {
     const current = stateWithLinkedRefundClaim(true)
     current.revision = 87
     current.cart[0].quantity = 2
@@ -931,7 +1346,7 @@ describe('MockRepository recovery and persistence', () => {
     const repository = new MockRepository(storage)
     const snapshot = repository.getSnapshot()
 
-    expect(snapshot.schemaVersion).toBe(7)
+    expect(snapshot.schemaVersion).toBe(8)
     expect(snapshot.revision).toBe(87)
     expect(snapshot.cart[0].quantity).toBe(2)
     expect(snapshot.shipments.every((shipment) => shipment.purpose === 'original')).toBe(true)
@@ -940,12 +1355,16 @@ describe('MockRepository recovery and persistence', () => {
       remedyState: 'refund_completed',
       linkedRefundEventId: current.claims[0].linkedRefundEventId,
       resolutionReference: current.claims[0].resolutionReference,
+      remedyBoxIds: ['box-delivered-01'],
+      requiredSettlementSen: 11_200,
+      acceptedSettlementSen: 11_200,
+      settlementPolicy: 'exact_scope',
     })
     expect(snapshot.audits).toEqual(legacyAudits)
     expect(snapshot.auditCount).toBe(current.auditCount)
     expect(snapshot.auditHeadId).toBe(current.auditHeadId)
     expect(storage.writes).toBe(1)
-    expect(repository.recoveryNotice).toMatch(/version 6 to version 7/i)
+    expect(repository.recoveryNotice).toMatch(/version 6 through version 7 to version 8/i)
     expect(() => validateDemoState(snapshot)).not.toThrow()
 
     const persisted = storage.getItem(STORAGE_KEY)
@@ -1091,7 +1510,7 @@ describe('MockRepository recovery and persistence', () => {
 
     const repository = new MockRepository(storage)
 
-    expect(repository.getSnapshot().schemaVersion).toBe(7)
+    expect(repository.getSnapshot().schemaVersion).toBe(8)
     expect(storage.getItem(STORAGE_KEY)).toBe(raw)
     expect(storage.successfulWrites).toBe(0)
     expect(repository.recoveryNotice).toMatch(
@@ -1099,7 +1518,7 @@ describe('MockRepository recovery and persistence', () => {
     )
   })
 
-  it('keeps original version 5 bytes when migration persistence fails and continues with frozen version 7 memory', () => {
+  it('keeps original version 5 bytes when migration persistence fails and continues with frozen version 8 memory', () => {
     const custom = createDemoState()
     custom.revision = 17
     custom.cart[0].quantity = 2
@@ -1111,7 +1530,7 @@ describe('MockRepository recovery and persistence', () => {
     const repository = new MockRepository(storage)
 
     expect(repository.getSnapshot()).toMatchObject({
-      schemaVersion: 7,
+      schemaVersion: 8,
       revision: 17,
       cart: [{ quantity: 2 }],
     })
@@ -2049,6 +2468,8 @@ describe('MockRepository recovery and persistence', () => {
       shipmentId: 'shp-delivered',
       status: 'submitted',
       remedyState: 'none',
+      remedyBoxIds: ['box-delivered-01'],
+      requiredSettlementSen: 11_200,
       createdAt: FIXED_NOW,
       updatedAt: FIXED_NOW,
       history: [{
@@ -2423,6 +2844,8 @@ describe('MockRepository recovery and persistence', () => {
       shipmentId: 'shp-delivered',
       status: 'reviewing',
       remedyState: 'none',
+        remedyBoxIds: ['box-delivered-01'],
+        requiredSettlementSen: 11_200,
         createdAt: '2026-07-28T01:00:00.000Z',
         updatedAt: '2026-07-28T02:00:00.000Z',
         history: [

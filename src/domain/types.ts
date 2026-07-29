@@ -219,6 +219,7 @@ export interface Shipment {
   purpose: ShipmentPurpose
   sourceClaimId?: string
   replacementForShipmentId?: string
+  legacyRecordedBoxIds?: string[]
   status: ShipmentStatus
   carrier: string
   trackingNumber: string
@@ -246,6 +247,9 @@ export type ClaimRemedyState =
   | 'replacement_authorized'
   | 'replacement_delivered'
   | 'no_remedy'
+export type ClaimSettlementPolicy =
+  | 'exact_scope'
+  | 'terminal_replacement_fallback'
 
 export interface ClaimRmaEvidence {
   reference: string
@@ -285,6 +289,10 @@ export interface Claim {
   boxId?: string
   status: ClaimStatus
   remedyState: ClaimRemedyState
+  remedyBoxIds: string[]
+  requiredSettlementSen: number
+  acceptedSettlementSen?: number
+  settlementPolicy?: ClaimSettlementPolicy
   rma?: ClaimRmaEvidence
   replacementShipmentId?: string
   replacementAuthorization?: ReplacementAuthorizationEvidence
@@ -295,6 +303,7 @@ export interface Claim {
   resolutionOutcome?: ClaimResolutionOutcome
   resolutionReference?: string
   linkedRefundEventId?: string
+  legacyUnderSettledRefund?: true
   history: ClaimHistoryEntry[]
 }
 
@@ -317,7 +326,7 @@ export interface AuditEntry {
 }
 
 export interface DemoState {
-  schemaVersion: 7
+  schemaVersion: 8
   revision: number
   nextSequence: number
   auditCount: number

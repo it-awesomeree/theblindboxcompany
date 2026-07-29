@@ -19,6 +19,10 @@ import {
 import { matchingAppliedPaymentRefundAudit } from '../domain/refundLink'
 import { refreshOrderFulfillment } from '../domain/orderFulfillment'
 import {
+  remedyBoxIdsForEvidence,
+  requiredSettlementForBoxScope,
+} from '../domain/remedyPolicy'
+import {
   REPLACEMENT_AUTHORIZED_ACTION,
   RMA_CREATED_ACTION,
   RMA_INSPECTED_ACTION,
@@ -313,6 +317,14 @@ export class ClaimService {
             evidenceAt[shipmentId],
           ]),
         )
+        duplicate.remedyBoxIds = remedyBoxIdsForEvidence(state, order, {
+          kind: duplicate.kind,
+          shipmentCandidateIds: duplicate.shipmentCandidateIds,
+        })
+        duplicate.requiredSettlementSen = requiredSettlementForBoxScope(
+          order,
+          duplicate.remedyBoxIds,
+        )
         duplicate.updatedAt = now
         duplicate.history.push({
           id: `${duplicate.id}-h-${String(duplicate.history.length + 1).padStart(2, '0')}`,
@@ -352,6 +364,12 @@ export class ClaimService {
         shipmentCandidateIds?.join(',') ??
         ''
       const identity = nextClaimIdentity(state, `${order.id}:${input.kind}:${evidenceSeed}`)
+      const remedyBoxIds = remedyBoxIdsForEvidence(state, order, {
+        kind: input.kind,
+        boxId: input.kind === 'value_floor' ? selectedBox!.id : undefined,
+        shipmentId: input.kind === 'value_floor' ? undefined : selectedShipment?.id,
+        shipmentCandidateIds,
+      })
       const claim: Claim = {
         ...identity,
         orderId: order.id,
@@ -366,6 +384,8 @@ export class ClaimService {
         boxId: input.kind === 'value_floor' ? selectedBox!.id : undefined,
         status: 'submitted',
         remedyState: 'none',
+        remedyBoxIds,
+        requiredSettlementSen: requiredSettlementForBoxScope(order, remedyBoxIds),
         createdAt: now,
         updatedAt: now,
         history: [{
@@ -489,6 +509,11 @@ export class ClaimService {
     const reference = sanitizeText(resolution.reference, 100)
     assert(reference.length >= 4, 'Enter the fictional resolution reference.', 'RESOLUTION_REFERENCE_REQUIRED')
     if (resolution.outcome === 'refund_recorded') {
+      assert(
+        claim.legacyUnderSettledRefund !== true,
+        'Legacy under-settled refund evidence cannot complete a current remedy.',
+        'CLAIM_SETTLEMENT_MISMATCH',
+      )
       assert(
         claim.linkedRefundEventId && reference === claim.linkedRefundEventId,
         'Refund resolution must use the exact refund event already linked to this claim.',
@@ -838,11 +863,8 @@ export class ClaimService {
       assert(
         !state.shipments.some((shipment) =>
           shipment.purpose === 'replacement' &&
-          (
-            shipment.sourceClaimId === claim.id ||
-            shipment.replacementForShipmentId === original.id
-          )),
-        'A replacement shipment already uses this claim or original shipment.',
+          shipment.sourceClaimId === claim.id),
+        'A replacement shipment already uses this claim.',
         'REPLACEMENT_REUSED',
       )
       const now = this.now()
@@ -856,7 +878,7 @@ export class ClaimService {
       const replacement: Shipment = {
         id: shipmentId,
         orderId: original.orderId,
-        boxIds: [...original.boxIds],
+        boxIds: [...claim.remedyBoxIds],
         kind: original.kind,
         purpose: 'replacement',
         sourceClaimId: claim.id,

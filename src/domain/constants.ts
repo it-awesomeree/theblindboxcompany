@@ -9,7 +9,7 @@ import type {
 } from './types'
 import { exactOddsLabel } from './odds'
 
-export const SCHEMA_VERSION = 7 as const
+export const SCHEMA_VERSION = 8 as const
 export const SERIES_ID = 'series-001'
 export const BOX_PRICE_SEN = 10_000
 export const VALUE_FLOOR_SEN = 10_000
@@ -118,7 +118,7 @@ export const SHIPMENT_TRANSITIONS: Record<ShipmentStatus, ShipmentStatus[]> = {
   packed: ['label_created', 'cancelled'],
   label_created: ['shipped', 'cancelled'],
   shipped: ['delivered', 'failed_delivery', 'lost', 'returned'],
-  issued: ['sent'],
+  issued: ['sent', 'cancelled'],
   sent: ['delivered', 'failed'],
   delivered: ['returned'],
   failed: [],

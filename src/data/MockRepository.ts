@@ -1,11 +1,15 @@
 import { SCHEMA_VERSION, VALUE_FLOOR_SEN } from '../domain/constants'
 import { canonicalizeAuditEvidence } from '../domain/auditEvidence'
-import { cloneState, DomainError } from '../domain/guards'
+import { assert, cloneState, DomainError } from '../domain/guards'
 import { exactOddsLabel } from '../domain/odds'
 import {
   expectedBoxStatusForScope,
   resolveOrderFulfillment,
 } from '../domain/orderFulfillment'
+import {
+  expectedClaimRemedySnapshot,
+  isTerminalReplacementRefundFallback,
+} from '../domain/remedyPolicy'
 import type { AuditEntry, Claim, DemoState, Shipment } from '../domain/types'
 import { createDemoState } from './fixtures'
 import { isDemoState, validateDemoState } from './StateValidator'
@@ -19,16 +23,35 @@ export interface StorageLike {
   removeItem(key: string): void
 }
 
+type LegacyClaimV7 = Omit<
+  Claim,
+  | 'remedyBoxIds'
+  | 'requiredSettlementSen'
+  | 'acceptedSettlementSen'
+  | 'settlementPolicy'
+  | 'legacyUnderSettledRefund'
+>
+type LegacyDemoStateV7 = Omit<
+  DemoState,
+  'schemaVersion' | 'claims'
+> & {
+  schemaVersion: 7
+  claims: LegacyClaimV7[]
+}
 type LegacyShipmentV6 = Omit<
   Shipment,
   'purpose' | 'sourceClaimId' | 'replacementForShipmentId'
 >
 type LegacyClaimV6 = Omit<
-  Claim,
-  'remedyState' | 'rma' | 'replacementShipmentId' | 'replacementAuthorization' | 'legacyTypedResolution'
+  LegacyClaimV7,
+  | 'remedyState'
+  | 'rma'
+  | 'replacementShipmentId'
+  | 'replacementAuthorization'
+  | 'legacyTypedResolution'
 >
 type LegacyDemoStateV6 = Omit<
-  DemoState,
+  LegacyDemoStateV7,
   'schemaVersion' | 'shipments' | 'claims'
 > & {
   schemaVersion: 6
@@ -49,7 +72,7 @@ interface LoadedState {
   notice: string | null
   needsPersist: boolean
   migratedFromRaw?: string
-  migratedFromVersion?: 5 | 6
+  migratedFromVersion?: 5 | 6 | 7
   protectedRaw?: string
   requiresConfirmedReset?: boolean
   storageWasMissing?: boolean
@@ -178,12 +201,38 @@ function migrateDemoStateV5ToV6(value: unknown): LegacyDemoStateV6 {
 }
 
 function migrateDigitalShipmentV6(shipment: LegacyShipmentV6): Shipment {
-  let terminal: 'delivered' | 'failed' | undefined
+  let terminal: 'delivered' | 'failed' | 'cancelled' | undefined
   const timeline: Shipment['timeline'] = []
-  shipment.timeline.forEach((entry) => {
+  const finalEntry = shipment.timeline.at(-1)
+  const financiallyCancelled =
+    finalEntry?.status === 'cancelled' && Boolean(finalEntry.financialHold)
+
+  const appendMissingDigitalStep = (
+    entry: LegacyShipmentV6['timeline'][number],
+    status: 'issued' | 'sent',
+  ) => {
+    timeline.push({
+      ...entry,
+      id: `${entry.id}-migration-${status}`,
+      status,
+      label: `${entry.label} — migrated digital ${status} evidence`,
+      financialHold: undefined,
+    })
+  }
+
+  shipment.timeline.forEach((entry, index) => {
     let status: Shipment['status']
     if (terminal) {
       status = terminal
+    } else if (financiallyCancelled) {
+      if (index === shipment.timeline.length - 1) {
+        status = 'cancelled'
+        terminal = 'cancelled'
+      } else if (entry.status === 'unfulfilled') {
+        status = 'unfulfilled'
+      } else {
+        status = 'issued'
+      }
     } else if (entry.status === 'unfulfilled') {
       status = 'unfulfilled'
     } else if (['picking', 'packed'].includes(entry.status)) {
@@ -194,30 +243,26 @@ function migrateDigitalShipmentV6(shipment: LegacyShipmentV6): Shipment {
       status = 'delivered'
       terminal = 'delivered'
     } else if (entry.status === 'returned' && shipment.timeline
-      .slice(0, shipment.timeline.indexOf(entry))
+      .slice(0, index)
       .some((prior) => prior.status === 'delivered')) {
       status = 'delivered'
       terminal = 'delivered'
+    } else if (entry.status === 'cancelled') {
+      status = 'cancelled'
+      terminal = 'cancelled'
     } else {
       status = 'failed'
       terminal = 'failed'
     }
-    if (status === 'failed') {
+    if (['sent', 'delivered', 'failed'].includes(status)) {
       if (timeline.at(-1)?.status === 'unfulfilled') {
-        timeline.push({
-          ...entry,
-          id: `${entry.id}-migration-issued`,
-          status: 'issued',
-          label: `${entry.label} — migrated digital issue evidence`,
-        })
+        appendMissingDigitalStep(entry, 'issued')
       }
-      if (timeline.at(-1)?.status === 'issued') {
-        timeline.push({
-          ...entry,
-          id: `${entry.id}-migration-sent`,
-          status: 'sent',
-          label: `${entry.label} — migrated digital send evidence`,
-        })
+      if (
+        ['delivered', 'failed'].includes(status) &&
+        timeline.at(-1)?.status === 'issued'
+      ) {
+        appendMissingDigitalStep(entry, 'sent')
       }
     }
     timeline.push({ ...entry, status })
@@ -281,7 +326,7 @@ function normalizeMigratedFulfillment(candidate: DemoState) {
   }
 }
 
-export function migrateDemoStateV6(value: unknown): DemoState {
+function migrateDemoStateV6ToV7(value: unknown): LegacyDemoStateV7 {
   if (
     !record(value) ||
     value.schemaVersion !== 6 ||
@@ -295,7 +340,7 @@ export function migrateDemoStateV6(value: unknown): DemoState {
     shipment.kind === 'DIGITAL'
       ? migrateDigitalShipmentV6(shipment)
       : migratePhysicalShipmentV6(shipment))
-  const claims: Claim[] = legacy.claims.map((claim) => ({
+  const claims: LegacyClaimV7[] = legacy.claims.map((claim) => ({
     ...claim,
     remedyState:
       claim.status === 'resolved' && claim.resolutionOutcome === 'refund_recorded'
@@ -317,13 +362,121 @@ export function migrateDemoStateV6(value: unknown): DemoState {
   }))
   const candidate = {
     ...legacy,
-    schemaVersion: SCHEMA_VERSION,
+    schemaVersion: 7 as const,
     shipments,
     claims,
+  } as LegacyDemoStateV7
+  return candidate
+}
+
+function linkedRefundEvidence(
+  state: DemoState,
+  claim: LegacyClaimV7,
+) {
+  if (!claim.linkedRefundEventId) return undefined
+  for (const payment of state.payments) {
+    const eventIndex = payment.events.findIndex((event) =>
+      event.id === claim.linkedRefundEventId)
+    if (eventIndex < 0) continue
+    const event = payment.events[eventIndex]
+    const amountSen = event.refundIntent?.amountSen
+    if (
+      event.refundIntent?.claimId !== claim.id ||
+      !Number.isInteger(amountSen) ||
+      amountSen! <= 0
+    ) {
+      return undefined
+    }
+    const priorRefundedSen = payment.events
+      .slice(0, eventIndex)
+      .reduce((sum, prior) => sum + (prior.refundIntent?.amountSen ?? 0), 0)
+    return {
+      amountSen: amountSen!,
+      payment,
+      priorRefundedSen,
+    }
+  }
+  return undefined
+}
+
+export function migrateDemoStateV7(value: unknown): DemoState {
+  if (
+    !record(value) ||
+    value.schemaVersion !== 7 ||
+    !Array.isArray(value.shipments) ||
+    !Array.isArray(value.claims)
+  ) {
+    throw new DomainError('Stored data is not a version 7 demo state.', 'MIGRATION_SOURCE_INVALID')
+  }
+  const legacy = structuredClone(value) as LegacyDemoStateV7
+  const candidate = {
+    ...legacy,
+    schemaVersion: SCHEMA_VERSION,
+    claims: [],
   } as DemoState
+  candidate.claims = legacy.claims.map((claim) => {
+    const snapshot = expectedClaimRemedySnapshot(candidate, claim)
+    const refund = linkedRefundEvidence(candidate, claim)
+    const replacement = claim.replacementShipmentId
+      ? candidate.shipments.find((shipment) =>
+          shipment.id === claim.replacementShipmentId &&
+          shipment.sourceClaimId === claim.id)
+      : undefined
+    const terminalFallback =
+      refund &&
+      isTerminalReplacementRefundFallback(replacement) &&
+      refund.amountSen === refund.payment.amountSen - refund.priorRefundedSen
+    const exactScope = refund?.amountSen === snapshot.requiredSettlementSen
+    const legacyUnderSettledRefund = Boolean(
+      refund && !exactScope && !terminalFallback,
+    )
+    return {
+      ...claim,
+      ...snapshot,
+      ...(refund ? { acceptedSettlementSen: refund.amountSen } : {}),
+      ...(exactScope ? { settlementPolicy: 'exact_scope' as const } : {}),
+      ...(terminalFallback
+        ? { settlementPolicy: 'terminal_replacement_fallback' as const }
+        : {}),
+      ...(legacyUnderSettledRefund
+        ? { legacyUnderSettledRefund: true as const }
+        : {}),
+    }
+  })
+  candidate.shipments = legacy.shipments.map((shipment) => {
+    if (shipment.purpose !== 'replacement') return shipment
+    const claim = candidate.claims.find((entry) =>
+      entry.id === shipment.sourceClaimId &&
+      entry.replacementShipmentId === shipment.id)
+    const original = candidate.shipments.find((entry) =>
+      entry.id === shipment.replacementForShipmentId &&
+      entry.purpose === 'original')
+    if (
+      !claim ||
+      !original ||
+      JSON.stringify(shipment.boxIds) === JSON.stringify(claim.remedyBoxIds)
+    ) {
+      return shipment
+    }
+    assert(
+      JSON.stringify(shipment.boxIds) === JSON.stringify(original.boxIds) &&
+        claim.remedyBoxIds.every((boxId) => shipment.boxIds.includes(boxId)),
+      'Legacy replacement scope is not the exact old original scope.',
+      'MIGRATION_SOURCE_INVALID',
+    )
+    return {
+      ...shipment,
+      boxIds: [...claim.remedyBoxIds],
+      legacyRecordedBoxIds: [...shipment.boxIds],
+    }
+  })
   normalizeMigratedFulfillment(candidate)
   validateDemoState(candidate)
   return candidate
+}
+
+export function migrateDemoStateV6(value: unknown): DemoState {
+  return migrateDemoStateV7(migrateDemoStateV6ToV7(value))
 }
 
 export function migrateDemoStateV5(value: unknown): DemoState {
@@ -401,11 +554,24 @@ export class MockRepository {
       if (isDemoState(parsed)) {
         return { state: parsed, notice: null, needsPersist: false }
       }
+      if (record(parsed) && parsed.schemaVersion === 7) {
+        try {
+          return {
+            state: migrateDemoStateV7(parsed),
+            notice: 'Demo data was upgraded safely from version 7 to version 8.',
+            needsPersist: true,
+            migratedFromRaw: raw,
+            migratedFromVersion: 7,
+          }
+        } catch {
+          // Invalid version 7 data follows the same safe fixture recovery path below.
+        }
+      }
       if (record(parsed) && parsed.schemaVersion === 6) {
         try {
           return {
             state: migrateDemoStateV6(parsed),
-            notice: 'Demo data was upgraded safely from version 6 to version 7.',
+            notice: 'Demo data was upgraded safely from version 6 through version 7 to version 8.',
             needsPersist: true,
             migratedFromRaw: raw,
             migratedFromVersion: 6,
@@ -418,7 +584,7 @@ export class MockRepository {
         try {
           return {
             state: migrateDemoStateV5(parsed),
-            notice: 'Demo data was upgraded safely from version 5 through version 6 to version 7.',
+            notice: 'Demo data was upgraded safely from version 5 through version 6 and version 7 to version 8.',
             needsPersist: true,
             migratedFromRaw: raw,
             migratedFromVersion: 5,

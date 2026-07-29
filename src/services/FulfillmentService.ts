@@ -15,6 +15,7 @@ import {
 import { prizeForBox } from '../domain/selectors'
 import { refreshOrderFulfillment } from '../domain/orderFulfillment'
 import { REPLACEMENT_DELIVERED_ACTION } from '../domain/remedyEvidence'
+import { deliveredShipmentConflict } from '../domain/remedyPolicy'
 import type { DemoState, FulfilmentKind, Order, Shipment, ShipmentStatus } from '../domain/types'
 import type { MockRepository } from '../data/MockRepository'
 import { AuditService } from './AuditService'
@@ -90,6 +91,14 @@ export class FulfillmentService {
       const financiallyStopped = ['cancelled', 'refunded', 'disputed'].includes(order.status)
       const cleanReason = sanitizeText(reason, 220)
       assert(cleanReason.length >= 6, 'Give a short reason for this shipment change.', 'REASON_REQUIRED')
+      if (next === 'delivered') {
+        const conflict = deliveredShipmentConflict(state, shipment)
+        assert(
+          !conflict,
+          `Delivery entitlement is already consumed by shipment ${conflict?.id}.`,
+          'DELIVERY_ENTITLEMENT_CONSUMED',
+        )
+      }
       const before = shipment.status
       shipment.status = transitionShipmentForKind(shipment.kind, shipment.status, next)
       const now = this.now()

@@ -30,14 +30,11 @@ export interface OrderFulfillmentResolution {
   >
 }
 
-function claimAffectsOriginal(claim: Claim, original: Shipment) {
+function claimAffectsBox(claim: Claim, original: Shipment, boxId: string) {
   return (
     claim.orderId === original.orderId &&
-    (
-      claim.shipmentId === original.id ||
-      Boolean(claim.shipmentCandidateIds?.includes(original.id)) ||
-      Boolean(claim.boxId && original.boxIds.includes(claim.boxId))
-    )
+    original.boxIds.includes(boxId) &&
+    claim.remedyBoxIds.includes(boxId)
   )
 }
 
@@ -47,7 +44,10 @@ function completedRefund(claim: Claim) {
     claim.remedyState === 'refund_completed' &&
     claim.resolutionOutcome === 'refund_recorded' &&
     claim.linkedRefundEventId !== undefined &&
-    claim.resolutionReference === claim.linkedRefundEventId
+    claim.resolutionReference === claim.linkedRefundEventId &&
+    claim.acceptedSettlementSen !== undefined &&
+    claim.settlementPolicy !== undefined &&
+    claim.legacyUnderSettledRefund !== true
   )
 }
 
@@ -55,6 +55,7 @@ function completedReplacement(
   state: DemoState,
   claim: Claim,
   original: Shipment,
+  boxId: string,
 ) {
   if (
     claim.status !== 'resolved' ||
@@ -70,6 +71,7 @@ function completedReplacement(
     shipment.purpose === 'replacement' &&
     shipment.sourceClaimId === claim.id &&
     shipment.replacementForShipmentId === original.id &&
+    shipment.boxIds.includes(boxId) &&
     shipment.status === 'delivered',
   )
 }
@@ -77,12 +79,13 @@ function completedReplacement(
 function scopeStatus(
   state: DemoState,
   original: Shipment,
+  boxId: string,
   affectedClaims: Claim[],
 ): FulfillmentScopeResolution {
   const openClaims = affectedClaims.filter((claim) => isOpenClaimStatus(claim.status))
   const refundClaim = affectedClaims.find(completedRefund)
   const replacement = affectedClaims
-    .map((claim) => completedReplacement(state, claim, original))
+    .map((claim) => completedReplacement(state, claim, original, boxId))
     .find(Boolean)
   const complete = openClaims.length === 0 && (
     original.status === 'delivered' ||
@@ -93,7 +96,7 @@ function scopeStatus(
     .map((claim) => claim.replacementShipmentId)
     .filter(Boolean)
     .map((shipmentId) => state.shipments.find((shipment) => shipment.id === shipmentId))
-    .find(Boolean)
+    .find((shipment) => shipment?.boxIds.includes(boxId))
   const untouched =
     original.status === 'unfulfilled' &&
     affectedClaims.length === 0 &&
@@ -101,7 +104,7 @@ function scopeStatus(
 
   return {
     originalShipmentId: original.id,
-    boxIds: [...original.boxIds],
+    boxIds: [boxId],
     status: complete ? 'fulfilled' : untouched ? 'confirmed' : 'processing',
     ...(complete
       ? {
@@ -139,13 +142,14 @@ export function resolveOrderFulfillment(
   assert(order, 'Order was not found for fulfilment resolution.', 'ORDER_MISSING')
   const originals = state.shipments.filter((shipment) =>
     shipment.orderId === order.id && shipment.purpose === 'original')
-  const scopes = originals.map((original) =>
-    scopeStatus(
-      state,
-      original,
-      state.claims.filter((claim) => claimAffectsOriginal(claim, original)),
-    ),
-  )
+  const scopes = originals.flatMap((original) =>
+    original.boxIds.map((boxId) =>
+      scopeStatus(
+        state,
+        original,
+        boxId,
+        state.claims.filter((claim) => claimAffectsBox(claim, original, boxId)),
+      )))
   return {
     orderId: order.id,
     scopes,

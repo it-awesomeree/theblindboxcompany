@@ -214,5 +214,5 @@ export function matchingReplacementTransitionAudit(
 }
 
 export function replacementTerminalStatus(status: ShipmentStatus) {
-  return ['failed', 'failed_delivery', 'lost', 'returned'].includes(status)
+  return ['failed', 'lost', 'returned'].includes(status)
 }

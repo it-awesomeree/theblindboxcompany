@@ -18,6 +18,7 @@ import {
   CountingStorage,
   MemoryStorage,
   FIXED_NOW,
+  makeProcessingOrderSingleGroupedPhysicalShipment,
   makeProcessingOrderTwoPhysicalShipments,
 } from './helpers'
 
@@ -117,6 +118,146 @@ function neutralClaimWideningScenario() {
     makeSecondShipmentEligible,
     resubmit,
   }
+}
+
+function approveClaim(services: AppServices, claimId: string) {
+  services.auth.oneClick('admin')
+  services.claims.review(
+    claimId,
+    'acknowledge',
+    'Confirmed exact remedy test acknowledgement',
+  )
+  services.claims.review(
+    claimId,
+    'approve',
+    'Confirmed exact remedy test approval',
+  )
+}
+
+function physicalReplacementScenario(
+  status:
+    | 'unfulfilled'
+    | 'picking'
+    | 'packed'
+    | 'label_created'
+    | 'shipped'
+    | 'failed_delivery'
+    | 'lost'
+    | 'returned'
+    | 'cancelled'
+    | 'delivered',
+  storage: MemoryStorage = new MemoryStorage(),
+) {
+  const isolated = new AppServices(storage, () => FIXED_NOW)
+  isolated.auth.oneClick('customer')
+  const claim = isolated.claims.submit({
+    orderId: 'ord-failed',
+    kind: 'non_delivery',
+    shipmentId: 'shp-failed',
+    note: `DEMO physical replacement ${status} fallback evidence`,
+  }).data
+  approveClaim(isolated, claim.id)
+  const replacement = isolated.claims.authorizeReplacement(
+    claim.id,
+    `Confirmed physical replacement ${status} authorization`,
+  ).data
+  const paths = {
+    unfulfilled: [],
+    picking: ['picking'],
+    packed: ['picking', 'packed'],
+    label_created: ['picking', 'packed', 'label_created'],
+    shipped: ['picking', 'packed', 'label_created', 'shipped'],
+    failed_delivery: ['picking', 'packed', 'label_created', 'shipped', 'failed_delivery'],
+    lost: ['picking', 'packed', 'label_created', 'shipped', 'lost'],
+    returned: ['picking', 'packed', 'label_created', 'shipped', 'returned'],
+    cancelled: ['cancelled'],
+    delivered: ['picking', 'packed', 'label_created', 'shipped', 'delivered'],
+  } as const
+  for (const next of paths[status]) {
+    isolated.fulfilment.advance(
+      replacement.id,
+      next,
+      `Confirmed physical replacement ${status} ${next}`,
+    )
+  }
+  return { services: isolated, claim, replacement }
+}
+
+function failedDigitalReplacementScenario() {
+  const isolated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+  isolated.auth.oneClick('customer')
+  isolated.openBox('box-processing-02')
+  isolated.auth.oneClick('admin')
+  for (const next of ['issued', 'sent', 'failed'] as const) {
+    isolated.fulfilment.advance(
+      'shp-digital',
+      next,
+      `Confirmed digital fallback original ${next}`,
+    )
+  }
+  isolated.auth.oneClick('customer')
+  const claim = isolated.claims.submit({
+    orderId: 'ord-processing',
+    kind: 'non_delivery',
+    shipmentId: 'shp-digital',
+    note: 'DEMO failed digital replacement refund fallback evidence',
+  }).data
+  approveClaim(isolated, claim.id)
+  const replacement = isolated.claims.authorizeReplacement(
+    claim.id,
+    'Confirmed failed digital replacement authorization',
+  ).data
+  for (const next of ['issued', 'sent', 'failed'] as const) {
+    isolated.fulfilment.advance(
+      replacement.id,
+      next,
+      `Confirmed digital fallback replacement ${next}`,
+    )
+  }
+  return { services: isolated, claim, replacement }
+}
+
+function digitalReissueScenario() {
+  let now = FIXED_NOW
+  const isolated = new AppServices(new MemoryStorage(), () => now)
+  isolated.auth.oneClick('customer')
+  isolated.openBox('box-processing-02')
+  isolated.auth.oneClick('admin')
+  isolated.fulfilment.advance(
+    'shp-digital',
+    'issued',
+    'Confirmed overdue digital original issued',
+  )
+  isolated.fulfilment.advance(
+    'shp-digital',
+    'sent',
+    'Confirmed overdue digital original sent',
+  )
+  now = '2026-08-01T04:00:00.000Z'
+  isolated.auth.oneClick('customer')
+  const claim = isolated.claims.submit({
+    orderId: 'ord-processing',
+    kind: 'non_delivery',
+    shipmentId: 'shp-digital',
+    note: 'DEMO overdue digital original reissue entitlement evidence',
+  }).data
+  approveClaim(isolated, claim.id)
+  const replacement = isolated.claims.authorizeReplacement(
+    claim.id,
+    'Confirmed overdue digital reissue authorization',
+  ).data
+  isolated.fulfilment.advance(
+    replacement.id,
+    'issued',
+    'Confirmed overdue digital reissue issued',
+  )
+  isolated.fulfilment.advance(
+    replacement.id,
+    'sent',
+    'Confirmed overdue digital reissue sent',
+  )
+  now = '2026-08-01T05:00:00.000Z'
+  return { services: isolated, claim, replacement }
 }
 
 const INVALID_AUDIT_EVIDENCE_CASES: Array<[string, () => unknown, string]> = [
@@ -1208,7 +1349,7 @@ describe('customer, payment, allocation and admin services', () => {
     isolated.repository.update((state) => { state.sessionUserId = 'usr-demo-admin' })
     isolated.payments.refund(
       'pay-delivered',
-      1000,
+      claim.requiredSettlementSen,
       'Confirmed inspected RMA linked refund',
       'req-inspected-rma-linked-refund',
       claim.id,
@@ -1230,7 +1371,7 @@ describe('customer, payment, allocation and admin services', () => {
     expect(isolated.repository.getSnapshot().shipments
       .find((entry) => entry.id === 'shp-delivered')?.status).toBe('returned')
     expect(isolated.repository.getSnapshot().orders
-      .find((entry) => entry.id === 'ord-delivered')?.status).toBe('fulfilled')
+      .find((entry) => entry.id === 'ord-delivered')?.status).toBe('refunded')
     expect(() => validateDemoState(isolated.repository.getSnapshot())).not.toThrow()
   })
 
@@ -1394,14 +1535,14 @@ describe('customer, payment, allocation and admin services', () => {
     services.claims.review(claim.id, 'approve', 'Confirmed failed-scope refund approval')
     services.payments.refund(
       'pay-failed',
-      1000,
+      claim.requiredSettlementSen,
       'Confirmed exact failed-scope linked refund',
       'req-failed-scope-linked-refund',
       claim.id,
     )
     let snapshot = services.repository.getSnapshot()
     const linked = snapshot.claims.find((entry) => entry.id === claim.id)!.linkedRefundEventId!
-    expect(snapshot.orders.find((entry) => entry.id === 'ord-failed')?.status).toBe('processing')
+    expect(snapshot.orders.find((entry) => entry.id === 'ord-failed')?.status).toBe('refunded')
     expect(snapshot.claims.find((entry) => entry.id === claim.id)).toMatchObject({
       status: 'approved',
       remedyState: 'refund_linked',
@@ -1421,16 +1562,16 @@ describe('customer, payment, allocation and admin services', () => {
       remedyState: 'refund_completed',
       resolutionReference: linked,
     })
-    expect(snapshot.orders.find((entry) => entry.id === 'ord-failed')?.status).toBe('fulfilled')
+    expect(snapshot.orders.find((entry) => entry.id === 'ord-failed')?.status).toBe('refunded')
     expect(snapshot.boxes.find((entry) => entry.id === 'box-failed-01')).toMatchObject({
-      status: 'fulfilled',
+      status: 'on_hold',
       shipmentId: 'shp-failed',
     })
     expect(() => services.admin.changeOrderStatus(
       'ord-failed',
       'closed',
       'Confirmed close after exact failed-scope remedy',
-    )).not.toThrow()
+    )).toThrow()
     expect(() => validateDemoState(services.repository.getSnapshot())).not.toThrow()
   })
 
@@ -2222,6 +2363,10 @@ describe('customer, payment, allocation and admin services', () => {
     const scenario = neutralClaimWideningScenario()
     expect(scenario.services.repository.getSnapshot().claims.at(-1)?.shipmentCandidateIds)
       .toEqual(['shp-processing'])
+    expect(scenario.services.repository.getSnapshot().claims.at(-1)).toMatchObject({
+      remedyBoxIds: ['box-processing-01'],
+      requiredSettlementSen: 10_600,
+    })
     scenario.moveToReviewState('reviewing')
     scenario.makeSecondShipmentEligible()
 
@@ -2237,6 +2382,10 @@ describe('customer, payment, allocation and admin services', () => {
     expect(stored.shipmentCandidateEvidenceAt).toEqual({
       'shp-digital': '2026-07-28T08:00:00.000Z',
       'shp-processing': '2026-07-28T06:00:00.000Z',
+    })
+    expect(stored).toMatchObject({
+      remedyBoxIds: ['box-processing-01', 'box-processing-02'],
+      requiredSettlementSen: 21_200,
     })
     expect(stored.history.at(-1)?.note).toBe(
       'Neutral order-level delivery evidence widened after customer resubmission.',
@@ -2376,7 +2525,7 @@ describe('customer, payment, allocation and admin services', () => {
 
     services.payments.refund(
       'pay-delivered',
-      1000,
+      claim.requiredSettlementSen,
       'Confirmed audited refund for claim resolution',
       'req-claim-resolution-refund',
       claim.id,
@@ -2413,7 +2562,7 @@ describe('customer, payment, allocation and admin services', () => {
     expect(refundEvent.refundIntent?.claimId).toBe(claim.id)
     expect(services.repository.getSnapshot().audits.find((audit) => audit.eventId === refundEvent.id)).toMatchObject({
       targetId: 'pay-delivered',
-      action: 'payment.partially_refunded',
+      action: 'payment.refunded',
     })
     expect(services.repository.getSnapshot().audits.find((audit) =>
       audit.eventId === refundEvent.id && audit.targetId === claim.id)).toMatchObject({
@@ -2439,7 +2588,7 @@ describe('customer, payment, allocation and admin services', () => {
     isolated.claims.review(claim.id, 'approve', 'Approved linked refund replay evidence')
     const first = isolated.payments.refund(
       'pay-delivered',
-      1000,
+      claim.requiredSettlementSen,
       'Confirmed exact claim-linked refund replay',
       'req-linked-refund-replay',
       claim.id,
@@ -2449,7 +2598,7 @@ describe('customer, payment, allocation and admin services', () => {
 
     const replay = isolated.payments.refund(
       'pay-delivered',
-      1000,
+      claim.requiredSettlementSen,
       'Confirmed exact claim-linked refund replay',
       'req-linked-refund-replay',
       claim.id,
@@ -2463,7 +2612,7 @@ describe('customer, payment, allocation and admin services', () => {
 
     expect(() => isolated.payments.refund(
       'pay-delivered',
-      1000,
+      claim.requiredSettlementSen,
       'Confirmed exact claim-linked refund replay',
       'req-linked-refund-replay',
       `${claim.id}-changed`,
@@ -2485,7 +2634,7 @@ describe('customer, payment, allocation and admin services', () => {
     services.claims.review(claim.id, 'approve', 'Approved goodwill separation evidence')
     services.payments.refund(
       'pay-delivered',
-      1000,
+      claim.requiredSettlementSen,
       'Confirmed unlinked goodwill refund',
       'req-unlinked-goodwill-refund',
     )
@@ -2553,7 +2702,7 @@ describe('customer, payment, allocation and admin services', () => {
     )).toThrow(expect.objectContaining({ code: 'CLAIM_PAYMENT_MISMATCH' }))
     expect(() => services.payments.refund(
       'pay-delivered',
-      1000,
+      claim.requiredSettlementSen,
       'Attempted missing claim-linked refund',
       'req-missing-claim-linked-refund',
       'clm-missing-refund-link',
@@ -2613,7 +2762,7 @@ describe('customer, payment, allocation and admin services', () => {
     services.claims.review(claim.id, 'approve', 'Approved single linked event evidence')
     services.payments.refund(
       'pay-delivered',
-      1000,
+      claim.requiredSettlementSen,
       'Confirmed first claim-linked refund',
       'req-first-claim-linked-refund',
       claim.id,
@@ -2622,7 +2771,7 @@ describe('customer, payment, allocation and admin services', () => {
 
     expect(() => services.payments.refund(
       'pay-delivered',
-      1000,
+      claim.requiredSettlementSen,
       'Attempted second claim-linked refund',
       'req-second-claim-linked-refund',
       claim.id,
@@ -2997,6 +3146,515 @@ describe('customer, payment, allocation and admin services', () => {
       targetId: 'usr-suspended',
     })
   })
+
+  it('snapshots disjoint value-floor sibling scopes and resolves only the delivered replacement box', () => {
+    const isolated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    makeProcessingOrderSingleGroupedPhysicalShipment(isolated)
+    isolated.auth.oneClick('customer')
+    isolated.openBox('box-processing-02')
+    const first = isolated.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'value_floor',
+      boxId: 'box-processing-01',
+      note: 'DEMO first grouped sibling value-floor evidence',
+    }).data
+    const second = isolated.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'value_floor',
+      boxId: 'box-processing-02',
+      note: 'DEMO second grouped sibling value-floor evidence',
+    }).data
+
+    expect(first).toMatchObject({
+      remedyBoxIds: ['box-processing-01'],
+      requiredSettlementSen: 10_600,
+    })
+    expect(second).toMatchObject({
+      remedyBoxIds: ['box-processing-02'],
+      requiredSettlementSen: 10_600,
+    })
+    expect(first.requiredSettlementSen + second.requiredSettlementSen).toBe(21_200)
+
+    approveClaim(isolated, first.id)
+    approveClaim(isolated, second.id)
+    const firstReplacement = isolated.claims.authorizeReplacement(
+      first.id,
+      'Confirmed first disjoint sibling replacement',
+    ).data
+    const secondReplacement = isolated.claims.authorizeReplacement(
+      second.id,
+      'Confirmed second disjoint sibling replacement',
+    ).data
+    expect(firstReplacement.boxIds).toEqual(['box-processing-01'])
+    expect(secondReplacement.boxIds).toEqual(['box-processing-02'])
+    for (const next of ['picking', 'packed', 'label_created', 'shipped', 'delivered'] as const) {
+      isolated.fulfilment.advance(
+        firstReplacement.id,
+        next,
+        `Confirmed first sibling replacement ${next}`,
+      )
+    }
+
+    const snapshot = isolated.repository.getSnapshot()
+    expect(snapshot.shipments.find((entry) => entry.id === 'shp-processing')?.boxIds)
+      .toEqual(['box-processing-01', 'box-processing-02'])
+    expect(snapshot.boxes.find((entry) => entry.id === 'box-processing-01')?.status)
+      .toBe('fulfilled')
+    expect(snapshot.boxes.find((entry) => entry.id === 'box-processing-02')?.status)
+      .toBe('on_hold')
+    expect(snapshot.orders.find((entry) => entry.id === 'ord-processing')?.status)
+      .toBe('partially_fulfilled')
+    expect(snapshot.claims.find((entry) => entry.id === second.id)).toMatchObject({
+      status: 'approved',
+      remedyState: 'replacement_authorized',
+    })
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+  })
+
+  it('snapshots an exact grouped delivery claim as the full original shipment box scope', () => {
+    const isolated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    makeProcessingOrderSingleGroupedPhysicalShipment(isolated)
+    isolated.auth.oneClick('customer')
+    isolated.openBox('box-processing-02')
+    isolated.auth.oneClick('admin')
+    for (const next of ['packed', 'label_created', 'shipped', 'failed_delivery'] as const) {
+      isolated.fulfilment.advance(
+        'shp-processing',
+        next,
+        `Confirmed grouped delivery evidence ${next}`,
+      )
+    }
+    isolated.auth.oneClick('customer')
+    const claim = isolated.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'non_delivery',
+      shipmentId: 'shp-processing',
+      note: 'DEMO grouped delivery exact original scope evidence',
+    }).data
+
+    expect(claim.remedyBoxIds).toEqual([
+      'box-processing-01',
+      'box-processing-02',
+    ])
+    expect(claim.requiredSettlementSen).toBe(21_200)
+    approveClaim(isolated, claim.id)
+    const replacement = isolated.claims.authorizeReplacement(
+      claim.id,
+      'Confirmed grouped delivery exact replacement',
+    ).data
+    expect(replacement.boxIds).toEqual(claim.remedyBoxIds)
+    expect(replacement).toMatchObject({
+      kind: 'BULKY',
+      insured: false,
+      signatureRequired: false,
+      replacementForShipmentId: 'shp-processing',
+    })
+  })
+
+  it('preserves grouped original insurance and signature flags on a one-box value-floor replacement', () => {
+    const isolated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    makeProcessingOrderSingleGroupedPhysicalShipment(isolated)
+    isolated.repository.update((state) => {
+      const first = state.boxes.find((entry) => entry.id === 'box-processing-01')!
+      const second = state.boxes.find((entry) => entry.id === 'box-processing-02')!
+      const inventory = state.series[0].inventory
+      inventory.find((entry) => entry.prizeId === first.prizeId)!.assigned -= 1
+      inventory.find((entry) => entry.prizeId === second.prizeId)!.assigned -= 1
+      first.prizeId = 'airpods'
+      second.prizeId = 'air-fryer'
+      inventory.find((entry) => entry.prizeId === first.prizeId)!.assigned += 1
+      inventory.find((entry) => entry.prizeId === second.prizeId)!.assigned += 1
+      const original = state.shipments.find((entry) => entry.id === 'shp-processing')!
+      original.kind = 'PARCEL'
+      original.carrier = 'Demo Express'
+      original.insured = true
+      original.signatureRequired = true
+    })
+    isolated.auth.oneClick('customer')
+    isolated.openBox('box-processing-02')
+    const claim = isolated.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'value_floor',
+      boxId: 'box-processing-02',
+      note: 'DEMO one-box replacement preserves grouped original flags',
+    }).data
+    approveClaim(isolated, claim.id)
+
+    const replacement = isolated.claims.authorizeReplacement(
+      claim.id,
+      'Confirmed one-box grouped flag preservation',
+    ).data
+
+    expect(replacement).toMatchObject({
+      boxIds: ['box-processing-02'],
+      kind: 'PARCEL',
+      insured: true,
+      signatureRequired: true,
+      replacementForShipmentId: 'shp-processing',
+    })
+    expect(() => validateDemoState(isolated.repository.getSnapshot())).not.toThrow()
+  })
+
+  it('keeps ordinary partial refunds ledger-only and rejects under-settled claim links atomically', () => {
+    const isolated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    makeProcessingOrderSingleGroupedPhysicalShipment(isolated)
+    isolated.auth.oneClick('customer')
+    isolated.openBox('box-processing-02')
+    const claim = isolated.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'value_floor',
+      boxId: 'box-processing-01',
+      note: 'DEMO exact settlement and ledger separation evidence',
+    }).data
+    approveClaim(isolated, claim.id)
+    isolated.payments.refund(
+      'pay-processing',
+      1000,
+      'Confirmed ordinary ledger-only partial refund',
+      'req-ledger-only-partial',
+    )
+    expect(isolated.repository.getSnapshot().claims.find((entry) => entry.id === claim.id))
+      .toMatchObject({ status: 'approved', remedyState: 'none' })
+
+    for (const amountSen of [1, 1000]) {
+      const before = structuredClone(isolated.repository.getSnapshot())
+      expect(() => isolated.payments.refund(
+        'pay-processing',
+        amountSen,
+        `Attempted under-settled claim link ${amountSen}`,
+        `req-under-settled-${amountSen}`,
+        claim.id,
+      )).toThrow(expect.objectContaining({ code: 'CLAIM_SETTLEMENT_MISMATCH' }))
+      expect(isolated.repository.getSnapshot()).toEqual(before)
+    }
+
+    isolated.payments.refund(
+      'pay-processing',
+      claim.requiredSettlementSen,
+      'Confirmed exact snapshotted claim settlement',
+      'req-exact-scope-settlement',
+      claim.id,
+    )
+    let snapshot = isolated.repository.getSnapshot()
+    const linked = snapshot.claims.find((entry) => entry.id === claim.id)!
+    expect(linked).toMatchObject({
+      status: 'approved',
+      remedyState: 'refund_linked',
+      acceptedSettlementSen: 10_600,
+      settlementPolicy: 'exact_scope',
+    })
+    expect(snapshot.payments.find((entry) => entry.id === 'pay-processing')).toMatchObject({
+      refundedSen: 11_600,
+      status: 'partially_refunded',
+    })
+    isolated.claims.review(
+      claim.id,
+      'resolve',
+      'Confirmed exact scoped settlement completion',
+      { outcome: 'refund_recorded', reference: linked.linkedRefundEventId! },
+    )
+    snapshot = isolated.repository.getSnapshot()
+    expect(snapshot.boxes.find((entry) => entry.id === 'box-processing-01')?.status)
+      .toBe('fulfilled')
+    expect(snapshot.boxes.find((entry) => entry.id === 'box-processing-02')?.status)
+      .toBe('opened')
+    expect(snapshot.orders.find((entry) => entry.id === 'ord-processing')?.status)
+      .toBe('partially_fulfilled')
+  })
+
+  it.each(['lost', 'returned'] as const)(
+    'allows a terminal physical %s replacement to fall back to the full remaining payment refund',
+    (status) => {
+      const scenario = physicalReplacementScenario(status)
+      const { services: isolated, claim, replacement } = scenario
+      if (status === 'returned') {
+        isolated.payments.refund(
+          'pay-failed',
+          1000,
+          'Confirmed prior ordinary partial before returned fallback',
+          'req-returned-fallback-prior-partial',
+        )
+      }
+      const payment = isolated.repository.getSnapshot().payments
+        .find((entry) => entry.id === 'pay-failed')!
+      const remainingSen = payment.amountSen - payment.refundedSen
+      const result = isolated.payments.refund(
+        payment.id,
+        remainingSen,
+        `Confirmed terminal physical ${status} replacement fallback`,
+        `req-physical-${status}-fallback`,
+        claim.id,
+      )
+      const snapshot = isolated.repository.getSnapshot()
+      const storedClaim = snapshot.claims.find((entry) => entry.id === claim.id)!
+
+      expect(result.changed).toBe(true)
+      expect(snapshot.shipments.find((entry) => entry.id === replacement.id)?.status)
+        .toBe(status)
+      expect(storedClaim).toMatchObject({
+        status: 'approved',
+        remedyState: 'refund_linked',
+        replacementShipmentId: replacement.id,
+        acceptedSettlementSen: remainingSen,
+        settlementPolicy: 'terminal_replacement_fallback',
+      })
+      expect(snapshot.shipments.find((entry) => entry.id === 'shp-failed')?.status)
+        .toBe('failed_delivery')
+      expect(() => validateDemoState(snapshot)).not.toThrow()
+    },
+  )
+
+  it('uses full remaining balance for failed digital replacement fallback with exact replay and conflict guards', () => {
+    const scenario = failedDigitalReplacementScenario()
+    const { services: isolated, claim, replacement } = scenario
+    const beforeRefund = isolated.repository.getSnapshot()
+    const payment = beforeRefund.payments.find((entry) => entry.id === 'pay-processing')!
+    expect(claim.requiredSettlementSen).toBe(10_600)
+    expect(payment.amountSen).toBe(21_200)
+    expect(() => isolated.payments.refund(
+      payment.id,
+      claim.requiredSettlementSen,
+      'Attempted scoped amount for terminal digital fallback',
+      'req-digital-fallback-under',
+      claim.id,
+    )).toThrow(expect.objectContaining({ code: 'CLAIM_SETTLEMENT_MISMATCH' }))
+
+    const first = isolated.payments.refund(
+      payment.id,
+      payment.amountSen,
+      'Confirmed terminal digital replacement full fallback',
+      'req-digital-fallback-exact',
+      claim.id,
+    )
+    const afterFirst = structuredClone(isolated.repository.getSnapshot())
+    const replay = isolated.payments.refund(
+      payment.id,
+      payment.amountSen,
+      'Confirmed terminal digital replacement full fallback',
+      'req-digital-fallback-exact',
+      claim.id,
+    )
+    expect(replay).toMatchObject({ changed: false, payment: { id: first.payment.id } })
+    expect(isolated.repository.getSnapshot()).toEqual(afterFirst)
+    expect(afterFirst.claims.find((entry) => entry.id === claim.id)).toMatchObject({
+      status: 'approved',
+      remedyState: 'refund_linked',
+      acceptedSettlementSen: 21_200,
+      settlementPolicy: 'terminal_replacement_fallback',
+      replacementShipmentId: replacement.id,
+    })
+    for (const [amountSen, reason, changedClaimId] of [
+      [21_199, 'Confirmed terminal digital replacement full fallback', claim.id],
+      [21_200, 'Changed terminal digital replacement fallback reason', claim.id],
+      [21_200, 'Confirmed terminal digital replacement full fallback', `${claim.id}-other`],
+    ] as const) {
+      expect(() => isolated.payments.refund(
+        payment.id,
+        amountSen,
+        reason,
+        'req-digital-fallback-exact',
+        changedClaimId,
+      )).toThrow(expect.objectContaining({ code: 'IDEMPOTENCY_CONFLICT' }))
+    }
+    const eventId = afterFirst.claims.find((entry) => entry.id === claim.id)!
+      .linkedRefundEventId!
+    isolated.claims.review(
+      claim.id,
+      'resolve',
+      'Confirmed terminal digital fallback audited completion',
+      { outcome: 'refund_recorded', reference: eventId },
+    )
+    expect(isolated.repository.getSnapshot().claims.find((entry) => entry.id === claim.id))
+      .toMatchObject({
+        status: 'resolved',
+        remedyState: 'refund_completed',
+        resolutionReference: eventId,
+      })
+  })
+
+  it.each([
+    'unfulfilled',
+    'picking',
+    'packed',
+    'label_created',
+    'shipped',
+    'failed_delivery',
+    'cancelled',
+    'delivered',
+  ] as const)(
+    'rejects replacement refund fallback from %s without changing stored evidence',
+    (status) => {
+      const scenario = physicalReplacementScenario(status)
+      const { services: isolated, claim } = scenario
+      const payment = isolated.repository.getSnapshot().payments
+        .find((entry) => entry.id === 'pay-failed')!
+      const before = structuredClone(isolated.repository.getSnapshot())
+      expect(() => isolated.payments.refund(
+        payment.id,
+        payment.amountSen - payment.refundedSen,
+        `Attempted invalid physical ${status} replacement fallback`,
+        `req-invalid-${status}-fallback`,
+        claim.id,
+      )).toThrow()
+      expect(isolated.repository.getSnapshot()).toEqual(before)
+    },
+  )
+
+  it('rolls back a terminal replacement fallback when storage persistence fails and retries safely', () => {
+    const storage = new FailNextWriteStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const scenario = physicalReplacementScenario('lost', storage)
+    const { services: isolated, claim } = scenario
+    const payment = isolated.repository.getSnapshot().payments
+      .find((entry) => entry.id === 'pay-failed')!
+    const before = structuredClone(isolated.repository.getSnapshot())
+    const rawBefore = storage.getItem(STORAGE_KEY)
+    storage.failNextWrite = true
+
+    expect(() => isolated.payments.refund(
+      payment.id,
+      payment.amountSen,
+      'Confirmed storage rollback terminal fallback',
+      'req-terminal-fallback-storage',
+      claim.id,
+    )).toThrow(expect.objectContaining({ code: 'STORAGE_WRITE_FAILED' }))
+    expect(isolated.repository.getSnapshot()).toEqual(before)
+    expect(storage.getItem(STORAGE_KEY)).toBe(rawBefore)
+
+    expect(isolated.payments.refund(
+      payment.id,
+      payment.amountSen,
+      'Confirmed storage rollback terminal fallback',
+      'req-terminal-fallback-storage',
+      claim.id,
+    ).changed).toBe(true)
+  })
+
+  it.each(['unfulfilled', 'issued'] as const)(
+    'cancels and safely requeues disputed unsent digital work from %s',
+    (status) => {
+      const isolated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+      isolated.auth.oneClick('admin')
+      if (status === 'issued') {
+        isolated.fulfilment.advance(
+          'shp-digital',
+          'issued',
+          'Confirmed disputed digital issue before stop',
+        )
+      }
+      isolated.payments.dispute(
+        'pay-processing',
+        `Confirmed disputed digital ${status} stop`,
+        `evt-digital-${status}-stop`,
+      )
+      let snapshot = isolated.repository.getSnapshot()
+      const stopped = snapshot.shipments.find((entry) => entry.id === 'shp-digital')!
+      expect(stopped.status).toBe('cancelled')
+      expect(stopped.timeline.at(-1)).toMatchObject({
+        status: 'cancelled',
+        financialHold: 'disputed',
+      })
+      expect(snapshot.shipments.some((entry) =>
+        entry.orderId === 'ord-processing' &&
+        (
+          (entry.kind === 'DIGITAL' && ['unfulfilled', 'issued'].includes(entry.status)) ||
+          (entry.kind !== 'DIGITAL' &&
+            ['unfulfilled', 'picking', 'packed', 'label_created'].includes(entry.status))
+        ))).toBe(false)
+
+      isolated.payments.resolveDispute(
+        'pay-processing',
+        'merchant_won',
+        `Confirmed disputed digital ${status} resume`,
+        `evt-digital-${status}-resume`,
+      )
+      snapshot = isolated.repository.getSnapshot()
+      expect(snapshot.shipments.find((entry) => entry.id === 'shp-digital')?.status)
+        .toBe('unfulfilled')
+      expect(() => validateDemoState(snapshot)).not.toThrow()
+    },
+  )
+
+  it.each([
+    ['unfulfilled', 'cancelled'],
+    ['issued', 'cancelled'],
+    ['sent', 'sent'],
+    ['delivered', 'delivered'],
+    ['failed', 'failed'],
+  ] as const)(
+    'keeps permanent refund digital evidence auditable from %s as %s',
+    (starting, expected) => {
+      const isolated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+      isolated.auth.oneClick('admin')
+      const path = starting === 'unfulfilled'
+        ? []
+        : starting === 'issued'
+          ? ['issued'] as const
+          : starting === 'sent'
+            ? ['issued', 'sent'] as const
+            : starting === 'delivered'
+              ? ['issued', 'sent', 'delivered'] as const
+              : ['issued', 'sent', 'failed'] as const
+      for (const next of path) {
+        isolated.fulfilment.advance(
+          'shp-digital',
+          next,
+          `Confirmed permanent refund digital ${next}`,
+        )
+      }
+      isolated.payments.refund(
+        'pay-processing',
+        21_200,
+        `Confirmed permanent refund from digital ${starting}`,
+        `req-permanent-digital-${starting}`,
+      )
+      const snapshot = isolated.repository.getSnapshot()
+      expect(snapshot.shipments.find((entry) => entry.id === 'shp-digital')?.status)
+        .toBe(expected)
+      expect(snapshot.orders.find((entry) => entry.id === 'ord-processing')?.status)
+        .toBe('refunded')
+      if (expected === 'cancelled') {
+        const before = structuredClone(snapshot)
+        expect(() => isolated.fulfilment.advance(
+          'shp-digital',
+          'unfulfilled',
+          'Attempted independent worker restart after permanent refund',
+        )).toThrow(expect.objectContaining({ code: 'FINANCIAL_HOLD' }))
+        expect(isolated.repository.getSnapshot()).toEqual(before)
+      }
+      expect(() => validateDemoState(snapshot)).not.toThrow()
+    },
+  )
+
+  it.each(['replacement_first', 'original_first'] as const)(
+    'enforces one digital delivery entitlement when %s reaches delivery',
+    (direction) => {
+      const scenario = digitalReissueScenario()
+      const { services: isolated, replacement } = scenario
+      const firstShipmentId = direction === 'replacement_first'
+        ? replacement.id
+        : 'shp-digital'
+      const secondShipmentId = direction === 'replacement_first'
+        ? 'shp-digital'
+        : replacement.id
+      isolated.fulfilment.advance(
+        firstShipmentId,
+        'delivered',
+        `Confirmed ${direction} entitlement winner`,
+      )
+      const before = structuredClone(isolated.repository.getSnapshot())
+      expect(() => isolated.fulfilment.advance(
+        secondShipmentId,
+        'delivered',
+        `Attempted ${direction} duplicate entitlement delivery`,
+      )).toThrow(expect.objectContaining({ code: 'DELIVERY_ENTITLEMENT_CONSUMED' }))
+      expect(isolated.repository.getSnapshot()).toEqual(before)
+      expect(before.shipments.find((entry) => entry.id === firstShipmentId)?.status)
+        .toBe('delivered')
+      expect(before.shipments.find((entry) => entry.id === secondShipmentId)?.status)
+        .toBe('sent')
+    },
+  )
 
   it('uses all exact prize values and allocation names', () => {
     expect(PRIZES.map((prize) => prize.valueSen)).toEqual([13000, 12000, 12000, 15000, 14000, 10000, 29900, 82900, 204900, 399900, 599900])

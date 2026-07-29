@@ -19,9 +19,14 @@ import {
   claimRefundLinkedHistoryNote,
 } from '../domain/refundLink'
 import { refreshOrderFulfillment } from '../domain/orderFulfillment'
+import {
+  isTerminalReplacementRefundFallback,
+  remainingPaymentBalance,
+} from '../domain/remedyPolicy'
 import { prizeForBox } from '../domain/selectors'
 import type {
   DemoState,
+  ClaimSettlementPolicy,
   Order,
   Payment,
   PaymentEvent,
@@ -592,6 +597,18 @@ export class MockPaymentGateway {
         'Refund request identity changed before it could be saved.',
         'IDEMPOTENCY_CONFLICT',
       )
+      if (cleanClaimId !== undefined) {
+        const existingClaim = state.claims.find((claim) => claim.id === cleanClaimId)
+        assert(existingClaim, 'The refund claim was not found.', 'CLAIM_MISSING')
+        assert(
+          existingClaim.linkedRefundEventId === undefined &&
+            !state.payments.some((entry) =>
+              entry.events.some((event) =>
+                event.refundIntent?.claimId === existingClaim.id)),
+          'This claim is already linked to a refund event.',
+          'CLAIM_REFUND_ALREADY_LINKED',
+        )
+      }
       assert(['succeeded', 'partially_refunded'].includes(payment.status), 'Only succeeded demo payments can be refunded.', 'NOT_REFUNDABLE')
       assert(payment.refundedSen + amountSen <= payment.amountSen, 'Refund exceeds the paid demo amount.', 'REFUND_TOO_HIGH')
       const order = state.orders.find((entry) => entry.id === payment.orderId)
@@ -601,6 +618,7 @@ export class MockPaymentGateway {
       const linkedClaim = cleanClaimId === undefined
         ? undefined
         : state.claims.find((claim) => claim.id === cleanClaimId)
+      let settlementPolicy: ClaimSettlementPolicy | undefined
       if (cleanClaimId !== undefined) {
         assert(linkedClaim, 'The refund claim was not found.', 'CLAIM_MISSING')
         assert(
@@ -615,15 +633,15 @@ export class MockPaymentGateway {
           'A claim must be approved before its refund can be linked.',
           'CLAIM_NOT_APPROVED',
         )
-        assert(
-          linkedClaim.linkedRefundEventId === undefined &&
-            !state.payments.some((entry) =>
-              entry.events.some((event) => event.refundIntent?.claimId === linkedClaim.id),
-            ),
-          'This claim is already linked to a refund event.',
-          'CLAIM_REFUND_ALREADY_LINKED',
-        )
-        assert(
+        const replacement = linkedClaim.replacementShipmentId
+          ? state.shipments.find((shipment) =>
+              shipment.id === linkedClaim.replacementShipmentId &&
+              shipment.sourceClaimId === linkedClaim.id &&
+              shipment.purpose === 'replacement')
+          : undefined
+        const terminalFallback = isTerminalReplacementRefundFallback(replacement)
+        const ordinaryRefundPath =
+          linkedClaim.replacementShipmentId === undefined &&
           (
             (
               linkedClaim.remedyState === 'none' &&
@@ -633,11 +651,28 @@ export class MockPaymentGateway {
               linkedClaim.remedyState === 'rma_inspected' &&
               linkedClaim.rma?.status === 'inspected'
             )
-          ) &&
-            linkedClaim.replacementShipmentId === undefined,
-          'A claim can link a refund only before another remedy or after its RMA inspection.',
+          )
+        assert(
+          ordinaryRefundPath || terminalFallback,
+          'A replacement refund fallback requires terminal digital failure or terminal physical loss or return.',
           'REMEDY_CONFLICT',
         )
+        settlementPolicy = terminalFallback
+          ? 'terminal_replacement_fallback'
+          : 'exact_scope'
+        if (terminalFallback) {
+          assert(
+            amountSen === remainingPaymentBalance(payment),
+            'A terminal replacement refund fallback must refund the selected payment’s full remaining balance.',
+            'CLAIM_SETTLEMENT_MISMATCH',
+          )
+        } else {
+          assert(
+            amountSen === linkedClaim.requiredSettlementSen,
+            'A claim-linked refund must exactly equal the claim’s snapshotted required settlement.',
+            'CLAIM_SETTLEMENT_MISMATCH',
+          )
+        }
         assert(
           !state.claims.some((claim) =>
             claim.id !== linkedClaim.id &&
@@ -708,6 +743,8 @@ export class MockPaymentGateway {
       if (linkedClaim) {
         linkedClaim.linkedRefundEventId = eventId
         linkedClaim.remedyState = 'refund_linked'
+        linkedClaim.acceptedSettlementSen = amountSen
+        linkedClaim.settlementPolicy = settlementPolicy
         linkedClaim.updatedAt = now
         linkedClaim.history.push({
           id: `${linkedClaim.id}-h-${String(linkedClaim.history.length + 1).padStart(2, '0')}`,

@@ -3,7 +3,7 @@ import {
   makeId,
   transitionBox,
   transitionOrder,
-  transitionShipment,
+  transitionShipmentForKind,
 } from '../domain/guards'
 import type { DemoState, Order, OrderStatus, Role, ShipmentStatus } from '../domain/types'
 import {
@@ -12,7 +12,13 @@ import {
 } from '../domain/orderFulfillment'
 import { AuditService } from './AuditService'
 
-const UNSHIPPED: ShipmentStatus[] = ['unfulfilled', 'picking', 'packed', 'label_created']
+const PHYSICAL_UNSHIPPED: ShipmentStatus[] = [
+  'unfulfilled',
+  'picking',
+  'packed',
+  'label_created',
+]
+const DIGITAL_UNSENT: ShipmentStatus[] = ['unfulfilled', 'issued']
 
 interface FinancialActor {
   id: string
@@ -38,8 +44,15 @@ export class FinancialSafetyService {
         .map((shipment) => ({ id: shipment.id, status: shipment.status })),
     }
     for (const shipment of state.shipments.filter((entry) => entry.orderId === order.id)) {
-      if (shipment.kind === 'DIGITAL' || !UNSHIPPED.includes(shipment.status)) continue
-      shipment.status = transitionShipment(shipment.status, 'cancelled')
+      const stoppable = shipment.kind === 'DIGITAL'
+        ? DIGITAL_UNSENT.includes(shipment.status)
+        : PHYSICAL_UNSHIPPED.includes(shipment.status)
+      if (!stoppable) continue
+      shipment.status = transitionShipmentForKind(
+        shipment.kind,
+        shipment.status,
+        'cancelled',
+      )
       shipment.timeline.push({
         id: makeId('stl', `${shipment.id}:financial-stop:${requestId}`),
         status: 'cancelled',
@@ -98,7 +111,11 @@ export class FinancialSafetyService {
       entry.status === 'cancelled' &&
       entry.timeline.at(-1)?.financialHold === 'disputed',
     )) {
-      shipment.status = transitionShipment(shipment.status, 'unfulfilled')
+      shipment.status = transitionShipmentForKind(
+        shipment.kind,
+        shipment.status,
+        'unfulfilled',
+      )
       shipment.timeline.push({
         id: makeId('stl', `${shipment.id}:dispute-resolved:${requestId}`),
         status: 'unfulfilled',

@@ -57,9 +57,10 @@ export function canTransitionShipmentForKind(
 ) {
   if (kind === 'DIGITAL') {
     return (
-      (from === 'unfulfilled' && to === 'issued') ||
-      (from === 'issued' && to === 'sent') ||
-      (from === 'sent' && (to === 'delivered' || to === 'failed'))
+      (from === 'unfulfilled' && (to === 'issued' || to === 'cancelled')) ||
+      (from === 'issued' && (to === 'sent' || to === 'cancelled')) ||
+      (from === 'sent' && (to === 'delivered' || to === 'failed')) ||
+      (from === 'cancelled' && to === 'unfulfilled')
     )
   }
   return (

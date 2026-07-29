@@ -42,6 +42,11 @@ Important uniqueness/check rules include:
 - `(series_id, allocation_serial)` unique.
 - refund request ID globally unique, with normalized target payment, amount and
   reason stored so exact replays are no-ops and changed intent is a conflict.
+- a server-owned `remedy_entitlements` row for each `(order_id, box_id)` held by
+  a claim, with that pair unique across every claim kind. A multi-box claim
+  acquires all of its rows together or acquires none.
+- a claim-linked refund event may belong to exactly one claim, and its payment,
+  order, customer, accepted amount and settlement policy must match that claim.
 - shipment event request ID unique.
 - quantities and money non-negative; declared prize value at least 10,000 sen
   for a published RM100-floor series.
@@ -59,12 +64,20 @@ reconciliation ledger remain the source of truth.
 
 Full refund, accepted cancellation and dispute handling must update the payment,
 order, eligible unshipped fulfilment and unopened-box holds in one database
-transaction. Already shipped/delivered events remain append-only history.
+transaction. That transaction must also lock and inspect every open or
+remedy-entitlement-holding claim on the order. It must stop rather than orphan
+or duplicate a linked refund, RMA or replacement. Already shipped/delivered
+events remain append-only history.
 While an order remains refunded or disputed, legal carrier outcomes for an
 already-shipped record may still be appended without reopening fulfilment,
 unlocking tracking edits or releasing unopened boxes.
 Resuming a dispute hold needs its own authorized resolution command and audit
 record; it must not be a generic status edit.
+
+Cancelled, refunded and disputed orders are financial holds. Server-side guards
+must prevent both new and progressing typed RMA/replacement work while any of
+those holds applies. Existing evidence stays readable and immutable; only
+explicit, audited financial resolution may make eligible work available again.
 
 ## Trusted checkout creation
 
@@ -127,6 +140,13 @@ Events can be duplicated or arrive out of order. Database uniqueness and state
 guards must prevent extra deductions, boxes, prize allocations, reveals,
 refunds or shipments.
 
+Every provider webhook, including payment and shipping callbacks, needs this
+same signed and idempotent boundary: verify its signature before any business
+side effect, store a unique provider/event identity and a payload digest, and
+perform the allowed transition inside a transaction. An exact retry is a safe
+no-op response. Reuse of an event identity with different signed content is a
+security error, not a new event.
+
 The guard must be order-wide, not attempt-local: customer retry, staff retry,
 webhook reconciliation and forced/late success all lock the order and inspect
 every attempt before accepting a capture.
@@ -166,7 +186,7 @@ exception only when no delivered event existed by claim creation; a
 post-delivery customer return is never non-delivery. Value-floor review needs an
 immutable reveal.
 
-Store append-only claim events for acknowledge, approve, reject and resolve,
+Store append-only claim events for acknowledge, approve, reject and final audit,
 including actor, note and UTC time. Delivery claims must not require customers
 to reveal unrelated prizes. While any box remains sealed, show exactly one
 neutral order-level option and store every eligible physical shipment in a
@@ -174,12 +194,44 @@ sorted candidate relation captured at submission, without choosing an arbitrary
 exact shipment. Do not expose the candidate IDs, candidate count, shipment IDs,
 carrier, kind, flags, prize or per-split status to the customer. Exact shipment
 claims unlock only after every box is revealed; authorized claim staff may
-inspect candidate evidence. Resolution needs a finite outcome and reference. A
-recorded-refund outcome must identify a real, audited refund on a payment for
-the same order; replacement, RMA or no-remedy outcomes need their own clearly
-non-production reference and descriptive note. Claim approval or resolution
-must not silently issue money. A separate finance permission, idempotency key
-and refund transaction are required.
+inspect candidate evidence.
+
+Approval does not resolve a claim. Starting an RMA or replacement must lock the
+claim, order and all requested `(order_id, box_id)` entitlement rows in one
+transaction. The unique entitlement key prevents overlapping damage,
+non-delivery and value-floor claims from owning a second remedy for the same
+box. RMA created → received → inspected stays approved/open and retains those
+entitlement rows. Replacement authorization also stays approved/open and
+retains the entitlement until the exact replacement is delivered. Only
+delivered replacement evidence, an audited completed linked refund, or an
+explicit no-remedy decision may close the applicable path.
+
+## Transactional refund and remedy coordination
+
+Claim approval must never silently issue money. A finance-authorized refund
+command needs its own idempotency key, immutable normalized intent and database
+transaction. For a claim-linked refund, that transaction locks the payment,
+order, claim and entitlement rows, verifies the exact scope and available
+balance, records the refund event once, and links it to only that claim.
+Provider confirmation and the protected final claim audit must also be
+idempotent. Recording the linked refund leaves the claim approved/open until
+the final audit verifies that exact accepted event.
+
+A safe partial goodwill refund remains unlinked. It is a separate financial
+adjustment and cannot satisfy a claim, consume an entitlement or finalize a
+claim scope. Before a generic full-payment refund or a dispute-origin refund,
+the server must lock and coordinate every open or entitlement-holding claim on
+the order. It must reject any action that would orphan or duplicate an RMA,
+replacement or refund remedy. Full refunds may proceed only through an
+explicitly coordinated transaction that preserves one auditable completion
+path per box.
+
+Ordinary claim refunds use the snapshotted required settlement. After an
+authorized replacement reaches an eligible terminal failure, the fallback
+amount is `min(required claim settlement, remaining refundable payment
+balance)`; it never uses an uncapped payment-remainder rule. Migrated legacy
+under-settled evidence remains immutable and incomplete and cannot be reused or
+edited to finalize its claim or box scope.
 
 ## Roles and admin security
 

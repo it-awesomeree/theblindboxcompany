@@ -4045,6 +4045,11 @@ legend {
     font-size: .6875rem;
   }
 
+  .remedy-original span,
+  .remedy-original small {
+    font-size: .6875rem;
+  }
+
   input,
   select,
   textarea {

@@ -326,4 +326,15 @@ describe('release and responsive safety configuration', () => {
     expect(styles).toMatch(/\.brand-seal\s*\{[\s\S]*?width:\s*29px;[\s\S]*?height:\s*29px;/)
     expect(styles).toMatch(/@media \(max-width: 620px\)[\s\S]*?\.brand-seal\s*\{[\s\S]*?width:\s*26px;[\s\S]*?height:\s*26px;/)
   })
+
+  it('keeps remedy metadata compact on desktop and readable on mobile', () => {
+    const styles = read('src/styles.css')
+    const mobileFloorStyles = styles.slice(styles.lastIndexOf('@media (max-width: 820px)'))
+    expect(styles).toMatch(
+      /\.remedy-original span,\s*\.remedy-original small\s*\{[^}]*font:\s*\.58rem\/1\.5 var\(--mono\);[^}]*\}/,
+    )
+    expect(mobileFloorStyles).toMatch(
+      /\.remedy-original span,\s*\.remedy-original small\s*\{\s*font-size:\s*\.6875rem;\s*\}/,
+    )
+  })
 })

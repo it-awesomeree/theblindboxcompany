@@ -387,6 +387,8 @@ test('320px typed remedy dialog stays scrollable, labelled, and restores its ope
   await page.goto('#/auth')
   await page.getByRole('button', { name: /one-click aina demo/i }).click()
   await page.goto('#/order/ord-delivered')
+  await expectVisibleFloor(page, '.remedy-original span', 'fontSize', 11)
+  await expectVisibleFloor(page, '.remedy-original small', 'fontSize', 11)
   await page.getByRole('link', { name: /start a demo claim/i }).click()
   await page.getByLabel(/fictional note/i).fill('DEMO mobile typed remedy dialog evidence.')
   await page.getByRole('button', { name: /submit demo claim/i }).click()

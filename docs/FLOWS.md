@@ -92,7 +92,15 @@ ID makes the operation idempotent across every payment. The stored normalized
 intent includes the payment ID, amount and sanitized reason. An exact replay
 returns the original target with no write, revision, listener, audit or
 timestamp change. Reusing the ID with different intent is an explicit conflict.
-A full refund moves the order to `refunded` when allowed.
+
+A partial goodwill refund is a separate, unlinked finance adjustment and is
+permitted while the payment is safely refundable. It does not consume a box
+remedy entitlement, satisfy a claim settlement or finalize any claim. A generic
+full-payment refund, including a refund that ends a dispute, must coordinate
+with every open claim and every claim that still holds a remedy entitlement.
+The demo blocks the full refund if it would orphan an RMA or replacement,
+duplicate a refund remedy, or bypass a required claim link and audit. A full
+refund moves the order to `refunded` only when those checks allow it.
 
 An assigned prize is never rerolled or returned to the series. A revealed box
 keeps its immutable result. An unopened refunded box is held, not reallocated.
@@ -155,14 +163,34 @@ be entered.
   revision, storage write, listener, audit or timestamp change.
 
 Support/admin review requires a note for acknowledge, approve, reject and
-resolve. The approved → resolved step also requires one structured outcome:
-replacement authorized, return/RMA created, refund recorded or no remedy. A
-replacement, RMA or no-remedy result needs a clearly fictional `DEMO-` reference
-and descriptive note. A refund-recorded result must name an existing audited
-refund event for a payment on that order. The outcome and reference stay
-visible to both admin and customer. Every step appends customer-visible history
-and protected audit evidence. A claim never creates a refund implicitly; refund
-remains a separate finance action.
+the final claim audit. Approval opens a typed remedy path; it does not itself
+resolve the claim or issue money. Exactly one claim may hold the remedy
+entitlement for a given order box at a time, even when overlapping claims have
+different kinds.
+
+The guarded remedy paths are:
+
+- RMA created → received → inspected remains approved/open throughout and keeps
+  the box entitlement. Inspection is evidence for the next decision, not a
+  resolution.
+- Replacement authorization creates linked fulfilment work but remains
+  approved/open and keeps the entitlement until that exact replacement is
+  delivered. Delivery records the final resolution. A terminal digital failure
+  or terminal physical loss/return can instead open a linked refund fallback.
+- An ordinary linked refund must equal the snapshotted required settlement. A
+  terminal replacement fallback is exactly the smaller of the required claim
+  settlement and the selected payment’s remaining refundable balance; it never
+  uses an uncapped payment-remainder rule.
+- Recording an accepted linked refund leaves the claim approved/open. Claims
+  must perform a separate final audit against that exact refund event before
+  the claim and remedy scope become complete.
+- An explicit no-remedy decision may close the claim with a clearly fictional
+  `DEMO-` reference and descriptive note.
+
+Every step appends customer-visible history and protected audit evidence. A
+claim never creates a refund implicitly; refund remains a separate finance
+action. Legacy under-settled refund evidence is immutable and incomplete. It
+cannot be changed, upgraded or used to finalize the claim’s box scope.
 
 ## Admin
 
@@ -202,12 +230,14 @@ server-side flows and written operating rules:
 - **Cancellation window:** the server decides whether a customer request is
   still before the saved cancellation deadline. After capture/picking, route the
   request into the return/RMA policy instead of force-cancelling the order.
-- **Return, replacement and RMA:** open a separate case, link the exact item and
-  shipment, record receipt/inspection, then approve replacement stock or send an
-  approved amount to finance. Neither outcome happens when the case is opened.
+- **Return, replacement and RMA:** open a separate case, lock its exact box
+  entitlement across claim kinds, link the exact item and shipment, and record
+  receipt/inspection. Replacement authorization stays open until delivery; a
+  refund stays separate and needs its final claim audit.
 - **Approved claim to finance:** Claims shows the exact-order Payments handoff.
   Approval does not refund automatically; a permitted finance user must review
-  the payment and confirm a separate audited action.
+  the payment and confirm a separate audited linked action. Unlinked partial
+  goodwill cannot finalize the claim.
 - **Tax and accounting:** production must create invoice/credit-note records and
   reconcile order totals, tax, provider settlements, refunds and disputes with
   the accounting ledger. The demo totals are not invoices.

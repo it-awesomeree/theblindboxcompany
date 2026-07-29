@@ -38,6 +38,8 @@ import {
 import { sealedCustomerTimeline } from '../src/domain/orderTimeline'
 import { resolveOrderFulfillment } from '../src/domain/orderFulfillment'
 import {
+  assertClaimOrderAllowsTypedRemedy,
+  CLAIM_ORDER_FINANCIAL_HOLD_CODE,
   claimHoldsRemedyEntitlement,
   orderBoxSettlementAllocations,
   requiredSettlementForBoxScope,
@@ -275,6 +277,9 @@ describe('Series 001 and domain guards', () => {
       history: [],
     }
     for (const remedyState of [
+      'rma_created',
+      'rma_received',
+      'rma_inspected',
       'replacement_authorized',
       'replacement_delivered',
       'refund_linked',
@@ -295,9 +300,6 @@ describe('Series 001 and domain guards', () => {
     }
     for (const remedyState of [
       'none',
-      'rma_created',
-      'rma_received',
-      'rma_inspected',
       'no_remedy',
     ] as const) {
       expect(claimHoldsRemedyEntitlement({ ...base, remedyState })).toBe(false)
@@ -318,6 +320,24 @@ describe('Series 001 and domain guards', () => {
       remedyState: 'none',
       resolutionOutcome: 'return_rma_created',
     })).toBe(false)
+  })
+
+  it('blocks typed RMA and replacement work on every claim-order financial hold', () => {
+    for (const status of ['cancelled', 'refunded', 'disputed'] as const) {
+      expect(() => assertClaimOrderAllowsTypedRemedy({ status })).toThrow(
+        expect.objectContaining({ code: CLAIM_ORDER_FINANCIAL_HOLD_CODE }),
+      )
+    }
+    for (const status of [
+      'pending_payment',
+      'confirmed',
+      'processing',
+      'partially_fulfilled',
+      'fulfilled',
+      'closed',
+    ] as const) {
+      expect(() => assertClaimOrderAllowsTypedRemedy({ status })).not.toThrow()
+    }
   })
 
   it('guards box transitions while keeping reveal and shipment independent', () => {

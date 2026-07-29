@@ -9,11 +9,16 @@ import {
 import { AUDIT_EVIDENCE_MAX_BYTES } from '../src/domain/auditEvidence'
 import { exactOddsLabel } from '../src/domain/odds'
 import { sealedCustomerTimeline } from '../src/domain/orderTimeline'
-import type { Role } from '../src/domain/types'
+import type { DemoState, Role } from '../src/domain/types'
 import { createDemoState, DEMO_ADDRESS } from '../src/data/fixtures'
-import { STORAGE_KEY } from '../src/data/MockRepository'
+import {
+  type MockRepository,
+  STORAGE_KEY,
+} from '../src/data/MockRepository'
 import { validateDemoState } from '../src/data/StateValidator'
 import { AppServices } from '../src/services/AppServices'
+import { AuditService } from '../src/services/AuditService'
+import { ClaimService } from '../src/services/ClaimService'
 import {
   CountingStorage,
   MemoryStorage,
@@ -34,6 +39,22 @@ class FailNextWriteStorage extends MemoryStorage {
       throw new Error('write blocked for atomic service test')
     }
     super.setItem(key, value)
+  }
+}
+
+class TransactionTestRepository {
+  updateCalls = 0
+
+  constructor(private state: DemoState) {}
+
+  getSnapshot = () => this.state
+
+  update<T>(mutator: (draft: DemoState) => T) {
+    this.updateCalls += 1
+    const draft = structuredClone(this.state)
+    const result = mutator(draft)
+    this.state = draft
+    return result
   }
 }
 
@@ -150,6 +171,54 @@ function overlappingCrossKindClaims() {
     note: 'DEMO overlapping revealed value-floor complaint',
   }).data
   return { services, damage, valueFloor }
+}
+
+function rmaReferenceKind(kind: 'damage' | 'value_floor') {
+  return kind.replaceAll('_', '-').toUpperCase()
+}
+
+function typedRemedyFinancialHoldScenario(
+  hold: 'cancelled' | 'refunded' | 'disputed',
+  rmaProgress: 'none' | 'created' | 'received',
+) {
+  const setup = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+  setup.auth.oneClick('customer')
+  const claim = setup.claims.submit({
+    orderId: 'ord-delivered',
+    kind: 'damage',
+    shipmentId: 'shp-delivered',
+    note: `DEMO ${hold} typed remedy guard evidence`,
+  }).data
+  approveClaim(setup, claim.id)
+  if (rmaProgress !== 'none') {
+    setup.claims.createRma(
+      claim.id,
+      `DEMO-RMA-${hold.toUpperCase()}-HOLD`,
+      `Confirmed ${hold} hold RMA creation evidence`,
+    )
+  }
+  if (rmaProgress === 'received') {
+    setup.claims.recordRmaReceived(
+      claim.id,
+      `DEMO-RMA-${hold.toUpperCase()}-HOLD`,
+      `Confirmed ${hold} hold RMA receipt evidence`,
+    )
+  }
+
+  const state = structuredClone(setup.repository.getSnapshot())
+  state.orders.find((order) => order.id === claim.orderId)!.status = hold
+  const repository = new TransactionTestRepository(state)
+  const claims = new ClaimService(
+    repository as unknown as MockRepository,
+    new AuditService(),
+    () => FIXED_NOW,
+  )
+  return {
+    claim,
+    claims,
+    reference: `DEMO-RMA-${hold.toUpperCase()}-HOLD`,
+    repository,
+  }
 }
 
 function physicalReplacementScenario(
@@ -1266,6 +1335,67 @@ describe('customer, payment, allocation and admin services', () => {
       .toBe('fulfilled')
     expect(() => validateDemoState(snapshot)).not.toThrow()
   })
+
+  it.each(['cancelled', 'refunded', 'disputed'] as const)(
+    'rejects every new typed remedy mutation on a %s claim order without changing one byte',
+    (hold) => {
+      const attempts = [
+        {
+          progress: 'none' as const,
+          run: (
+            scenario: ReturnType<typeof typedRemedyFinancialHoldScenario>,
+          ) => scenario.claims.createRma(
+            scenario.claim.id,
+            scenario.reference,
+            `Attempted ${hold} hold RMA creation evidence`,
+          ),
+        },
+        {
+          progress: 'created' as const,
+          run: (
+            scenario: ReturnType<typeof typedRemedyFinancialHoldScenario>,
+          ) => scenario.claims.recordRmaReceived(
+            scenario.claim.id,
+            scenario.reference,
+            `Attempted ${hold} hold RMA receipt evidence`,
+          ),
+        },
+        {
+          progress: 'received' as const,
+          run: (
+            scenario: ReturnType<typeof typedRemedyFinancialHoldScenario>,
+          ) => scenario.claims.recordRmaInspected(
+            scenario.claim.id,
+            scenario.reference,
+            `Attempted ${hold} hold RMA inspection evidence`,
+          ),
+        },
+        {
+          progress: 'none' as const,
+          run: (
+            scenario: ReturnType<typeof typedRemedyFinancialHoldScenario>,
+          ) => scenario.claims.authorizeReplacement(
+            scenario.claim.id,
+            `Attempted ${hold} hold replacement authorization`,
+          ),
+        },
+      ]
+
+      for (const attempt of attempts) {
+        const scenario = typedRemedyFinancialHoldScenario(
+          hold,
+          attempt.progress,
+        )
+        const before = JSON.stringify(scenario.repository.getSnapshot())
+
+        expect(() => attempt.run(scenario)).toThrow(
+          expect.objectContaining({ code: 'CLAIM_ORDER_FINANCIAL_HOLD' }),
+        )
+        expect(JSON.stringify(scenario.repository.getSnapshot())).toBe(before)
+        expect(scenario.repository.updateCalls).toBe(1)
+      }
+    },
+  )
 
   it('records ordered RMA evidence with role guards, exact replay, and inspected completion', () => {
     const storage = new CountingStorage()
@@ -3181,7 +3311,7 @@ describe('customer, payment, allocation and admin services', () => {
     ['damage', 'value_floor'],
     ['value_floor', 'damage'],
   ] as const)(
-    'blocks a second overlapping cross-kind replacement when %s is authorized before %s',
+    'blocks a second overlapping cross-kind replacement and RMA when %s is authorized before %s',
     (firstKind, secondKind) => {
       const { services: isolated, damage, valueFloor } = overlappingCrossKindClaims()
       const claims = { damage, value_floor: valueFloor }
@@ -3198,6 +3328,12 @@ describe('customer, payment, allocation and admin services', () => {
         `Attempted ${secondKind} overlapping replacement authorization`,
       )).toThrow(expect.objectContaining({ code: 'REMEDY_SCOPE_CONFLICT' }))
       expect(isolated.repository.getSnapshot()).toEqual(beforeConflict)
+      expect(() => isolated.claims.createRma(
+        claims[secondKind].id,
+        `DEMO-RMA-${rmaReferenceKind(secondKind)}-AFTER-REPLACEMENT`,
+        `Attempted ${secondKind} overlapping RMA after replacement`,
+      )).toThrow(expect.objectContaining({ code: 'REMEDY_SCOPE_CONFLICT' }))
+      expect(isolated.repository.getSnapshot()).toEqual(beforeConflict)
       expect(beforeConflict.shipments.filter((shipment) =>
         shipment.purpose === 'replacement')).toEqual([
         expect.objectContaining({
@@ -3206,6 +3342,56 @@ describe('customer, payment, allocation and admin services', () => {
           boxIds: ['box-delivered-01'],
         }),
       ])
+    },
+  )
+
+  it.each([
+    ['damage', 'value_floor'],
+    ['value_floor', 'damage'],
+  ] as const)(
+    'lets the first %s RMA reserve overlapping scope and blocks the %s RMA, refund, and replacement',
+    (firstKind, secondKind) => {
+      const { services: isolated, damage, valueFloor } = overlappingCrossKindClaims()
+      const claims = { damage, value_floor: valueFloor }
+      approveClaim(isolated, claims[firstKind].id)
+      approveClaim(isolated, claims[secondKind].id)
+
+      expect(isolated.claims.createRma(
+        claims[firstKind].id,
+        `DEMO-RMA-${rmaReferenceKind(firstKind)}-FIRST`,
+        `Confirmed ${firstKind} overlapping RMA reservation`,
+      )).toMatchObject({
+        changed: true,
+        data: {
+          id: claims[firstKind].id,
+          remedyState: 'rma_created',
+        },
+      })
+
+      const expectConflictWithoutStateChange = (attempt: () => unknown) => {
+        const before = structuredClone(isolated.repository.getSnapshot())
+        expect(attempt).toThrow(
+          expect.objectContaining({ code: 'REMEDY_SCOPE_CONFLICT' }),
+        )
+        expect(isolated.repository.getSnapshot()).toEqual(before)
+      }
+
+      expectConflictWithoutStateChange(() => isolated.claims.createRma(
+        claims[secondKind].id,
+        `DEMO-RMA-${rmaReferenceKind(secondKind)}-SECOND`,
+        `Attempted ${secondKind} overlapping RMA reservation`,
+      ))
+      expectConflictWithoutStateChange(() => isolated.payments.refund(
+        'pay-delivered',
+        claims[secondKind].requiredSettlementSen,
+        `Attempted ${secondKind} refund after overlapping RMA`,
+        `req-${secondKind}-refund-after-overlapping-rma`,
+        claims[secondKind].id,
+      ))
+      expectConflictWithoutStateChange(() => isolated.claims.authorizeReplacement(
+        claims[secondKind].id,
+        `Attempted ${secondKind} replacement after overlapping RMA`,
+      ))
     },
   )
 

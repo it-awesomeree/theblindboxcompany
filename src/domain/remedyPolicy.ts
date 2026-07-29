@@ -9,6 +9,9 @@ import type {
 } from './types'
 
 const REMEDY_ENTITLEMENT_STATES = new Set<Claim['remedyState']>([
+  'rma_created',
+  'rma_received',
+  'rma_inspected',
   'replacement_authorized',
   'replacement_delivered',
   'refund_linked',
@@ -23,6 +26,14 @@ const GRANDFATHERED_COMPLETION_OUTCOMES = new Set<
 ])
 
 export const REMEDY_SCOPE_CONFLICT_CODE = 'REMEDY_SCOPE_CONFLICT'
+export const CLAIM_ORDER_FINANCIAL_HOLD_CODE =
+  'CLAIM_ORDER_FINANCIAL_HOLD'
+
+const CLAIM_ORDER_FINANCIAL_HOLD_STATUSES = new Set<Order['status']>([
+  'cancelled',
+  'refunded',
+  'disputed',
+])
 
 export interface RemedyScopeConflict {
   orderId: string
@@ -84,6 +95,16 @@ export function assertNoRemedyScopeConflict(
       ? `Claim ${currentClaim.id} overlaps remedy entitlement held by claim ${conflict.holderClaimId} for box scope ${conflict.remedyBoxIds.join(', ')}.`
       : 'Claim remedy entitlement scope is available.',
     REMEDY_SCOPE_CONFLICT_CODE,
+  )
+}
+
+export function assertClaimOrderAllowsTypedRemedy(
+  order: Pick<Order, 'status'>,
+) {
+  assert(
+    !CLAIM_ORDER_FINANCIAL_HOLD_STATUSES.has(order.status),
+    `Typed RMA and replacement work is unavailable while the claim order is ${order.status}.`,
+    CLAIM_ORDER_FINANCIAL_HOLD_CODE,
   )
 }
 

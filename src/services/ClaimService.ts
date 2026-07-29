@@ -19,6 +19,7 @@ import {
 import { matchingAppliedPaymentRefundAudit } from '../domain/refundLink'
 import { refreshOrderFulfillment } from '../domain/orderFulfillment'
 import {
+  assertClaimOrderAllowsTypedRemedy,
   assertNoRemedyScopeConflict,
   remedyBoxIdsForEvidence,
   requiredSettlementForBoxScope,
@@ -698,6 +699,9 @@ export class ClaimService {
       assertRole(actor, ['support', 'admin', 'super_admin'], 'record RMA evidence')
       const claim = state.claims.find((entry) => entry.id === claimId)
       assert(claim, 'Claim was not found.', 'CLAIM_MISSING')
+      const order = state.orders.find((entry) => entry.id === claim.orderId)
+      assert(order, 'Claim order was not found.', 'ORDER_MISSING')
+      assertClaimOrderAllowsTypedRemedy(order)
       assert(claim.status === 'approved', 'RMA evidence requires an approved claim.', 'CLAIM_NOT_APPROVED')
       assert(claim.linkedRefundEventId === undefined, 'A refund-linked claim cannot start an RMA path.', 'REMEDY_CONFLICT')
       const now = this.now()
@@ -731,6 +735,7 @@ export class ClaimService {
           'That RMA reference is already in use.',
           'RMA_REFERENCE_REUSED',
         )
+        assertNoRemedyScopeConflict(state.claims, claim)
         claim.rma = {
           reference,
           status: 'created',
@@ -781,8 +786,6 @@ export class ClaimService {
         actorRole: actor.role,
         at: now,
       })
-      const order = state.orders.find((entry) => entry.id === claim.orderId)
-      assert(order, 'Claim order was not found.', 'ORDER_MISSING')
       refreshOrderFulfillment(state, order, now, reason)
       this.audit.append(state, {
         actorId: actor.id,
@@ -847,6 +850,8 @@ export class ClaimService {
       assertRole(actor, ['fulfilment', 'admin', 'super_admin'], 'authorize a replacement')
       const claim = state.claims.find((entry) => entry.id === claimId)
       assert(claim, 'Claim was not found.', 'CLAIM_MISSING')
+      const order = state.orders.find((entry) => entry.id === claim.orderId)
+      assert(order, 'Claim order was not found.', 'ORDER_MISSING')
       assert(claim.status === 'approved', 'Replacement requires an approved claim.', 'CLAIM_NOT_APPROVED')
       assert(claim.linkedRefundEventId === undefined, 'A refund-linked claim cannot authorize a replacement.', 'REMEDY_CONFLICT')
       assert(
@@ -860,6 +865,7 @@ export class ClaimService {
         'REPLACEMENT_SCOPE_AMBIGUOUS',
       )
       assertNoRemedyScopeConflict(state.claims, claim)
+      assertClaimOrderAllowsTypedRemedy(order)
       const original = originalForClaim(state, claim)
       assert(original, 'Replacement original shipment scope was not found.', 'REPLACEMENT_ORIGINAL_MISSING')
       assert(
@@ -919,8 +925,6 @@ export class ClaimService {
         actorRole: actor.role,
         at: now,
       })
-      const order = state.orders.find((entry) => entry.id === claim.orderId)
-      assert(order, 'Claim order was not found.', 'ORDER_MISSING')
       refreshOrderFulfillment(state, order, now, reason)
       this.audit.append(state, {
         actorId: actor.id,

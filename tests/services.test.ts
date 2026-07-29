@@ -1339,6 +1339,85 @@ describe('customer, payment, allocation and admin services', () => {
     expect(() => validateDemoState(snapshot)).not.toThrow()
   })
 
+  it('keeps a shipped replacement and its claim immutable during a dispute hold, then delivers after merchant win', () => {
+    const { services: isolated, claim, replacement } =
+      physicalReplacementScenario('shipped')
+
+    isolated.payments.dispute(
+      'pay-failed',
+      'Confirmed dispute after the authorized replacement shipped',
+      'evt-shipped-replacement-dispute-stop',
+    )
+    const beforeBlockedDelivery = structuredClone(
+      isolated.repository.getSnapshot(),
+    )
+    expect(beforeBlockedDelivery.shipments
+      .find((entry) => entry.id === replacement.id)?.status).toBe('shipped')
+    expect(beforeBlockedDelivery.claims
+      .find((entry) => entry.id === claim.id)).toMatchObject({
+        status: 'approved',
+        remedyState: 'replacement_authorized',
+      })
+
+    expect(() => isolated.fulfilment.advance(
+      replacement.id,
+      'delivered',
+      'Attempted replacement delivery during the dispute hold',
+    )).toThrow(expect.objectContaining({ code: 'FINANCIAL_HOLD' }))
+
+    const afterBlockedDelivery = isolated.repository.getSnapshot()
+    const heldOrder = beforeBlockedDelivery.orders
+      .find((entry) => entry.id === claim.orderId)!
+    const heldPayment = beforeBlockedDelivery.payments
+      .find((entry) => entry.id === 'pay-failed')!
+    expect(afterBlockedDelivery.shipments
+      .find((entry) => entry.id === replacement.id)).toEqual(
+      beforeBlockedDelivery.shipments.find((entry) => entry.id === replacement.id),
+    )
+    expect(afterBlockedDelivery.claims
+      .find((entry) => entry.id === claim.id)).toEqual(
+      beforeBlockedDelivery.claims.find((entry) => entry.id === claim.id),
+    )
+    expect(afterBlockedDelivery.orders
+      .find((entry) => entry.id === heldOrder.id)).toEqual(heldOrder)
+    expect(afterBlockedDelivery.payments
+      .find((entry) => entry.id === heldPayment.id)).toEqual(heldPayment)
+    expect(afterBlockedDelivery.boxes
+      .filter((entry) => heldOrder.boxIds.includes(entry.id))).toEqual(
+      beforeBlockedDelivery.boxes
+        .filter((entry) => heldOrder.boxIds.includes(entry.id)),
+    )
+    expect(afterBlockedDelivery.audits).toEqual(beforeBlockedDelivery.audits)
+    expect(afterBlockedDelivery).toEqual(beforeBlockedDelivery)
+
+    isolated.payments.resolveDispute(
+      heldPayment.id,
+      'merchant_won',
+      'Confirmed merchant win clearing the replacement delivery hold',
+      'evt-shipped-replacement-dispute-resume',
+    )
+    isolated.fulfilment.advance(
+      replacement.id,
+      'delivered',
+      'Confirmed replacement delivery after the hold cleared',
+    )
+
+    const completed = isolated.repository.getSnapshot()
+    expect(completed.shipments
+      .find((entry) => entry.id === replacement.id)?.status).toBe('delivered')
+    expect(completed.claims.find((entry) => entry.id === claim.id)).toMatchObject({
+      status: 'resolved',
+      remedyState: 'replacement_delivered',
+      replacementShipmentId: replacement.id,
+      resolutionReference: replacement.id,
+    })
+    expect(completed.orders
+      .find((entry) => entry.id === claim.orderId)?.status).toBe('fulfilled')
+    expect(completed.payments
+      .find((entry) => entry.id === heldPayment.id)?.status).toBe('succeeded')
+    expect(() => validateDemoState(completed)).not.toThrow()
+  })
+
   it.each(['cancelled', 'refunded', 'disputed'] as const)(
     'rejects every new typed remedy mutation on a %s claim order without changing one byte',
     (hold) => {

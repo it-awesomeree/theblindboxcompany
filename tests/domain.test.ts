@@ -574,6 +574,30 @@ describe('Series 001 and domain guards', () => {
     expect(shipmentTrackingActionEligibility('disputed', physical).eligible).toBe(false)
   })
 
+  it.each(['refunded', 'disputed'] as const)(
+    'allows original physical carrier evidence but blocks the same replacement delivery during a %s hold',
+    (hold) => {
+      const original = createDemoState().shipments
+        .find((shipment) => shipment.id === 'shp-shipped')!
+      const replacement = {
+        ...original,
+        purpose: 'replacement' as const,
+      }
+
+      expect(shipmentStatusActionEligibility(hold, original, 'delivered')).toMatchObject({
+        eligible: true,
+        code: 'CARRIER_EVIDENCE_ALLOWED',
+      })
+      expect(shipmentStatusActionEligibility(hold, replacement, 'delivered')).toMatchObject({
+        eligible: false,
+        code: 'FINANCIAL_HOLD',
+        reason: expect.stringMatching(
+          /replacement shipments.+locked until the hold is explicitly cleared/i,
+        ),
+      })
+    },
+  )
+
   it('accepts fictional input and blocks likely real data', () => {
     expect(validateCheckoutRequestId('checkout_0123456789abcdef0123456789abcdef')).toBe('checkout_0123456789abcdef0123456789abcdef')
     expect(() => validateCheckoutRequestId('checkout_short')).toThrow(/identity is invalid/i)

@@ -46,7 +46,11 @@ export function AccountPage() {
               const orderBoxes = order.boxIds.map((id) => state.boxes.find((box) => box.id === id)).filter(Boolean)
               const shipments = state.shipments.filter((entry) => entry.orderId === order.id)
               const claims = state.claims.filter((entry) => order.claimIds.includes(entry.id))
-              const refundAwaitingFinalAudit = claims.some((claim) => claim.remedyState === 'refund_linked')
+              const refundAwaitingFinalAudit = claims.some((claim) =>
+                claim.remedyState === 'refund_linked' &&
+                claim.legacyUnderSettledRefund !== true)
+              const legacyUnderSettledClaims = claims.filter((claim) =>
+                claim.legacyUnderSettledRefund === true)
               const everyBoxRevealed =
                 orderBoxes.length === order.boxIds.length &&
                 orderBoxes.length > 0 &&
@@ -94,6 +98,12 @@ export function AccountPage() {
                       })}
                     </div>
                   )}
+                  {everyBoxRevealed && legacyUnderSettledClaims.map((claim) => (
+                    <div className="notice notice-info" key={claim.id}>
+                      <b>Legacy refund record is read-only and incomplete</b>
+                      <p>Immutable under-settled evidence accepted <b>{formatMYR(claim.acceptedSettlementSen ?? 0)}</b> against required <b>{formatMYR(claim.requiredSettlementSen)}</b>. It does not complete the remedy scope, and no final audit is available.</p>
+                    </div>
+                  ))}
                   <Link className="button button-ghost" to={`/order/${order.id}`}>View full record</Link>
                 </article>
               )

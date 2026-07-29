@@ -28,6 +28,41 @@ function renderApp(storage = new MemoryStorage()) {
   return services
 }
 
+function makeApprovedCrossKindRemedyConflict(services: AppServices) {
+  services.auth.oneClick('customer')
+  const holder = services.claims.submit({
+    orderId: 'ord-delivered',
+    kind: 'value_floor',
+    boxId: 'box-delivered-01',
+    note: 'DEMO value-floor holder for overlapping remedy UI',
+  }).data
+  const conflicting = services.claims.submit({
+    orderId: 'ord-delivered',
+    kind: 'damage',
+    shipmentId: 'shp-delivered',
+    note: 'DEMO cross-kind damage claim for overlapping remedy UI',
+  }).data
+  services.auth.oneClick('admin')
+  for (const claim of [holder, conflicting]) {
+    services.claims.review(
+      claim.id,
+      'acknowledge',
+      `Confirmed overlap acknowledgement for ${claim.id}`,
+    )
+    services.claims.review(
+      claim.id,
+      'approve',
+      `Confirmed overlap approval for ${claim.id}`,
+    )
+  }
+  services.claims.createRma(
+    holder.id,
+    `DEMO-RMA-${holder.id.toUpperCase()}`,
+    'Confirmed holder RMA creation evidence',
+  )
+  return { conflicting, holder }
+}
+
 describe('app components', () => {
   it('shows a visible demo warning and preserves the approved homepage tagline', () => {
     renderApp()
@@ -1274,6 +1309,233 @@ describe('app components', () => {
     expect(services.repository.getSnapshot().orders.find((entry) => entry.id === order.id)?.status).toBe('pending_payment')
   })
 
+  it('limits an approved cross-kind conflict to no-remedy while its entitlement holder keeps progressing', async () => {
+    const user = userEvent.setup()
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    const { conflicting, holder } = makeApprovedCrossKindRemedyConflict(services)
+    window.history.replaceState({}, '', '#/admin/claims')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+
+    const conflictingRecord = screen
+      .getByText(conflicting.id, { selector: 'summary b' })
+      .closest('details')!
+    const conflictNotice = within(conflictingRecord)
+      .getByText(/overlapping remedy boxes:/i)
+      .closest<HTMLElement>('.notice')!
+    expect(conflictNotice).toHaveTextContent(holder.id)
+    expect(conflictNotice).toHaveTextContent('box-delivered-01')
+    expect(within(conflictNotice).getByRole('link', {
+      name: new RegExp(`claim ${holder.id}`, 'i'),
+    })).toBeVisible()
+
+    await user.click(within(conflictingRecord).getByRole('button', {
+      name: /record typed remedy/i,
+    }))
+    const conflictingDialog = screen.getByRole('dialog', {
+      name: new RegExp(conflicting.id),
+    })
+    expect(within(conflictingDialog).getAllByRole('radio')).toHaveLength(1)
+    expect(within(conflictingDialog).getByRole('radio', {
+      name: /close explicitly with no remedy/i,
+    })).toBeChecked()
+    expect(within(conflictingDialog).queryByRole('radio', {
+      name: /rma|refund|replacement|reissue/i,
+    })).not.toBeInTheDocument()
+    await user.click(within(conflictingDialog).getByRole('button', {
+      name: /go back/i,
+    }))
+
+    const holderRecord = screen
+      .getByText(holder.id, { selector: 'summary b' })
+      .closest('details')!
+    await user.click(within(holderRecord).getByRole('button', {
+      name: /record typed remedy/i,
+    }))
+    const holderDialog = screen.getByRole('dialog', {
+      name: new RegExp(holder.id),
+    })
+    expect(within(holderDialog).getByRole('radio', {
+      name: /record rma received/i,
+    })).toBeChecked()
+    await user.click(within(holderDialog).getByRole('button', {
+      name: /confirm typed evidence/i,
+    }))
+    expect(services.repository.getSnapshot().claims
+      .find((claim) => claim.id === holder.id)).toMatchObject({
+        remedyState: 'rma_received',
+        status: 'approved',
+      })
+  })
+
+  it('shows a scope-holder conflict and hides linked settlement on a direct claim-payment URL', async () => {
+    const user = userEvent.setup()
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    const { conflicting, holder } = makeApprovedCrossKindRemedyConflict(services)
+    window.history.replaceState(
+      {},
+      '',
+      `#/admin/payments?order=ord-delivered&claim=${encodeURIComponent(conflicting.id)}`,
+    )
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+
+    const paymentRecord = screen
+      .getByText('pay-delivered', { selector: 'summary b' })
+      .closest('details')!
+    await user.click(paymentRecord.querySelector('summary')!)
+    const unavailable = within(paymentRecord)
+      .getByText('Linked refund unavailable on this payment')
+      .closest('.notice')!
+    expect(unavailable).toHaveTextContent(holder.id)
+    expect(unavailable).toHaveTextContent('box-delivered-01')
+    expect(within(paymentRecord).queryByRole('button', {
+      name: new RegExp(`linked claim ${conflicting.id}`, 'i'),
+    })).not.toBeInTheDocument()
+  })
+
+  it('keeps partial goodwill and dispute marking but hides generic full-refund controls for a blocking claim', async () => {
+    const user = userEvent.setup()
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    services.auth.oneClick('customer')
+    const claim = services.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'value_floor',
+      boxId: 'box-processing-01',
+      note: 'DEMO open claim blocks generic full payment refunds',
+    }).data
+    services.auth.oneClick('admin')
+    services.claims.review(
+      claim.id,
+      'acknowledge',
+      'Confirmed generic refund blocker acknowledgement',
+    )
+    services.claims.review(
+      claim.id,
+      'approve',
+      'Confirmed generic refund blocker approval',
+    )
+    window.history.replaceState({}, '', '#/admin/payments?order=ord-processing')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+
+    const paymentRecord = screen
+      .getByText('pay-processing', { selector: 'summary b' })
+      .closest('details')!
+    await user.click(paymentRecord.querySelector('summary')!)
+    const blockerNotice = within(paymentRecord)
+      .getByText('Full payment refund is coordinated through claim remedies')
+      .closest<HTMLElement>('.notice')!
+    expect(within(blockerNotice).getByRole('link', {
+      name: new RegExp(`claim ${claim.id}`, 'i'),
+    })).toBeVisible()
+    expect(blockerNotice).toHaveTextContent(
+      /eligible rm10 partial goodwill and dispute marking remain separate/i,
+    )
+    expect(within(paymentRecord).getByRole('button', {
+      name: /unlinked partial refund rm10/i,
+    })).toBeVisible()
+    expect(within(paymentRecord).getByRole('button', {
+      name: /mark disputed/i,
+    })).toBeVisible()
+    expect(within(paymentRecord).queryByRole('button', {
+      name: /unlinked refund remaining/i,
+    })).not.toBeInTheDocument()
+
+    await user.click(within(paymentRecord).getByRole('button', {
+      name: /mark disputed/i,
+    }))
+    const disputeDialog = screen.getByRole('dialog', {
+      name: /confirm dispute payment action/i,
+    })
+    await user.click(within(disputeDialog).getByRole('button', {
+      name: /confirm and audit/i,
+    }))
+    expect(await within(paymentRecord).findByRole('button', {
+      name: /resolve: merchant won/i,
+    })).toBeVisible()
+    expect(within(paymentRecord).queryByRole('button', {
+      name: /resolve: full refund/i,
+    })).not.toBeInTheDocument()
+
+    cleanup()
+    window.history.replaceState(
+      {},
+      '',
+      `#/admin/claims?claim=${encodeURIComponent(claim.id)}`,
+    )
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+    const claimRecord = screen
+      .getByText(claim.id, { selector: 'summary b' })
+      .closest('details')!
+    expect(claimRecord).toHaveTextContent(
+      /order ord-processing is disputed.+only close explicitly with no remedy/i,
+    )
+    await user.click(within(claimRecord).getByRole('button', {
+      name: /record typed remedy/i,
+    }))
+    const heldDialog = screen.getByRole('dialog', {
+      name: new RegExp(claim.id),
+    })
+    expect(within(heldDialog).getAllByRole('radio')).toHaveLength(1)
+    expect(within(heldDialog).getByRole('radio', {
+      name: /close explicitly with no remedy/i,
+    })).toBeChecked()
+  })
+
+  it.each(['rejected', 'no-remedy'] as const)(
+    'keeps generic full refund available for a %s claim',
+    async (terminalClaimState) => {
+      const user = userEvent.setup()
+      const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+      services.auth.oneClick('customer')
+      const claim = services.claims.submit({
+        orderId: 'ord-delivered',
+        kind: 'damage',
+        shipmentId: 'shp-delivered',
+        note: `DEMO ${terminalClaimState} claim allows generic full refund`,
+      }).data
+      services.auth.oneClick('admin')
+      if (terminalClaimState === 'rejected') {
+        services.claims.review(
+          claim.id,
+          'reject',
+          'Confirmed rejected claim safe full-refund exception',
+        )
+      } else {
+        services.claims.review(
+          claim.id,
+          'acknowledge',
+          'Confirmed no-remedy acknowledgement',
+        )
+        services.claims.review(
+          claim.id,
+          'approve',
+          'Confirmed no-remedy approval',
+        )
+        services.claims.review(
+          claim.id,
+          'resolve',
+          'Confirmed explicit no-remedy resolution',
+          {
+            outcome: 'no_remedy',
+            reference: `DEMO-NO-${claim.id.toUpperCase()}`,
+          },
+        )
+      }
+      window.history.replaceState({}, '', '#/admin/payments?order=ord-delivered')
+      render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+
+      const paymentRecord = screen
+        .getByText('pay-delivered', { selector: 'summary b' })
+        .closest('details')!
+      await user.click(paymentRecord.querySelector('summary')!)
+      expect(within(paymentRecord).getByRole('button', {
+        name: /unlinked refund remaining rm\s*112\.00/i,
+      })).toBeVisible()
+      expect(within(paymentRecord).queryByText(
+        'Full payment refund is coordinated through claim remedies',
+      )).not.toBeInTheDocument()
+    },
+  )
+
   it('records an exact full claim-linked refund, then finalizes the exact event separately', async () => {
     const user = userEvent.setup()
     const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
@@ -1344,6 +1606,15 @@ describe('app components', () => {
     render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
     const focusedClaim = screen.getByText(claim.id).closest('details')!
     expect(focusedClaim).toHaveAttribute('data-focused', 'true')
+    expect(focusedClaim).toHaveTextContent(
+      /existing linked refund may still be finalized through its exact final audit/i,
+    )
+    expect(focusedClaim).toHaveTextContent(
+      /linked-refund final audit remains available/i,
+    )
+    expect(focusedClaim).not.toHaveTextContent(
+      /claim with no started remedy may only close explicitly/i,
+    )
     await user.click(within(focusedClaim).getByRole('button', { name: /record typed remedy/i }))
     const finalDialog = screen.getByRole('dialog', { name: new RegExp(claim.id) })
     expect(within(finalDialog).getByRole('radio', { name: /finalize exact audited refund link/i })).toBeChecked()
@@ -1468,7 +1739,103 @@ describe('app components', () => {
     expect(screen.getByText(/1 of 2 box fulfilment scopes complete/i)).toBeVisible()
   })
 
-  it('offers a lost physical replacement fallback for the exact post-partial remaining balance', async () => {
+  it('caps a failed digital one-box terminal fallback at RM106 on an RM212 payment', async () => {
+    const user = userEvent.setup()
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    services.auth.oneClick('customer')
+    services.openBox('box-processing-02')
+    const claim = services.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'value_floor',
+      boxId: 'box-processing-02',
+      note: 'DEMO digital one-box capped terminal fallback UI',
+    }).data
+    services.auth.oneClick('admin')
+    services.claims.review(
+      claim.id,
+      'acknowledge',
+      'Confirmed digital fallback acknowledgement',
+    )
+    services.claims.review(
+      claim.id,
+      'approve',
+      'Confirmed digital fallback approval',
+    )
+    const replacement = services.claims.authorizeReplacement(
+      claim.id,
+      'Confirmed digital reissue before capped fallback',
+    ).data
+    for (const status of ['issued', 'sent', 'failed'] as const) {
+      services.fulfilment.advance(
+        replacement.id,
+        status,
+        `Confirmed digital replacement ${status}`,
+      )
+    }
+    window.history.replaceState(
+      {},
+      '',
+      `#/admin/claims?claim=${encodeURIComponent(claim.id)}`,
+    )
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+
+    const claimRecord = screen
+      .getByText(claim.id, { selector: 'summary b' })
+      .closest('details')!
+    expect(claimRecord).toHaveTextContent(
+      /capped terminal replacement fallback available/i,
+    )
+    expect(claimRecord).toHaveTextContent(
+      /smaller of required settlement rm\s*106\.00 and one selected payment's remaining balance/i,
+    )
+    await user.click(within(claimRecord).getByRole('button', {
+      name: /record typed remedy/i,
+    }))
+    const remedyDialog = screen.getByRole('dialog', {
+      name: new RegExp(`capped terminal replacement fallback.+${claim.id}`, 'i'),
+    })
+    expect(within(remedyDialog).getByRole('radio', {
+      name: /open capped terminal replacement fallback in payments/i,
+    })).toBeChecked()
+    expect(remedyDialog).toHaveTextContent(
+      /smaller of required settlement rm\s*106\.00 and the selected payment’s remaining balance/i,
+    )
+    await user.click(within(remedyDialog).getByRole('button', {
+      name: /open exact payment/i,
+    }))
+
+    const paymentRecord = screen
+      .getByText('pay-processing', { selector: 'summary b' })
+      .closest('details')!
+    await user.click(paymentRecord.querySelector('summary')!)
+    const fallback = within(paymentRecord).getByRole('button', {
+      name: new RegExp(
+        `linked claim ${claim.id}.+capped terminal replacement fallback rm\\s*106\\.00`,
+        'i',
+      ),
+    })
+    expect(within(paymentRecord).queryByRole('button', {
+      name: new RegExp(
+        `linked claim ${claim.id}.+terminal replacement fallback rm\\s*212\\.00`,
+        'i',
+      ),
+    })).not.toBeInTheDocument()
+    await user.click(fallback)
+    const fallbackDialog = screen.getByRole('dialog', {
+      name: new RegExp(
+        `capped terminal replacement fallback of rm\\s*106\\.00 for claim ${claim.id}`,
+        'i',
+      ),
+    })
+    expect(fallbackDialog).toHaveTextContent(/required claim settlementrm\s*106\.00/i)
+    expect(fallbackDialog).toHaveTextContent(/remaining payment balancerm\s*212\.00/i)
+    expect(fallbackDialog).toHaveTextContent(/amount to refundrm\s*106\.00/i)
+    expect(fallbackDialog).toHaveTextContent(
+      /smaller of the required claim settlement and the remaining payment balance: rm\s*106\.00/i,
+    )
+  })
+
+  it('offers a lost physical replacement fallback for the capped post-partial remaining balance', async () => {
     const user = userEvent.setup()
     const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
     services.auth.oneClick('customer')
@@ -1526,9 +1893,11 @@ describe('app components', () => {
     await user.click(within(claimRecord).getByRole('button', { name: /record typed remedy/i }))
     const remedyDialog = screen.getByRole('dialog', { name: new RegExp(claim.id) })
     expect(within(remedyDialog).getByRole('radio', {
-      name: /open terminal replacement fallback in payments/i,
+      name: /open capped terminal replacement fallback in payments/i,
     })).toBeChecked()
-    expect(remedyDialog).toHaveTextContent(/selected payment’s exact full remaining balance/i)
+    expect(remedyDialog).toHaveTextContent(
+      /smaller of required settlement rm\s*112\.00 and the selected payment’s remaining balance/i,
+    )
     await user.click(within(remedyDialog).getByRole('button', { name: /open exact payment/i }))
 
     const paymentRecord = screen.getByText('pay-failed', { selector: 'summary b' }).closest('details')!
@@ -1538,7 +1907,7 @@ describe('app components', () => {
     })
     await user.click(fallback)
     const fallbackDialog = screen.getByRole('dialog', {
-      name: new RegExp(`terminal replacement fallback of rm\\s*102\\.00 for claim ${claim.id}`, 'i'),
+      name: new RegExp(`capped terminal replacement fallback of rm\\s*102\\.00 for claim ${claim.id}`, 'i'),
     })
     expect(fallbackDialog).toHaveTextContent(claim.id)
     expect(fallbackDialog).toHaveTextContent('pay-failed')
@@ -1546,8 +1915,11 @@ describe('app components', () => {
     expect(fallbackDialog).toHaveTextContent(/remaining payment balancerm\s*102\.00/i)
     expect(fallbackDialog).toHaveTextContent(/settlement policyterminal replacement fallback/i)
     expect(fallbackDialog).toHaveTextContent(/amount to refundrm\s*102\.00/i)
+    expect(fallbackDialog).toHaveTextContent(
+      /smaller of the required claim settlement and the remaining payment balance: rm\s*102\.00/i,
+    )
     await user.click(within(fallbackDialog).getByRole('button', {
-      name: /confirm terminal fallback & audit/i,
+      name: /confirm capped terminal fallback & audit/i,
     }))
 
     const snapshot = services.repository.getSnapshot()
@@ -1626,7 +1998,7 @@ describe('app components', () => {
       .find((entry) => entry.id === 'pay-processing')!
     services.payments.refund(
       payment.id,
-      payment.amountSen - payment.refundedSen,
+      claim.requiredSettlementSen,
       'Confirmed grouped-scope terminal fallback',
       'req-grouped-scope-terminal-fallback',
       claim.id,
@@ -1734,7 +2106,8 @@ describe('app components', () => {
     expect(within(paymentRecord).getByRole('button', { name: /mark disputed/i })).toBeVisible()
   })
 
-  it('renders migrated legacy under-settled evidence without claiming remedy completion', () => {
+  it('renders migrated legacy under-settled evidence without claiming remedy completion', async () => {
+    const user = userEvent.setup()
     const sourceServices = new AppServices(new MemoryStorage(), () => FIXED_NOW)
     makeProcessingOrderSingleGroupedPhysicalShipment(sourceServices)
     sourceServices.auth.oneClick('customer')
@@ -1801,14 +2174,86 @@ describe('app components', () => {
     expect(legacyEvidence).toHaveTextContent(/does not complete this delivery\/remedy scope/i)
     expect(legacyEvidence).toHaveTextContent(/no valid completion settlement policy/i)
     expect(screen.queryByText(/audited refund complete/i)).not.toBeInTheDocument()
+    expect(screen.queryByText('Refund Linked', { exact: true })).not.toBeInTheDocument()
+    expect(screen.queryByText(/waiting for final claim audit|final claim audit pending/i))
+      .not.toBeInTheDocument()
+    const orderTruth = screen.getByText(
+      'Legacy refund record is read-only and incomplete',
+    ).closest('.notice')!
+    expect(orderTruth).toHaveTextContent(/immutable under-settled evidence/i)
+    expect(orderTruth).toHaveTextContent(/does not complete the remedy scope/i)
+    expect(orderTruth).toHaveTextContent(/no final audit is available/i)
     expect(screen.getByText(/0 of 2 box fulfilment scopes complete/i)).toBeVisible()
 
     cleanup()
+    window.history.replaceState({}, '', '#/account')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+    const accountOrder = screen.getByRole('heading', {
+      level: 3,
+      name: 'ORD-PROCESSING',
+    }).closest('article')!
+    expect(within(accountOrder).queryByText('Refund Linked', { exact: true }))
+      .not.toBeInTheDocument()
+    expect(within(accountOrder).queryByText(
+      /waiting for final claim audit|final claim audit pending/i,
+    )).not.toBeInTheDocument()
+    const accountTruth = within(accountOrder).getByText(
+      'Legacy refund record is read-only and incomplete',
+    ).closest('.notice')!
+    expect(accountTruth).toHaveTextContent(/immutable under-settled evidence/i)
+    expect(accountTruth).toHaveTextContent(/accepted rm\s*10\.00.+required rm\s*106\.00/i)
+    expect(accountTruth).toHaveTextContent(/does not complete the remedy scope/i)
+    expect(accountTruth).toHaveTextContent(/no final audit is available/i)
+
+    cleanup()
     services.auth.oneClick('admin')
+    window.history.replaceState({}, '', '#/admin/payments?order=ord-processing')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+    const paymentRecord = screen
+      .getByText('pay-processing', { selector: 'summary b' })
+      .closest('details')!
+    await user.click(paymentRecord.querySelector('summary')!)
+    expect(within(paymentRecord).getByRole('button', {
+      name: /unlinked refund remaining rm\s*202\.00/i,
+    })).toBeVisible()
+    expect(within(paymentRecord).queryByText(
+      'Full payment refund is coordinated through claim remedies',
+    )).not.toBeInTheDocument()
+
+    cleanup()
+    window.history.replaceState({}, '', '#/admin/orders')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+    const adminOrder = screen
+      .getByText('ORD-PROCESSING', { selector: 'summary b' })
+      .closest('details')!
+    await user.click(adminOrder.querySelector('summary')!)
+    expect(within(adminOrder).getByText(
+      'Legacy under-settled · scope incomplete',
+    )).toBeVisible()
+    expect(within(adminOrder).queryByText('Refund Linked', { exact: true }))
+      .not.toBeInTheDocument()
+
+    cleanup()
+    services.auth.oneClick('admin')
+    services.payments.refund(
+      'pay-processing',
+      20_200,
+      'Confirmed later full refund without rewriting immutable legacy evidence',
+      'req-legacy-ui-later-full-refund',
+    )
+    expect(services.repository.getSnapshot().orders
+      .find((entry) => entry.id === claim.orderId)?.status).toBe('refunded')
     window.history.replaceState({}, '', `#/admin/claims?claim=${encodeURIComponent(claim.id)}`)
     render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
     const legacyRecord = screen.getByText(claim.id, { selector: 'summary b' }).closest('details')!
     expect(legacyRecord).toHaveTextContent(/approved legacy claim · immutable evidence cannot finalize/i)
+    expect(legacyRecord).toHaveTextContent(/no final audit is available/i)
+    expect(within(legacyRecord).queryByText(
+      'Financial hold limits typed remedy work',
+    )).not.toBeInTheDocument()
+    expect(legacyRecord).not.toHaveTextContent(
+      /existing linked refund may still be finalized|linked-refund final audit remains available|final claims audit still required/i,
+    )
     expect(within(legacyRecord).queryByRole('button', { name: /record typed remedy/i })).not.toBeInTheDocument()
     expect(within(legacyRecord).queryByRole('radio', { name: /finalize exact audited refund link/i })).not.toBeInTheDocument()
   })

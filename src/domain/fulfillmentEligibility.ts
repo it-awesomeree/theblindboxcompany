@@ -38,6 +38,7 @@ export function shipmentStatusActionEligibility(
     const carrierEvidenceAllowed =
       ['refunded', 'disputed'].includes(orderStatus) &&
       shipment.kind !== 'DIGITAL' &&
+      shipment.purpose === 'original' &&
       Boolean(FINANCIAL_HOLD_CARRIER_EDGES[shipment.status]?.includes(next))
     return carrierEvidenceAllowed
       ? {
@@ -47,7 +48,7 @@ export function shipmentStatusActionEligibility(
         }
       : {
           eligible: false,
-          reason: `Financial hold: the ${orderStatus} order can only record a graph-legal physical carrier evidence step for an already-shipped delivery; tracking, restarts, fulfilment progress, and financial state remain locked.`,
+          reason: `Financial hold: the ${orderStatus} order can only record a graph-legal physical carrier evidence step for an original shipment already in carrier transit; replacement shipments, tracking, restarts, fulfilment progress, and financial state remain locked until the hold is explicitly cleared.`,
           code: 'FINANCIAL_HOLD',
         }
   }

@@ -14,8 +14,11 @@ import {
 import { paymentRetryEligibility } from '../../domain/paymentEligibility'
 import { resolveOrderFulfillment } from '../../domain/orderFulfillment'
 import {
+  claimBlocksFullPaymentRefund,
+  findRemedyScopeConflict,
   isTerminalReplacementRefundFallback,
   remainingPaymentBalance,
+  terminalReplacementFallbackAmount,
 } from '../../domain/remedyPolicy'
 import { prizeForBox, publishedPrizesFor } from '../../domain/selectors'
 import type {
@@ -121,6 +124,16 @@ function deriveClaimRefundUiPolicy(
       remainingSen,
     }
   }
+  const conflict = findRemedyScopeConflict(state.claims, claim)
+  if (conflict) {
+    return {
+      amountSen: 0,
+      eligible: false,
+      exactMatch,
+      reason: `Claim ${claim.id} cannot use a linked refund because claim ${conflict.holderClaimId} holds overlapping remedy entitlement for boxes ${conflict.remedyBoxIds.join(', ')}.`,
+      remainingSen,
+    }
+  }
 
   const replacement = exactReplacementForClaim(state, claim)
   const terminalFallback = isTerminalReplacementRefundFallback(replacement)
@@ -151,7 +164,12 @@ function deriveClaimRefundUiPolicy(
     ? 'terminal_replacement_fallback'
     : 'exact_scope'
   const amountSen = terminalFallback
-    ? remainingSen
+    ? remainingSen > 0
+      ? terminalReplacementFallbackAmount(
+          claim.requiredSettlementSen,
+          remainingSen,
+        )
+      : 0
     : claim.requiredSettlementSen
   if (!['succeeded', 'partially_refunded'].includes(payment.status)) {
     return {
@@ -189,7 +207,7 @@ function deriveClaimRefundUiPolicy(
     exactMatch,
     policy,
     reason: terminalFallback
-      ? `Terminal replacement fallback will refund payment ${payment.id}'s exact full remaining balance.`
+      ? `Capped terminal replacement fallback will refund ${formatMYR(amountSen)}, the smaller of claim ${claim.id}'s required settlement and payment ${payment.id}'s remaining balance.`
       : `Exact claim-scope settlement is available on payment ${payment.id}.`,
     remainingSen,
   }
@@ -513,7 +531,14 @@ export function AdminOrdersPage() {
                     )
                   })}
                 </div>
-                {claims.map((claim) => <p key={claim.id}><b>{titleCase(claim.kind)} claim · {claim.id}</b><br /><StatusBadge value={claim.status} /> · <StatusBadge value={claim.remedyState} /></p>)}
+                {claims.map((claim) => (
+                  <p key={claim.id}>
+                    <b>{titleCase(claim.kind)} claim · {claim.id}</b><br />
+                    <StatusBadge value={claim.status} /> · {claim.legacyUnderSettledRefund
+                      ? <span className="table-readonly">Legacy under-settled · scope incomplete</span>
+                      : <StatusBadge value={claim.remedyState} />}
+                  </p>
+                ))}
               </section>
             </div>
             {canMutateOrders && (
@@ -568,6 +593,9 @@ export function AdminPaymentsPage() {
   const selectedClaimOrder = selectedClaim
     ? state.orders.find((order) => order.id === selectedClaim.orderId)
     : undefined
+  const selectedClaimConflict = selectedClaim
+    ? findRemedyScopeConflict(state.claims, selectedClaim)
+    : undefined
   const claimSelectionError = claimWorkflowActive
     ? !claimFilter
       ? 'The claim workflow filter is empty.'
@@ -612,7 +640,7 @@ export function AdminPaymentsPage() {
       ? `Confirm remaining refund of ${formatMYR(pendingAmountSen)}?`
       : pending?.kind === 'claim_refund'
         ? pendingClaimRefundPolicy?.policy === 'terminal_replacement_fallback'
-          ? `Terminal replacement fallback of ${formatMYR(pendingAmountSen)} for claim ${pending.claimId}?`
+          ? `Capped terminal replacement fallback of ${formatMYR(pendingAmountSen)} for claim ${pending.claimId}?`
           : `Exact claim-scope settlement of ${formatMYR(pendingAmountSen)} for claim ${pending.claimId}?`
       : `Confirm ${pending?.kind ?? ''} payment action?`
   const perform = () => {
@@ -738,12 +766,16 @@ export function AdminPaymentsPage() {
     {selectedClaim && !claimSelectionError && (
       <Notice>
         Exact claim <b>{selectedClaim.id}</b> is approved for order <b>{selectedClaim.orderId}</b>.
-        {' '}{isTerminalReplacementRefundFallback(exactReplacementForClaim(state, selectedClaim))
-          ? <>Its terminal replacement fallback uses the selected payment&apos;s exact full remaining balance.</>
-          : selectedClaim.replacementShipmentId
-            ? <>Its replacement is not terminal-fallback eligible. The matching payment stays read only.</>
-            : <>Its exact claim-scope settlement is <b>{formatMYR(selectedClaim.requiredSettlementSen)}</b> for remedy box{selectedClaim.remedyBoxIds.length === 1 ? '' : 'es'} <b className="breakable-id">{selectedClaim.remedyBoxIds.join(', ')}</b>.</>}
-        {' '}Claims must be finalized separately after an accepted audited event is recorded.
+        {' '}{selectedClaimConflict
+          ? <>Linked settlement is blocked because <Link className="table-action table-link breakable-id" to={`/admin/claims?claim=${encodeURIComponent(selectedClaimConflict.holderClaimId)}`}>claim {selectedClaimConflict.holderClaimId}</Link> holds overlapping remedy entitlement for boxes <b className="breakable-id">{selectedClaimConflict.remedyBoxIds.join(', ')}</b>.</>
+          : isTerminalReplacementRefundFallback(exactReplacementForClaim(state, selectedClaim))
+            ? <>Its terminal replacement fallback is capped at the smaller of required settlement <b>{formatMYR(selectedClaim.requiredSettlementSen)}</b> and the selected payment&apos;s remaining balance.</>
+            : selectedClaim.replacementShipmentId
+              ? <>Its replacement is not terminal-fallback eligible. The matching payment stays read only.</>
+              : <>Its exact claim-scope settlement is <b>{formatMYR(selectedClaim.requiredSettlementSen)}</b> for remedy box{selectedClaim.remedyBoxIds.length === 1 ? '' : 'es'} <b className="breakable-id">{selectedClaim.remedyBoxIds.join(', ')}</b>.</>}
+        {' '}{selectedClaimConflict
+          ? <>Return to Claims to close this selected claim explicitly with no remedy.</>
+          : <>Claims must be finalized separately after an accepted audited event is recorded.</>}
         {' '}Unrelated payment actions are hidden; leave or clear this claim workflow to use them.
         {' '}<button className="table-action" type="button" onClick={clearClaimWorkflow}>Clear claim workflow</button>
         {' '}<Link className="table-action table-link" to={`/admin/claims?claim=${encodeURIComponent(selectedClaim.id)}`}>Back to claim</Link>
@@ -774,6 +806,9 @@ export function AdminPaymentsPage() {
         const linkedRefundPolicy = selectedClaim && !claimSelectionError
           ? deriveClaimRefundUiPolicy(state, selectedClaim, payment)
           : undefined
+        const fullRefundBlocker = state.claims.find((claim) =>
+          claim.orderId === payment.orderId &&
+          claimBlocksFullPaymentRefund(claim))
         const linkedClaimIds = [...new Set(payment.events
           .map((event) => event.refundIntent?.claimId)
           .filter((claimId) => claimId !== undefined))]
@@ -794,11 +829,20 @@ export function AdminPaymentsPage() {
               <small>Remaining payment balance: {formatMYR(linkedRefundPolicy.remainingSen)}</small>
             </div>
           )}
+          {!claimWorkflowActive && fullRefundBlocker && (
+            <div className="notice notice-info">
+              <b>Full payment refund is coordinated through claim remedies</b>
+              <p>
+                <Link className="table-action table-link breakable-id" to={`/admin/claims?claim=${encodeURIComponent(fullRefundBlocker.id)}`}>Claim {fullRefundBlocker.id}</Link>
+                {' '}blocks a generic full refund for this payment. Use the claim remedy workflow for any full settlement. Eligible RM10 partial goodwill and dispute marking remain separate.
+              </p>
+            </div>
+          )}
           <div className="record-actions">
             {linkedRefundPolicy?.eligible && selectedClaim && (
               <button className="button" type="button" onClick={() => openAction({ kind: 'claim_refund', id: payment.id, claimId: selectedClaim.id })}>
                 {linkedRefundPolicy.policy === 'terminal_replacement_fallback'
-                  ? `Linked claim ${selectedClaim.id}: terminal replacement fallback ${formatMYR(linkedRefundPolicy.amountSen)}`
+                  ? `Linked claim ${selectedClaim.id}: capped terminal replacement fallback ${formatMYR(linkedRefundPolicy.amountSen)}`
                   : `Linked claim ${selectedClaim.id}: exact claim-scope settlement ${formatMYR(linkedRefundPolicy.amountSen)}`}
               </button>
             )}
@@ -806,10 +850,10 @@ export function AdminPaymentsPage() {
               {canRetry && <button className="button button-ghost" type="button" onClick={() => openAction({ kind: 'retry', id: payment.id })}>Retry attempt</button>}
               {['pending', 'processing'].includes(payment.status) && <button className="button" type="button" onClick={() => openAction({ kind: 'reconcile', id: payment.id })}>Reconcile succeeded</button>}
               {['succeeded', 'partially_refunded'].includes(payment.status) && remainingSen > 1000 && <button className="button button-ghost" type="button" onClick={() => openAction({ kind: 'partial', id: payment.id })}>Unlinked partial refund RM10</button>}
-              {['succeeded', 'partially_refunded'].includes(payment.status) && remainingSen > 0 && <button className="button button-danger" type="button" onClick={() => openAction({ kind: 'full', id: payment.id })}>Unlinked refund remaining {formatMYR(remainingSen)}</button>}
+              {!fullRefundBlocker && ['succeeded', 'partially_refunded'].includes(payment.status) && remainingSen > 0 && <button className="button button-danger" type="button" onClick={() => openAction({ kind: 'full', id: payment.id })}>Unlinked refund remaining {formatMYR(remainingSen)}</button>}
               {['succeeded', 'partially_refunded'].includes(payment.status) && <button className="button button-danger" type="button" onClick={() => openAction({ kind: 'dispute', id: payment.id })}>Mark disputed</button>}
               {payment.status === 'disputed' && <button className="button" type="button" onClick={() => openAction({ kind: 'merchant_won', id: payment.id })}>Resolve: merchant won</button>}
-              {payment.status === 'disputed' && <button className="button button-danger" type="button" onClick={() => openAction({ kind: 'dispute_refund', id: payment.id })}>Resolve: full refund</button>}
+              {payment.status === 'disputed' && !fullRefundBlocker && <button className="button button-danger" type="button" onClick={() => openAction({ kind: 'dispute_refund', id: payment.id })}>Resolve: full refund</button>}
             </>}
           </div>
           <div className="event-list">{payment.events.map((event) => <div key={event.id}><StatusBadge value={event.type} /><span><b>{event.id}</b><small>{event.source} · {formatDateTime(event.processedAt)}{event.ignoredReason ? ` · ${event.ignoredReason}` : ''}</small>{event.refundIntent?.claimId && <Link className="table-action table-link breakable-id" to={`/admin/claims?claim=${encodeURIComponent(event.refundIntent.claimId)}`}>Linked claim {event.refundIntent.claimId} · Back to claim</Link>}</span></div>)}</div>
@@ -822,7 +866,7 @@ export function AdminPaymentsPage() {
       title={pendingTitle}
       confirmLabel={pending?.kind === 'claim_refund'
         ? pendingClaimRefundPolicy?.policy === 'terminal_replacement_fallback'
-          ? 'Confirm terminal fallback & audit'
+          ? 'Confirm capped terminal fallback & audit'
           : 'Confirm exact settlement & audit'
         : 'Confirm and audit'}
       danger={['full', 'claim_refund', 'dispute', 'dispute_refund'].includes(pending?.kind ?? '')}
@@ -846,7 +890,7 @@ export function AdminPaymentsPage() {
                   <div><dt>Amount to refund</dt><dd><b>{formatMYR(pendingClaimRefundPolicy.amountSen)}</b></dd></div>
                 </dl>
                 <p>{pendingClaimRefundPolicy.policy === 'terminal_replacement_fallback'
-                  ? 'This terminal replacement fallback refunds the selected payment’s exact full remaining balance.'
+                  ? `This capped terminal replacement fallback uses the smaller of the required claim settlement and the remaining payment balance: ${formatMYR(pendingClaimRefundPolicy.amountSen)}.`
                   : 'This is the exact claim-scope settlement. It may leave a separate remaining balance on the payment.'} Claims still requires a separate final audit action.</p>
               </>
             )
@@ -1198,6 +1242,13 @@ function AdminClaimsContent() {
   }
   const replacementForClaim = (claim: Claim) =>
     exactReplacementForClaim(state, claim)
+  const claimOrderOnFinancialHold = (claim: Claim) => {
+    const order = state.orders.find((entry) => entry.id === claim.orderId)
+    return Boolean(
+      order &&
+      ['cancelled', 'refunded', 'disputed'].includes(order.status),
+    )
+  }
 
   const remedyOptions = (claim: Claim): Array<{ value: ClaimRemedyAction; label: string }> => {
     if (claim.status !== 'approved') return []
@@ -1206,6 +1257,11 @@ function AdminClaimsContent() {
     const replacement = replacementForClaim(claim)
     if (claim.remedyState === 'refund_linked' && claim.linkedRefundEventId) {
       return [{ value: 'finalize_refund', label: 'Finalize exact audited refund link' }]
+    }
+    if (claimOrderOnFinancialHold(claim)) {
+      return claim.remedyState === 'none'
+        ? [{ value: 'no_remedy', label: 'Close explicitly with no remedy' }]
+        : []
     }
     if (claim.remedyState === 'rma_created') {
       return [{ value: 'rma_received', label: 'Record RMA received' }]
@@ -1218,10 +1274,16 @@ function AdminClaimsContent() {
       isTerminalReplacementRefundFallback(replacement)
     ) {
       return canOpenPayments
-        ? [{ value: 'refund', label: 'Open terminal replacement fallback in Payments' }]
+        ? [{ value: 'refund', label: 'Open capped terminal replacement fallback in Payments' }]
         : []
     }
     if (!['none', 'rma_inspected'].includes(claim.remedyState)) return []
+    const conflict = findRemedyScopeConflict(state.claims, claim)
+    if (conflict) {
+      return claim.remedyState === 'none'
+        ? [{ value: 'no_remedy', label: 'Close explicitly with no remedy' }]
+        : []
+    }
     const options: Array<{ value: ClaimRemedyAction; label: string }> = []
     const deliveredBeforeClaim = original?.kind !== 'DIGITAL' &&
       original?.timeline.some((entry) =>
@@ -1324,6 +1386,9 @@ function AdminClaimsContent() {
         const replacement = replacementForClaim(claim)
         const terminalFallbackEligible =
           isTerminalReplacementRefundFallback(replacement)
+        const entitlementConflict = findRemedyScopeConflict(state.claims, claim)
+        const claimOrder = state.orders.find((entry) => entry.id === claim.orderId)
+        const orderFinancialHold = claimOrderOnFinancialHold(claim)
         const options = remedyOptions(claim)
         return (
         <details
@@ -1362,7 +1427,7 @@ function AdminClaimsContent() {
               <dt>Terminal fallback</dt>
               <dd>{replacement
                 ? terminalFallbackEligible
-                  ? `Available · ${shipmentWorkLabel(replacement)} is ${titleCase(replacement.status)}`
+                  ? `Available · capped at the smaller of required settlement ${formatMYR(claim.requiredSettlementSen)} and one selected payment's remaining balance · ${shipmentWorkLabel(replacement)} is ${titleCase(replacement.status)}`
                   : replacement.kind === 'DIGITAL'
                     ? `Unavailable while digital reissue is ${titleCase(replacement.status)}; only Failed is eligible`
                     : `Unavailable while physical replacement is ${titleCase(replacement.status)}; only Lost or Returned is eligible`
@@ -1375,14 +1440,48 @@ function AdminClaimsContent() {
             {['submitted', 'reviewing'].includes(claim.status) && <button className="button button-danger" type="button" onClick={() => openReview(claim.id, 'reject')}>Reject</button>}
             {options.length > 0 && <button className="button" type="button" onClick={() => openRemedy(claim)}>Record typed remedy</button>}
           </div>
+          {claim.status === 'approved' && claim.remedyState === 'none' && entitlementConflict && (
+            <div className="notice notice-info">
+              <b>
+                Overlapping remedy entitlement is held by{' '}
+                <Link className="table-action table-link breakable-id" to={`/admin/claims?claim=${encodeURIComponent(entitlementConflict.holderClaimId)}`}>claim {entitlementConflict.holderClaimId}</Link>
+              </b>
+              <p>Overlapping remedy boxes: <span className="breakable-id">{entitlementConflict.remedyBoxIds.join(', ')}</span>. This claim cannot start a second RMA, refund, or replacement; only explicit no-remedy closure remains. The holder claim can continue its own remedy.</p>
+            </div>
+          )}
+          {claim.status === 'approved' && orderFinancialHold && !claim.legacyUnderSettledRefund && (
+            <div className="notice notice-info">
+              <b>Financial hold limits typed remedy work</b>
+              <p>
+                Order <span className="breakable-id">{claim.orderId}</span> is {claimOrder?.status}.{' '}
+                {claim.remedyState === 'refund_linked'
+                  ? 'The existing linked refund may still be finalized through its exact final audit, but no RMA or replacement work can start.'
+                  : claim.remedyState === 'none'
+                    ? 'This approved claim may only close explicitly with no remedy while the hold remains.'
+                    : 'Existing RMA or replacement evidence remains read-only until the financial hold is explicitly cleared.'}
+              </p>
+            </div>
+          )}
           {claim.status === 'approved' && (
             <div className="notice notice-info">
               <b>{claim.legacyUnderSettledRefund
                 ? 'Approved legacy claim · immutable evidence cannot finalize'
-                : 'Approved claim · typed remedy remains open'}</b>
+                : entitlementConflict && claim.remedyState === 'none'
+                  ? 'Approved claim · only explicit no-remedy closure remains'
+                  : orderFinancialHold
+                    ? claim.remedyState === 'refund_linked'
+                      ? 'Approved claim · linked-refund final audit remains available'
+                      : 'Approved claim · financial hold limits typed remedies'
+                    : 'Approved claim · typed remedy remains open'}</b>
               <p>Exact scope: <span className="breakable-id">{claimScopeLabel(claim)}</span>. {claim.legacyUnderSettledRefund
-                ? 'The under-settled refund record is evidence only. It cannot complete this scope, and no typed finalize action is available.'
-                : 'Approval does not refund automatically. RMA evidence and replacement authorization do not resolve this claim. A replacement resolves only when its shipment is delivered; a refund requires a separate accepted event and final claim audit.'}</p>
+                ? 'The under-settled refund record is evidence only. It cannot complete this scope, and no final audit is available.'
+                : entitlementConflict && claim.remedyState === 'none'
+                  ? 'Another claim already owns the overlapping remedy entitlement. Approval does not create a second remedy.'
+                  : orderFinancialHold
+                    ? claim.remedyState === 'refund_linked'
+                      ? 'The existing linked refund can still complete through its exact audited event; the financial hold blocks starting RMA or replacement work.'
+                      : 'This order cannot start or advance typed RMA or replacement work while its financial hold remains.'
+                    : 'Approval does not refund automatically. RMA evidence and replacement authorization do not resolve this claim. A replacement resolves only when its shipment is delivered; a refund requires a separate accepted event and final claim audit.'}</p>
               {!canOpenPayments && claim.remedyState !== 'refund_linked' && <span className="table-readonly">Payments is restricted to finance, admin and super admin.</span>}
             </div>
           )}
@@ -1411,11 +1510,11 @@ function AdminClaimsContent() {
               <b>{shipmentWorkLabel(replacement)} · {replacement.status === 'delivered'
                 ? 'delivered and final'
                 : terminalFallbackEligible
-                  ? 'terminal replacement fallback available'
+                  ? 'capped terminal replacement fallback available'
                   : 'replacement in progress · refund fallback unavailable'}</b>
               <p className="breakable-id">{replacement.id} · original {original?.id}</p>
               {terminalFallbackEligible
-                ? <p>Payments may now record a terminal replacement fallback using one exact payment&apos;s full remaining balance. The claim still needs a separate final audit.</p>
+                ? <p>Payments may now record a capped terminal replacement fallback using the smaller of required settlement <b>{formatMYR(claim.requiredSettlementSen)}</b> and one selected payment&apos;s remaining balance. The claim still needs a separate final audit.</p>
                 : <p>{replacement.kind === 'DIGITAL'
                   ? 'Digital fallback becomes available only if this exact reissue fails.'
                   : 'Physical fallback becomes available only if this exact replacement is lost or returned. Failed delivery is not eligible.'}</p>}
@@ -1441,7 +1540,11 @@ function AdminClaimsContent() {
       open={Boolean(pending)}
       title={pending?.kind === 'review'
         ? `${titleCase(pending.action)} exact claim ${pending.id}?`
-        : `Record typed remedy for exact claim ${pendingClaim?.id}?`}
+        : pendingClaim &&
+            remedyAction === 'refund' &&
+            isTerminalReplacementRefundFallback(replacementForClaim(pendingClaim))
+          ? `Record capped terminal replacement fallback for exact claim ${pendingClaim.id}?`
+          : `Record typed remedy for exact claim ${pendingClaim?.id}?`}
       confirmLabel={pending?.kind === 'review' ? 'Confirm note & audit' : remedyAction === 'refund' ? 'Open exact payment' : 'Confirm typed evidence'}
       danger={(pending?.kind === 'review' && pending.action === 'reject') || remedyAction === 'no_remedy'}
       error={dialogError}
@@ -1476,7 +1579,7 @@ function AdminClaimsContent() {
           {remedyAction === 'finalize_refund' && <p>Finalization must use exact linked event <b className="breakable-id">{pendingClaim?.linkedRefundEventId}</b>.</p>}
           {remedyAction === 'refund' && (
             <p>{pendingClaim && isTerminalReplacementRefundFallback(replacementForClaim(pendingClaim))
-              ? 'Payments will offer the terminal replacement fallback using the selected payment’s exact full remaining balance.'
+              ? `Payments will offer a capped terminal replacement fallback using the smaller of required settlement ${formatMYR(pendingClaim.requiredSettlementSen)} and the selected payment’s remaining balance.`
               : `Payments will offer the exact required settlement of ${formatMYR(pendingClaim?.requiredSettlementSen ?? 0)} for remedy box${pendingClaim?.remedyBoxIds.length === 1 ? '' : 'es'} ${pendingClaim?.remedyBoxIds.join(', ')}.`} Returning here for a separate final audit is still required.</p>
           )}
         </>

@@ -21,7 +21,9 @@ export function OrderPage() {
   const shipments = state.shipments.filter((entry) => entry.orderId === order.id)
   const latestPayment = payments.at(-1)
   const claims = state.claims.filter((entry) => order.claimIds.includes(entry.id))
-  const refundAwaitingFinalAudit = claims.some((claim) => claim.remedyState === 'refund_linked')
+  const refundAwaitingFinalAudit = claims.some((claim) =>
+    claim.remedyState === 'refund_linked' &&
+    claim.legacyUnderSettledRefund !== true)
   const everyBoxRevealed =
     boxes.length === order.boxIds.length &&
     boxes.length > 0 &&
@@ -110,10 +112,19 @@ export function OrderPage() {
                     <div><span>{claim.id}</span><h3>{claim.kind.replaceAll('_', ' ')}</h3></div>
                     <div className="status-pair">
                       <StatusBadge value={claim.status} />
-                      {everyBoxRevealed && claim.remedyState !== 'none' && <StatusBadge value={claim.remedyState} />}
+                      {everyBoxRevealed &&
+                        claim.remedyState !== 'none' &&
+                        claim.legacyUnderSettledRefund !== true &&
+                        <StatusBadge value={claim.remedyState} />}
                     </div>
                   </div>
                   <p>{claim.note}</p>
+                  {everyBoxRevealed && claim.legacyUnderSettledRefund && (
+                    <div className="notice notice-info">
+                      <b>Legacy refund record is read-only and incomplete</b>
+                      <p>Immutable under-settled evidence accepted <b>{formatMYR(claim.acceptedSettlementSen ?? 0)}</b> against required <b>{formatMYR(claim.requiredSettlementSen)}</b>. It does not complete the remedy scope, and no final audit is available.</p>
+                    </div>
+                  )}
                   {everyBoxRevealed && (
                     <small className="breakable-id">
                       Linked record: {claim.shipmentCandidateIds?.join(', ') ?? claim.shipmentId ?? claim.boxId ?? order.id}

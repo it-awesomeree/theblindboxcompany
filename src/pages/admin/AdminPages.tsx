@@ -1,7 +1,7 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { PropsWithChildren } from 'react'
 import { Link, NavLink, Navigate } from '../../lib/router'
-import { useLocation, useSearchParams } from '../../lib/router-core'
+import { useLocation, useNavigate, useSearchParams } from '../../lib/router-core'
 import { ConfirmDialog } from '../../components/ConfirmDialog'
 import { Notice } from '../../components/Notice'
 import { StatusBadge } from '../../components/StatusBadge'
@@ -12,13 +12,34 @@ import {
   shipmentTrackingActionEligibility,
 } from '../../domain/fulfillmentEligibility'
 import { paymentRetryEligibility } from '../../domain/paymentEligibility'
+import { resolveOrderFulfillment } from '../../domain/orderFulfillment'
 import { prizeForBox, publishedPrizesFor } from '../../domain/selectors'
-import type { ClaimResolutionOutcome, ShipmentStatus } from '../../domain/types'
+import type { Claim, Shipment, ShipmentStatus } from '../../domain/types'
 import type { ClaimReviewAction } from '../../services/ClaimService'
 import { formatDateTime, formatMYR, titleCase } from '../../lib/format'
 import { useAppState } from '../../state/AppStateContext'
 
 type ActionNotice = { text: string; tone: 'info' | 'success' | 'danger' } | null
+
+function actionError(caught: unknown, fallback: string) {
+  return caught instanceof Error ? caught.message : fallback
+}
+
+function claimScopeLabel(claim: Claim) {
+  if (claim.shipmentCandidateIds?.length) {
+    return `Order-level candidates: ${claim.shipmentCandidateIds.join(', ')}`
+  }
+  if (claim.shipmentId) return `original shipment ${claim.shipmentId}`
+  if (claim.boxId) return `box ${claim.boxId}`
+  return `order ${claim.orderId}`
+}
+
+function shipmentWorkLabel(shipment: Shipment) {
+  if (shipment.kind === 'DIGITAL') {
+    return shipment.purpose === 'replacement' ? 'Digital reissue' : 'Digital delivery'
+  }
+  return shipment.purpose === 'replacement' ? 'Replacement shipment' : 'Original shipment'
+}
 
 function Allowed({ section, children }: { section: AdminSection; children: React.ReactNode }) {
   const { services } = useAppState()
@@ -104,7 +125,7 @@ function AdminDashboardContent() {
             <Link to="/admin/orders"><span>ORD</span><b>Inspect orders</b><small>Payment, boxes, address, claims</small></Link>
             <Link to="/admin/payments"><span>PAY</span><b>Reconcile payments</b><small>Events, retries, refunds</small></Link>
             <Link to="/admin/fulfilment"><span>FUL</span><b>Move shipments</b><small>Pack, label, ship, exception</small></Link>
-            <Link to="/admin/claims"><span>CLM</span><b>Review claims</b><small>Acknowledge, approve, reject, resolve</small></Link>
+            <Link to="/admin/claims"><span>CLM</span><b>Review claims</b><small>Acknowledge, approve, reject, typed remedy</small></Link>
             <Link to="/admin/audit"><span>AUD</span><b>Read audit</b><small>Append-only before and after</small></Link>
           </div>
         </section>
@@ -196,6 +217,7 @@ export function AdminOrdersPage() {
   const [query, setQuery] = useState('')
   const [pending, setPending] = useState<OrderAction>(null)
   const [notice, setNotice] = useState<ActionNotice>(null)
+  const [dialogError, setDialogError] = useState<string | null>(null)
   const userFilter = searchParams.get('user') ?? 'all'
   const selectedUser = state.users.find((user) => user.id === userFilter)
   const actor = state.users.find((entry) => entry.id === state.sessionUserId)
@@ -235,6 +257,7 @@ export function AdminOrdersPage() {
   const perform = () => {
     if (!pending) return
     setNotice(null)
+    setDialogError(null)
     try {
       if (pending.kind === 'cancel') {
         services.admin.changeOrderStatus(
@@ -251,13 +274,14 @@ export function AdminOrdersPage() {
         )
         setNotice({ text: 'Fulfilled order closed and audit evidence saved.', tone: 'success' })
       }
+      setPending(null)
     } catch (caught) {
-      setNotice({ text: caught instanceof Error ? caught.message : 'Order action was blocked.', tone: 'danger' })
+      setDialogError(actionError(caught, 'Order action was blocked.'))
     }
-    setPending(null)
   }
   const openAction = (action: NonNullable<OrderAction>) => {
     setNotice(null)
+    setDialogError(null)
     setPending(action)
   }
   return <Allowed section="orders"><>
@@ -282,6 +306,8 @@ export function AdminOrdersPage() {
         const boxes = state.boxes.filter((entry) => order.boxIds.includes(entry.id))
         const shipments = state.shipments.filter((entry) => entry.orderId === order.id)
         const claims = state.claims.filter((entry) => order.claimIds.includes(entry.id))
+        const fulfilment = resolveOrderFulfillment(state, order)
+        const completedScopes = fulfilment.scopes.filter((scope) => scope.status === 'fulfilled').length
         return (
           <details className="admin-record" key={order.id}>
             <summary><span><b>{order.id.toUpperCase()}</b><small>{user?.name} · {formatDateTime(order.createdAt)}</small></span><span>{formatMYR(order.snapshot.totals.totalSen)}</span><StatusBadge value={order.status} /></summary>
@@ -289,7 +315,39 @@ export function AdminOrdersPage() {
               <section><h3>Snapshot</h3><dl className="detail-list compact"><div><dt>Items</dt><dd>{order.snapshot.quantity} × {formatMYR(order.snapshot.unitPriceSen)}</dd></div><div><dt>Shipping</dt><dd>{order.snapshot.shippingMethod} · {formatMYR(order.snapshot.totals.shippingSen)}</dd></div><div><dt>Address</dt><dd>{order.snapshot.address.recipient}<br />{order.snapshot.address.line1}<br />{order.snapshot.address.postcode} {order.snapshot.address.city}</dd></div><div><dt>Policies</dt><dd>{order.snapshot.oddsVersion}<br />{order.snapshot.policyVersion}</dd></div></dl></section>
               <section><h3>Payment</h3>{payments.map((payment) => <p key={payment.id}><b>{payment.id}</b><br /><StatusBadge value={payment.status} /> · attempt {payment.attempt}</p>)}</section>
               <section><h3>Boxes / prize</h3>{boxes.map((box) => { const prize = prizeForBox(state, box); return <p key={box.id}><b>{box.id}</b><br />{prize?.name ?? 'Unallocated'} · <StatusBadge value={box.status} /></p> })}</section>
-              <section><h3>Fulfilment / claims</h3>{shipments.map((shipment) => <p key={shipment.id}><b>{shipment.trackingNumber}</b><br />{shipment.kind} · <StatusBadge value={shipment.status} /></p>)}{claims.map((claim) => <p key={claim.id}><b>{titleCase(claim.kind)} claim</b><br /><StatusBadge value={claim.status} /> · {claim.note}</p>)}</section>
+              <section>
+                <h3>Original delivery groups</h3>
+                <p><b>{completedScopes} of {fulfilment.scopes.length} original delivery groups complete</b><br /><StatusBadge value={fulfilment.status} /></p>
+                <div className="order-scope-list">
+                  {fulfilment.scopes.map((scope, index) => {
+                    const original = shipments.find((shipment) => shipment.id === scope.originalShipmentId)
+                    const scopeClaims = scope.affectedClaimIds
+                      .map((claimId) => claims.find((claim) => claim.id === claimId))
+                      .filter((claim) => claim !== undefined)
+                    const openClaims = scopeClaims.filter((claim) => isOpenClaimStatus(claim.status))
+                    const replacement = shipments.find((shipment) =>
+                      shipment.purpose === 'replacement' &&
+                      shipment.replacementForShipmentId === original?.id)
+                    const refund = scopeClaims.find((claim) =>
+                      ['refund_linked', 'refund_completed'].includes(claim.remedyState))
+                    const blocker = openClaims.length > 0
+                      ? `Open claim: ${openClaims.map((claim) => claim.id).join(', ')}`
+                      : scope.status !== 'fulfilled'
+                        ? 'Waiting for original delivery or a completed audited remedy'
+                        : 'No blocker'
+                    return (
+                      <article className="order-scope" key={scope.originalShipmentId}>
+                        <b>Group {index + 1} · <span className="breakable-id">{scope.originalShipmentId}</span></b>
+                        <small>Original: {original?.status ?? 'missing'}{scope.completedBy === 'original' ? ' · complete' : ''}</small>
+                        <small>Replacement: {replacement ? `${replacement.status} · ${replacement.id}` : 'not used'}{scope.completedBy === 'replacement' ? ' · complete' : ''}</small>
+                        <small>Refund: {refund?.remedyState === 'refund_completed' ? `audited complete · ${refund.id}` : refund?.remedyState === 'refund_linked' ? `waiting final audit · ${refund.id}` : 'not used'}</small>
+                        <small className={openClaims.length ? 'scope-blocker' : ''}>Blocker: {blocker}</small>
+                      </article>
+                    )
+                  })}
+                </div>
+                {claims.map((claim) => <p key={claim.id}><b>{titleCase(claim.kind)} claim · {claim.id}</b><br /><StatusBadge value={claim.status} /> · <StatusBadge value={claim.remedyState} /></p>)}
+              </section>
             </div>
             {canMutateOrders && (
               <div className="record-actions">
@@ -308,19 +366,24 @@ export function AdminOrdersPage() {
       title={pending?.kind === 'cancel' ? 'Cancel this unpaid order?' : 'Close this fulfilled order?'}
       confirmLabel={pending?.kind === 'cancel' ? 'Confirm cancellation' : 'Confirm closure'}
       danger={pending?.kind === 'cancel'}
+      error={dialogError}
       onConfirm={perform}
-      onCancel={() => setPending(null)}
+      onCancel={() => {
+        setDialogError(null)
+        setPending(null)
+      }}
     >
       {pending?.kind === 'cancel'
         ? <>This releases the unpaid reservation only if no active payment attempt remains. The service rechecks order <b>{pendingOrder?.id}</b> and writes audit evidence.</>
-        : <>This closes order <b>{pendingOrder?.id}</b> only after every shipment is delivered and every claim is resolved or rejected. The service rechecks both conditions.</>}
+        : <>This closes order <b>{pendingOrder?.id}</b> only when each original delivery group has one complete path: its original delivery, a completed audited linked refund, or its delivered replacement. No open claim may remain. The service rechecks those exact groups; it does not require every shipment row to be delivered.</>}
     </ConfirmDialog>
   </></Allowed>
 }
 
 type PaymentAction = {
-  kind: 'retry' | 'reconcile' | 'partial' | 'full' | 'dispute' | 'merchant_won' | 'dispute_refund'
+  kind: 'retry' | 'reconcile' | 'partial' | 'full' | 'claim_refund' | 'dispute' | 'merchant_won' | 'dispute_refund'
   id: string
+  claimId?: string
 } | null
 
 export function AdminPaymentsPage() {
@@ -328,27 +391,57 @@ export function AdminPaymentsPage() {
   const [searchParams, setSearchParams] = useSearchParams()
   const [pending, setPending] = useState<PaymentAction>(null)
   const [notice, setNotice] = useState<ActionNotice>(null)
+  const [dialogError, setDialogError] = useState<string | null>(null)
   const orderFilter = searchParams.get('order')
-  const filteredPayments = orderFilter
-    ? state.payments.filter((payment) => payment.orderId === orderFilter)
-    : state.payments
+  const claimFilter = searchParams.get('claim')
+  const selectedClaim = claimFilter
+    ? state.claims.find((claim) => claim.id === claimFilter)
+    : undefined
+  const selectedClaimOrder = selectedClaim
+    ? state.orders.find((order) => order.id === selectedClaim.orderId)
+    : undefined
+  const claimSelectionError = claimFilter
+    ? !selectedClaim
+      ? `Exact claim ${claimFilter} was not found.`
+      : selectedClaim.status !== 'approved'
+        ? `Claim ${selectedClaim.id} is ${selectedClaim.status}; a linked refund requires an approved claim.`
+        : orderFilter && selectedClaim.orderId !== orderFilter
+          ? `Claim ${selectedClaim.id} belongs to ${selectedClaim.orderId}, not exact order ${orderFilter}.`
+          : !selectedClaimOrder ||
+              selectedClaimOrder.userId !== selectedClaim.userId ||
+              !selectedClaimOrder.claimIds.includes(selectedClaim.id)
+            ? `Claim ${selectedClaim.id} does not match a valid exact order and customer.`
+            : null
+    : null
+  const effectiveOrderFilter = orderFilter ?? selectedClaim?.orderId
+  const filteredPayments = claimFilter && !selectedClaim
+    ? []
+    : effectiveOrderFilter
+      ? state.payments.filter((payment) => payment.orderId === effectiveOrderFilter)
+      : state.payments
   const pendingPayment = state.payments.find((entry) => entry.id === pending?.id)
+  const pendingClaim = pending?.claimId
+    ? state.claims.find((claim) => claim.id === pending.claimId)
+    : undefined
   const pendingRemainingSen = pendingPayment
     ? pendingPayment.amountSen - pendingPayment.refundedSen
     : 0
   const pendingAmountSen = pending?.kind === 'partial'
     ? 1000
-    : pending?.kind === 'full'
+    : pending?.kind === 'full' || pending?.kind === 'claim_refund'
       ? pendingRemainingSen
       : 0
   const pendingTitle = pending?.kind === 'partial'
     ? `Confirm partial refund of ${formatMYR(pendingAmountSen)}?`
     : pending?.kind === 'full'
       ? `Confirm remaining refund of ${formatMYR(pendingAmountSen)}?`
+      : pending?.kind === 'claim_refund'
+        ? `Refund ${formatMYR(pendingAmountSen)} for claim ${pending.claimId}?`
       : `Confirm ${pending?.kind ?? ''} payment action?`
   const perform = () => {
     if (!pending) return
     setNotice(null)
+    setDialogError(null)
     try {
       let result: { changed: boolean; message: string } | null = null
       if (pending.kind === 'retry') {
@@ -405,24 +498,43 @@ export function AdminPaymentsPage() {
           `req-full-${pending.id}-${state.revision}`,
         )
       }
+      if (pending.kind === 'claim_refund') {
+        if (!payment || !pending.claimId) throw new Error('Exact linked payment or claim was not found.')
+        const remaining = payment.amountSen - payment.refundedSen
+        result = services.payments.refund(
+          pending.id,
+          remaining,
+          `Confirmed exact full remaining demo refund for claim ${pending.claimId}`,
+          `req-claim-refund-${pending.claimId}-${pending.id}`,
+          pending.claimId,
+        )
+      }
       setNotice(result
         ? { text: result.message, tone: result.changed ? 'success' : 'info' }
         : { text: `${titleCase(pending.kind)} action completed and audited.`, tone: 'success' })
+      setPending(null)
     } catch (caught) {
-      setNotice({ text: caught instanceof Error ? caught.message : 'Payment action was blocked.', tone: 'danger' })
+      setDialogError(actionError(caught, 'Payment action was blocked.'))
     }
-    setPending(null)
   }
   const openAction = (action: NonNullable<PaymentAction>) => {
     setNotice(null)
+    setDialogError(null)
     setPending(action)
   }
   return <Allowed section="payments"><>
     <AdminHeading code="A03" title="Payments" description="Attempts, immutable events, idempotent reconcile/retry and refunds. Redirects are never proof." />
     {notice && <Notice tone={notice.tone}>{notice.text}</Notice>}
+    {claimFilter && claimSelectionError && <Notice tone="danger">{claimSelectionError} No linked refund action is available.</Notice>}
+    {selectedClaim && !claimSelectionError && (
+      <Notice>
+        Exact claim <b>{selectedClaim.id}</b> is approved for order <b>{selectedClaim.orderId}</b>. A linked action refunds the exact full remaining captured balance only; Claims must be finalized separately after the audited event is recorded.
+        {' '}<Link className="table-action table-link" to={`/admin/claims?claim=${encodeURIComponent(selectedClaim.id)}`}>Back to claim</Link>
+      </Notice>
+    )}
     {orderFilter && (
       <Notice>
-        Showing only payments for exact order <b>{orderFilter}</b>. An approved claim handoff does not refund automatically.
+        Showing only payments for exact order <b>{orderFilter}</b>.
         {' '}<button className="table-action" type="button" onClick={() => {
           const next = new URLSearchParams(searchParams)
           next.delete('order')
@@ -442,25 +554,72 @@ export function AdminPaymentsPage() {
         const canRetry = Boolean(
           order && paymentRetryEligibility(order, payment, orderPayments).eligible,
         )
+        const exactClaimMatch = Boolean(
+          selectedClaim &&
+          !claimSelectionError &&
+          order &&
+          selectedClaim.orderId === payment.orderId &&
+          selectedClaim.userId === payment.userId &&
+          order.userId === selectedClaim.userId &&
+          order.claimIds.includes(selectedClaim.id) &&
+          order.paymentIds.includes(payment.id),
+        )
+        const linkedClaimReady = Boolean(
+          exactClaimMatch &&
+          selectedClaim &&
+          selectedClaim.linkedRefundEventId === undefined &&
+          selectedClaim.replacementShipmentId === undefined &&
+          (
+            selectedClaim.remedyState === 'none' ||
+            (selectedClaim.remedyState === 'rma_inspected' && selectedClaim.rma?.status === 'inspected')
+          ) &&
+          ['succeeded', 'partially_refunded'].includes(payment.status) &&
+          remainingSen > 0,
+        )
+        const linkedClaimIds = [...new Set(payment.events
+          .map((event) => event.refundIntent?.claimId)
+          .filter((claimId) => claimId !== undefined))]
         return <details className="admin-record payment-record" key={payment.id}>
           <summary><span><b>{payment.id}</b><small>{payment.method ?? 'NO METHOD'} · attempt {payment.attempt}</small></span><span>{formatMYR(payment.amountSen)}<small>refunded {formatMYR(payment.refundedSen)}</small></span><StatusBadge value={payment.status} /></summary>
+          {linkedClaimIds.length > 0 && (
+            <div className="linked-records">
+              <b>Linked claim{linkedClaimIds.length === 1 ? '' : 's'}</b>
+              {linkedClaimIds.map((claimId) => (
+                <Link className="table-action table-link breakable-id" key={claimId} to={`/admin/claims?claim=${encodeURIComponent(claimId)}`}>{claimId} · Back to claim</Link>
+              ))}
+            </div>
+          )}
           <div className="record-actions">
             {canRetry && <button className="button button-ghost" type="button" onClick={() => openAction({ kind: 'retry', id: payment.id })}>Retry attempt</button>}
             {['pending', 'processing'].includes(payment.status) && <button className="button" type="button" onClick={() => openAction({ kind: 'reconcile', id: payment.id })}>Reconcile succeeded</button>}
-            {['succeeded', 'partially_refunded'].includes(payment.status) && remainingSen > 1000 && <button className="button button-ghost" type="button" onClick={() => openAction({ kind: 'partial', id: payment.id })}>Partial refund RM10</button>}
-            {['succeeded', 'partially_refunded'].includes(payment.status) && remainingSen > 0 && <button className="button button-danger" type="button" onClick={() => openAction({ kind: 'full', id: payment.id })}>Refund remaining {formatMYR(remainingSen)}</button>}
+            {linkedClaimReady && selectedClaim && <button className="button" type="button" onClick={() => openAction({ kind: 'claim_refund', id: payment.id, claimId: selectedClaim.id })}>Linked claim {selectedClaim.id}: refund exact {formatMYR(remainingSen)}</button>}
+            {['succeeded', 'partially_refunded'].includes(payment.status) && remainingSen > 1000 && <button className="button button-ghost" type="button" onClick={() => openAction({ kind: 'partial', id: payment.id })}>Unlinked partial refund RM10</button>}
+            {['succeeded', 'partially_refunded'].includes(payment.status) && remainingSen > 0 && <button className="button button-danger" type="button" onClick={() => openAction({ kind: 'full', id: payment.id })}>Unlinked refund remaining {formatMYR(remainingSen)}</button>}
             {['succeeded', 'partially_refunded'].includes(payment.status) && <button className="button button-danger" type="button" onClick={() => openAction({ kind: 'dispute', id: payment.id })}>Mark disputed</button>}
             {payment.status === 'disputed' && <button className="button" type="button" onClick={() => openAction({ kind: 'merchant_won', id: payment.id })}>Resolve: merchant won</button>}
             {payment.status === 'disputed' && <button className="button button-danger" type="button" onClick={() => openAction({ kind: 'dispute_refund', id: payment.id })}>Resolve: full refund</button>}
           </div>
-          <div className="event-list">{payment.events.map((event) => <div key={event.id}><StatusBadge value={event.type} /><span><b>{event.id}</b><small>{event.source} · {formatDateTime(event.processedAt)}{event.ignoredReason ? ` · ${event.ignoredReason}` : ''}</small></span></div>)}</div>
+          <div className="event-list">{payment.events.map((event) => <div key={event.id}><StatusBadge value={event.type} /><span><b>{event.id}</b><small>{event.source} · {formatDateTime(event.processedAt)}{event.ignoredReason ? ` · ${event.ignoredReason}` : ''}</small>{event.refundIntent?.claimId && <Link className="table-action table-link breakable-id" to={`/admin/claims?claim=${encodeURIComponent(event.refundIntent.claimId)}`}>Linked claim {event.refundIntent.claimId} · Back to claim</Link>}</span></div>)}</div>
         </details>
       })}
-      {filteredPayments.length === 0 && <div className="empty-state compact"><p>No fictional payments match this exact order.</p></div>}
+      {filteredPayments.length === 0 && <div className="empty-state compact"><p>No fictional payments match this exact order and claim selection.</p></div>}
     </div>
-    <ConfirmDialog open={Boolean(pending)} title={pendingTitle} confirmLabel="Confirm and audit" danger={['full', 'dispute', 'dispute_refund'].includes(pending?.kind ?? '')} onConfirm={perform} onCancel={() => setPending(null)}>
-      {pending?.kind === 'partial' || pending?.kind === 'full'
-        ? <>This records exactly <b>{formatMYR(pendingAmountSen)}</b> in local demo money. Claims never trigger this action automatically.</>
+    <ConfirmDialog
+      open={Boolean(pending)}
+      title={pendingTitle}
+      confirmLabel="Confirm and audit"
+      danger={['full', 'claim_refund', 'dispute', 'dispute_refund'].includes(pending?.kind ?? '')}
+      error={dialogError}
+      onConfirm={perform}
+      onCancel={() => {
+        setDialogError(null)
+        setPending(null)
+      }}
+    >
+      {pending?.kind === 'claim_refund'
+        ? <>This links exact claim <b>{pendingClaim?.id}</b> to payment <b>{pendingPayment?.id}</b> and refunds the exact full remaining captured balance of <b>{formatMYR(pendingAmountSen)}</b>. Claims still requires a separate final audit action.</>
+        : pending?.kind === 'partial' || pending?.kind === 'full'
+          ? <>This records exactly <b>{formatMYR(pendingAmountSen)}</b> as an unlinked local demo refund. It does not finalize a claim.</>
         : 'This is local demo money only. Full refunds and disputes stop eligible unshipped fulfilment. Claims never trigger this action automatically.'}
     </ConfirmDialog>
   </></Allowed>
@@ -524,24 +683,43 @@ export function AdminInventoryPage() {
   </></Allowed>
 }
 
-const nextStatus: Partial<Record<ShipmentStatus, ShipmentStatus>> = {
-  unfulfilled: 'picking',
-  picking: 'packed',
-  packed: 'label_created',
-  label_created: 'shipped',
-  shipped: 'delivered',
-  failed_delivery: 'shipped',
-}
-
 type FulfilmentAction =
   | { kind: 'status'; id: string; status: ShipmentStatus }
   | { kind: 'tracking'; id: string; carrier: string; trackingNumber: string }
 
+const physicalFulfilmentActions: Array<{ status: ShipmentStatus; label: string }> = [
+  { status: 'picking', label: 'Mark picking' },
+  { status: 'packed', label: 'Mark packed' },
+  { status: 'label_created', label: 'Create label' },
+  { status: 'shipped', label: 'Mark shipped' },
+  { status: 'delivered', label: 'Mark delivered' },
+  { status: 'failed_delivery', label: 'Delivery exception' },
+  { status: 'lost', label: 'Mark lost' },
+  { status: 'returned', label: 'Mark returned' },
+]
+
+const digitalFulfilmentActions: Array<{ status: ShipmentStatus; label: string }> = [
+  { status: 'issued', label: 'Issue' },
+  { status: 'sent', label: 'Mark sent' },
+  { status: 'delivered', label: 'Mark delivered' },
+  { status: 'failed', label: 'Mark failed' },
+]
+
 export function AdminFulfilmentPage() {
   const { state, services } = useAppState()
+  const [searchParams] = useSearchParams()
   const [pending, setPending] = useState<FulfilmentAction | null>(null)
   const [editing, setEditing] = useState<{ id: string; carrier: string; trackingNumber: string } | null>(null)
   const [notice, setNotice] = useState<ActionNotice>(null)
+  const [dialogError, setDialogError] = useState<string | null>(null)
+  const focusedRecordRef = useRef<HTMLElement | null>(null)
+  const claimFocus = searchParams.get('claim')
+  const shipmentFocus = searchParams.get('shipment')
+  const actor = state.users.find((entry) => entry.id === state.sessionUserId)
+  const canOpenClaims = Boolean(actor && ADMIN_SECTION_PERMISSIONS.claims.includes(actor.role))
+  const focusedClaim = claimFocus
+    ? state.claims.find((claim) => claim.id === claimFocus)
+    : undefined
   const pendingShipment = pending?.kind === 'status'
     ? state.shipments.find((shipment) => shipment.id === pending.id)
     : undefined
@@ -549,9 +727,18 @@ export function AdminFulfilmentPage() {
     pending?.kind === 'status' &&
     pending.status === 'returned' &&
     pendingShipment?.status === 'delivered'
+
+  useEffect(() => {
+    const record = focusedRecordRef.current
+    if (!record) return
+    record.scrollIntoView({ block: 'center' })
+    record.focus({ preventScroll: true })
+  }, [claimFocus, shipmentFocus])
+
   const perform = () => {
     if (!pending) return
     setNotice(null)
+    setDialogError(null)
     try {
       if (pending.kind === 'status') {
         const postDeliveryReturn =
@@ -580,13 +767,14 @@ export function AdminFulfilmentPage() {
         setNotice({ text: 'Carrier and tracking were updated and audited.', tone: 'success' })
         setEditing(null)
       }
+      setPending(null)
     } catch (caught) {
-      setNotice({ text: caught instanceof Error ? caught.message : 'Fulfilment action was blocked.', tone: 'danger' })
+      setDialogError(actionError(caught, 'Fulfilment action was blocked.'))
     }
-    setPending(null)
   }
   const openAction = (action: FulfilmentAction) => {
     setNotice(null)
+    setDialogError(null)
     setPending(action)
   }
   const openTrackingEdit = (shipment: { id: string; carrier: string; trackingNumber: string }) => {
@@ -594,11 +782,11 @@ export function AdminFulfilmentPage() {
     setEditing(shipment)
   }
   return <Allowed section="fulfilment"><>
-    <AdminHeading code="A05" title="Fulfilment" description="Picking, packing, split shipment, carrier, tracking, delivery and exception controls remain available on mobile." />
+    <AdminHeading code="A05" title="Fulfilment" description="Original and replacement physical shipments use carrier scans. Digital delivery and reissue use only digital actions." />
     {notice && <Notice tone={notice.tone}>{notice.text}</Notice>}
+    {claimFocus && !focusedClaim && <Notice tone="danger">Exact source claim <b>{claimFocus}</b> was not found.</Notice>}
     <div className="shipment-admin-grid">
       {state.shipments.map((shipment) => {
-        const next = nextStatus[shipment.status]
         const order = state.orders.find((entry) => entry.id === shipment.orderId)
         const canMoveTo = (status: ShipmentStatus) => Boolean(
           order && shipmentStatusActionEligibility(order.status, shipment, status).eligible,
@@ -606,20 +794,83 @@ export function AdminFulfilmentPage() {
         const canEditTracking = Boolean(
           order && shipmentTrackingActionEligibility(order.status, shipment).eligible,
         )
-        return <article className="panel shipment-admin-card" key={shipment.id}>
-          <div className="panel-heading"><div><span>{shipment.kind} / {shipment.id}</span><h2>{shipment.trackingNumber}</h2></div><StatusBadge value={shipment.status} /></div>
-          <dl className="detail-list compact"><div><dt>Carrier</dt><dd>{shipment.carrier}</dd></div><div><dt>Boxes</dt><dd>{shipment.boxIds.join(', ')}</dd></div><div><dt>Controls</dt><dd>{shipment.insured ? 'Insured' : 'Standard'}{shipment.signatureRequired ? ' · signature required' : ''}</dd></div></dl>
+        const focused = shipmentFocus
+          ? shipment.id === shipmentFocus
+          : shipment.sourceClaimId === claimFocus ||
+            Boolean(
+              focusedClaim &&
+              shipment.purpose === 'original' &&
+              (
+                focusedClaim.shipmentId === shipment.id ||
+                focusedClaim.shipmentCandidateIds?.includes(shipment.id)
+              ),
+            )
+        const sourceClaim = shipment.sourceClaimId
+          ? state.claims.find((claim) => claim.id === shipment.sourceClaimId)
+          : undefined
+        const original = shipment.replacementForShipmentId
+          ? state.shipments.find((entry) => entry.id === shipment.replacementForShipmentId)
+          : undefined
+        const actions = shipment.kind === 'DIGITAL'
+          ? digitalFulfilmentActions
+          : physicalFulfilmentActions
+        return <article
+          className={`panel shipment-admin-card${focused ? ' focused-record' : ''}`}
+          data-focused={focused || undefined}
+          key={shipment.id}
+          ref={(element) => {
+            if (focused) focusedRecordRef.current = element
+          }}
+          tabIndex={focused ? -1 : undefined}
+        >
+          <div className="panel-heading">
+            <div>
+              <span>{shipmentWorkLabel(shipment)}</span>
+              <small className="admin-record-id breakable-id">{shipment.kind} / {shipment.id}</small>
+              <h2>{shipment.kind === 'DIGITAL' ? (shipment.purpose === 'replacement' ? 'Digital reissue record' : 'Digital delivery record') : shipment.trackingNumber}</h2>
+            </div>
+            <StatusBadge value={shipment.status} />
+          </div>
+          <dl className="detail-list compact">
+            {shipment.kind !== 'DIGITAL' && <div><dt>Carrier</dt><dd>{shipment.carrier}</dd></div>}
+            {shipment.kind !== 'DIGITAL' && <div><dt>Tracking</dt><dd className="breakable-id">{shipment.trackingNumber}</dd></div>}
+            <div><dt>Boxes</dt><dd className="breakable-id">{shipment.boxIds.join(', ')}</dd></div>
+            {shipment.kind !== 'DIGITAL' && <div><dt>Controls</dt><dd>{shipment.insured ? 'Insured' : 'Standard'}{shipment.signatureRequired ? ' · signature required' : ''}</dd></div>}
+            {sourceClaim && (
+              <div>
+                <dt>Source claim</dt>
+                <dd>
+                  {canOpenClaims
+                    ? <Link className="table-action table-link breakable-id" to={`/admin/claims?claim=${encodeURIComponent(sourceClaim.id)}`}>{sourceClaim.id}</Link>
+                    : <span className="breakable-id">{sourceClaim.id} · Claims access required</span>}
+                </dd>
+              </div>
+            )}
+            {original && (
+              <div>
+                <dt>Original</dt>
+                <dd><Link className="table-action table-link breakable-id" to={`/admin/fulfilment?shipment=${encodeURIComponent(original.id)}${sourceClaim ? `&claim=${encodeURIComponent(sourceClaim.id)}` : ''}`}>{original.id}</Link></dd>
+              </div>
+            )}
+          </dl>
           <div className="record-actions">
-            {next && canMoveTo(next) && <button className="button" type="button" onClick={() => openAction({ kind: 'status', id: shipment.id, status: next })}>Mark {titleCase(next)}</button>}
+            {actions.filter((action) => canMoveTo(action.status)).map((action) => (
+              <button
+                className={['failed', 'failed_delivery', 'lost'].includes(action.status) ? 'button button-danger' : action.status === 'returned' ? 'button button-ghost' : 'button'}
+                key={action.status}
+                type="button"
+                onClick={() => openAction({ kind: 'status', id: shipment.id, status: action.status })}
+              >
+                {shipment.status === 'delivered' && action.status === 'returned'
+                  ? 'Record post-delivery return'
+                  : action.label}
+              </button>
+            ))}
             {canEditTracking && (
               <button className="button button-ghost" type="button" onClick={() => openTrackingEdit({ id: shipment.id, carrier: shipment.carrier, trackingNumber: shipment.trackingNumber })}>
                 Edit carrier &amp; tracking
               </button>
             )}
-            {shipment.status === 'shipped' && canMoveTo('failed_delivery') && <button className="button button-danger" type="button" onClick={() => openAction({ kind: 'status', id: shipment.id, status: 'failed_delivery' })}>Delivery exception</button>}
-            {shipment.status === 'shipped' && canMoveTo('lost') && <button className="button button-danger" type="button" onClick={() => openAction({ kind: 'status', id: shipment.id, status: 'lost' })}>Mark lost</button>}
-            {shipment.status === 'shipped' && canMoveTo('returned') && <button className="button button-ghost" type="button" onClick={() => openAction({ kind: 'status', id: shipment.id, status: 'returned' })}>Mark returned</button>}
-            {shipment.status === 'delivered' && canMoveTo('returned') && <button className="button button-ghost" type="button" onClick={() => openAction({ kind: 'status', id: shipment.id, status: 'returned' })}>Record post-delivery return</button>}
           </div>
           {editing?.id === shipment.id && (
             <div className="tracking-entry-form">
@@ -649,14 +900,18 @@ export function AdminFulfilmentPage() {
           ? 'Confirm return record & audit'
           : 'Confirm scan & audit'}
       danger={pending?.kind === 'status' && pending.status === 'failed_delivery'}
+      error={dialogError}
       onConfirm={perform}
-      onCancel={() => setPending(null)}
+      onCancel={() => {
+        setDialogError(null)
+        setPending(null)
+      }}
     >
       {pending?.kind === 'tracking'
         ? <>Carrier <b>{pending.carrier}</b> and tracking <b>{pending.trackingNumber}</b> will be validated, saved and appended to audit.</>
         : isPostDeliveryReturn
-          ? 'This records a returned shipment and reopens fulfilment. It does not create a claim or refund.'
-          : 'This advances one guarded fictional shipment transition. The before and after states are appended to audit.'}
+          ? <>This records exact {shipmentWorkLabel(pendingShipment!)} <b>{pendingShipment?.id}</b> as returned and reopens its original group. It does not create a claim or refund.</>
+          : <>This moves exact {pendingShipment ? shipmentWorkLabel(pendingShipment) : 'fulfilment record'} <b>{pendingShipment?.id}</b> to <b>{pending?.kind === 'status' ? titleCase(pending.status) : ''}</b>. The guarded before and after states are appended to audit.</>}
     </ConfirmDialog>
   </></Allowed>
 }
@@ -665,115 +920,271 @@ export function AdminClaimsPage() {
   return <Allowed section="claims"><AdminClaimsContent /></Allowed>
 }
 
+type ClaimReviewDialogAction = Exclude<ClaimReviewAction, 'resolve'>
+type ClaimRemedyAction =
+  | 'rma_create'
+  | 'rma_received'
+  | 'rma_inspected'
+  | 'refund'
+  | 'replacement'
+  | 'finalize_refund'
+  | 'no_remedy'
+type ClaimDialog =
+  | { kind: 'review'; id: string; action: ClaimReviewDialogAction }
+  | { kind: 'remedy'; id: string }
+
 function AdminClaimsContent() {
   const { services, state } = useAppState()
+  const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
   const claims = services.claims.queue()
   const actor = state.users.find((entry) => entry.id === state.sessionUserId)
   const canOpenPayments = Boolean(actor && ADMIN_SECTION_PERMISSIONS.payments.includes(actor.role))
-  const [pending, setPending] = useState<{ id: string; action: ClaimReviewAction } | null>(null)
+  const canAuthorizeReplacement = actor?.role === 'admin' || actor?.role === 'super_admin'
+  const focusedClaimId = searchParams.get('claim')
+  const focusedClaimRef = useRef<HTMLElement | null>(null)
+  const [pending, setPending] = useState<ClaimDialog | null>(null)
   const [note, setNote] = useState('Confirmed fictional claim review with no automatic refund.')
-  const [resolutionOutcome, setResolutionOutcome] = useState<ClaimResolutionOutcome>('replacement_authorized')
-  const [resolutionReference, setResolutionReference] = useState('DEMO-REPLACEMENT-001')
+  const [remedyAction, setRemedyAction] = useState<ClaimRemedyAction>('rma_create')
+  const [remedyReference, setRemedyReference] = useState('DEMO-RMA-001')
   const [notice, setNotice] = useState<ActionNotice>(null)
-  const openReview = (id: string, action: ClaimReviewAction) => {
-    setNotice(null)
-    setPending({ id, action })
-    if (action === 'resolve') {
-      setResolutionOutcome('replacement_authorized')
-      setResolutionReference(`DEMO-${id.toUpperCase()}`)
-      setNote('Confirmed fictional replacement handoff with documented demo evidence.')
+  const [dialogError, setDialogError] = useState<string | null>(null)
+  const pendingClaim = state.claims.find((claim) => claim.id === pending?.id)
+
+  const originalForClaim = (claim: Claim) => {
+    const shipmentId =
+      claim.shipmentId ??
+      (claim.shipmentCandidateIds?.length === 1 ? claim.shipmentCandidateIds[0] : undefined) ??
+      (claim.boxId
+        ? state.boxes.find((box) => box.id === claim.boxId && box.orderId === claim.orderId)?.shipmentId
+        : undefined)
+    return state.shipments.find((shipment) =>
+      shipment.id === shipmentId &&
+      shipment.orderId === claim.orderId &&
+      shipment.purpose === 'original')
+  }
+
+  const remedyOptions = (claim: Claim): Array<{ value: ClaimRemedyAction; label: string }> => {
+    if (claim.status !== 'approved') return []
+    const original = originalForClaim(claim)
+    if (claim.remedyState === 'refund_linked' && claim.linkedRefundEventId) {
+      return [{ value: 'finalize_refund', label: 'Finalize exact audited refund link' }]
     }
+    if (claim.remedyState === 'rma_created') {
+      return [{ value: 'rma_received', label: 'Record RMA received' }]
+    }
+    if (claim.remedyState === 'rma_received') {
+      return [{ value: 'rma_inspected', label: 'Record RMA inspected' }]
+    }
+    if (!['none', 'rma_inspected'].includes(claim.remedyState)) return []
+    const options: Array<{ value: ClaimRemedyAction; label: string }> = []
+    const deliveredBeforeClaim = original?.kind !== 'DIGITAL' &&
+      original?.timeline.some((entry) =>
+        entry.status === 'delivered' &&
+        Date.parse(entry.at) <= Date.parse(claim.createdAt))
+    if (claim.remedyState === 'none' && deliveredBeforeClaim) {
+      options.push({ value: 'rma_create', label: 'Create physical return / RMA' })
+    }
+    if (canOpenPayments) options.push({ value: 'refund', label: 'Open exact full linked refund in Payments' })
+    if (canAuthorizeReplacement && original && (!claim.shipmentCandidateIds || claim.shipmentCandidateIds.length === 1)) {
+      options.push({
+        value: 'replacement',
+        label: original.kind === 'DIGITAL' ? 'Authorize digital reissue' : 'Authorize replacement shipment',
+      })
+    }
+    if (claim.remedyState === 'none') options.push({ value: 'no_remedy', label: 'Close explicitly with no remedy' })
+    return options
+  }
+
+  useEffect(() => {
+    const record = focusedClaimRef.current
+    if (!record) return
+    record.scrollIntoView({ block: 'center' })
+    record.focus({ preventScroll: true })
+  }, [focusedClaimId])
+
+  const openReview = (id: string, action: ClaimReviewDialogAction) => {
+    setNotice(null)
+    setDialogError(null)
+    setPending({ kind: 'review', id, action })
+    setNote(`Confirmed fictional ${action} review for exact claim ${id}.`)
+  }
+  const openRemedy = (claim: Claim) => {
+    const options = remedyOptions(claim)
+    if (!options[0]) return
+    setNotice(null)
+    setDialogError(null)
+    setPending({ kind: 'remedy', id: claim.id })
+    setRemedyAction(options[0].value)
+    setRemedyReference(claim.rma?.reference ?? `DEMO-RMA-${claim.id.toUpperCase()}`)
+    setNote(`Confirmed fictional remedy evidence for exact claim ${claim.id}.`)
   }
   const perform = () => {
-    if (!pending) return
+    if (!pending || !pendingClaim) return
     setNotice(null)
+    setDialogError(null)
     try {
-      const result = services.claims.review(
-        pending.id,
-        pending.action,
-        note,
-        pending.action === 'resolve'
-          ? { outcome: resolutionOutcome, reference: resolutionReference }
-          : undefined,
-      )
-      setNotice({ text: result.message, tone: 'success' })
+      if (pending.kind === 'review') {
+        const result = services.claims.review(pending.id, pending.action, note)
+        setNotice({ text: result.message, tone: 'success' })
+        setPending(null)
+        return
+      }
+      if (remedyAction === 'refund') {
+        setPending(null)
+        navigate(`/admin/payments?order=${encodeURIComponent(pendingClaim.orderId)}&claim=${encodeURIComponent(pendingClaim.id)}`)
+        return
+      }
+      let result: { changed: boolean; message: string }
+      if (remedyAction === 'rma_create') {
+        result = services.claims.createRma(pendingClaim.id, remedyReference, note)
+      } else if (remedyAction === 'rma_received') {
+        result = services.claims.recordRmaReceived(pendingClaim.id, remedyReference, note)
+      } else if (remedyAction === 'rma_inspected') {
+        result = services.claims.recordRmaInspected(pendingClaim.id, remedyReference, note)
+      } else if (remedyAction === 'replacement') {
+        result = services.claims.authorizeReplacement(pendingClaim.id, note)
+      } else if (remedyAction === 'finalize_refund') {
+        if (!pendingClaim.linkedRefundEventId) throw new Error('The exact linked refund event is missing.')
+        result = services.claims.review(
+          pendingClaim.id,
+          'resolve',
+          note,
+          { outcome: 'refund_recorded', reference: pendingClaim.linkedRefundEventId },
+        )
+      } else {
+        result = services.claims.review(
+          pendingClaim.id,
+          'resolve',
+          note,
+          { outcome: 'no_remedy', reference: `DEMO-NO-REMEDY-${pendingClaim.id.toUpperCase()}` },
+        )
+      }
+      setNotice({ text: result.message, tone: result.changed ? 'success' : 'info' })
+      setPending(null)
     } catch (caught) {
-      setNotice({ text: caught instanceof Error ? caught.message : 'Claim action was blocked.', tone: 'danger' })
+      setDialogError(actionError(caught, 'Claim action was blocked.'))
     }
-    setPending(null)
   }
+  const pendingOptions = pendingClaim ? remedyOptions(pendingClaim) : []
+
   return <>
-    <AdminHeading code="A06" title="Claims queue" description="Eligibility-linked customer claims with guarded review notes. Refunds stay separate in Payments." />
+    <AdminHeading code="A06" title="Claims queue" description="Acknowledge, approve or reject first, then record one typed RMA, exact linked refund, replacement or explicit no-remedy path." />
     {notice && <Notice tone={notice.tone}>{notice.text}</Notice>}
+    {focusedClaimId && !state.claims.some((claim) => claim.id === focusedClaimId) && <Notice tone="danger">Exact claim <b>{focusedClaimId}</b> was not found.</Notice>}
     <div className="admin-record-list claims-queue">
-      {claims.map((claim) => (
-        <details className="admin-record claim-record" open key={claim.id}>
+      {claims.map((claim) => {
+        const focused = claim.id === focusedClaimId
+        const original = originalForClaim(claim)
+        const replacement = claim.replacementShipmentId
+          ? state.shipments.find((shipment) => shipment.id === claim.replacementShipmentId)
+          : undefined
+        const options = remedyOptions(claim)
+        return (
+        <details
+          className={`admin-record claim-record${focused ? ' focused-record' : ''}`}
+          data-focused={focused || undefined}
+          key={claim.id}
+          open
+          ref={(element) => {
+            if (focused) focusedClaimRef.current = element
+          }}
+          tabIndex={focused ? -1 : undefined}
+        >
           <summary>
             <span><b>{claim.id}</b><small>{titleCase(claim.kind)} · {claim.orderId}</small></span>
-            <span>
-              {claim.shipmentCandidateIds
-                ? `Order-level candidates: ${claim.shipmentCandidateIds.join(', ')}`
-                : claim.shipmentId ?? claim.boxId}
-            </span>
-            <StatusBadge value={claim.status} />
+            <span className="breakable-id">{claimScopeLabel(claim)}</span>
+            <span className="status-pair"><StatusBadge value={claim.status} />{claim.remedyState !== 'none' && <StatusBadge value={claim.remedyState} />}</span>
           </summary>
           <p>{claim.note}</p>
           <div className="record-actions">
             {claim.status === 'submitted' && <button className="button" type="button" onClick={() => openReview(claim.id, 'acknowledge')}>Acknowledge</button>}
             {claim.status === 'reviewing' && <button className="button" type="button" onClick={() => openReview(claim.id, 'approve')}>Approve</button>}
             {['submitted', 'reviewing'].includes(claim.status) && <button className="button button-danger" type="button" onClick={() => openReview(claim.id, 'reject')}>Reject</button>}
-            {claim.status === 'approved' && <button className="button" type="button" onClick={() => openReview(claim.id, 'resolve')}>Resolve</button>}
+            {options.length > 0 && <button className="button" type="button" onClick={() => openRemedy(claim)}>Record typed remedy</button>}
           </div>
           {claim.status === 'approved' && (
             <div className="notice notice-info">
-              <b>Approved claim finance / RMA handoff</b>
-              <p>This stays open until structured remedy evidence is recorded. Approval does not refund automatically; finance must use a separate audited payment action.</p>
-              {canOpenPayments
-                ? <Link className="table-action table-link" to={`/admin/payments?order=${encodeURIComponent(claim.orderId)}`}>Open Payments for {claim.orderId}</Link>
-                : <span className="table-readonly">Read only · finance or an admin must complete the payment review.</span>}
+              <b>Approved claim · typed remedy remains open</b>
+              <p>Exact scope: <span className="breakable-id">{claimScopeLabel(claim)}</span>. Approval does not refund automatically. RMA evidence and replacement authorization do not resolve this claim. A replacement resolves only when its shipment is delivered; a refund requires a separate accepted event and final claim audit.</p>
+              {!canOpenPayments && claim.remedyState !== 'refund_linked' && <span className="table-readonly">Payments is restricted to finance, admin and super admin.</span>}
             </div>
           )}
-          {claim.status === 'resolved' && (
+          {claim.rma && (
             <div className="notice notice-info">
-              <b>Structured resolution recorded</b>
-              <p>{titleCase(claim.resolutionOutcome ?? '')} · {claim.resolutionReference}</p>
-              <small>{claim.resolutionNote}</small>
+              <b>RMA evidence · claim remains {claim.status}</b>
+              <p><span className="breakable-id">{claim.rma.reference}</span> · <StatusBadge value={`rma_${claim.rma.status}`} /></p>
+              <small>Created {formatDateTime(claim.rma.createdAt)}{claim.rma.receivedAt ? ` · received ${formatDateTime(claim.rma.receivedAt)}` : ''}{claim.rma.inspectedAt ? ` · inspected ${formatDateTime(claim.rma.inspectedAt)}` : ''}</small>
+            </div>
+          )}
+          {claim.linkedRefundEventId && (
+            <div className="notice notice-info">
+              <b>{claim.remedyState === 'refund_completed' ? 'Audited refund complete' : 'Refund linked · final Claims audit still required'}</b>
+              <p className="breakable-id">{claim.linkedRefundEventId}</p>
+              {canOpenPayments && <Link className="table-action table-link" to={`/admin/payments?order=${encodeURIComponent(claim.orderId)}&claim=${encodeURIComponent(claim.id)}`}>Open linked payment record</Link>}
+            </div>
+          )}
+          {replacement && (
+            <div className="notice notice-info">
+              <b>{shipmentWorkLabel(replacement)} · {replacement.status === 'delivered' ? 'delivered and final' : 'claim remains approved until delivery'}</b>
+              <p className="breakable-id">{replacement.id} · original {original?.id}</p>
+              <Link className="table-action table-link" to={`/admin/fulfilment?claim=${encodeURIComponent(claim.id)}&shipment=${encodeURIComponent(replacement.id)}`}>Open linked fulfilment record</Link>
+            </div>
+          )}
+          {['rejected', 'resolved'].includes(claim.status) && (
+            <div className="notice notice-info">
+              <b>Final read-only evidence · structured resolution recorded</b>
+              <p>{titleCase(claim.resolutionOutcome ?? claim.status)} · <span className="breakable-id">{claim.resolutionReference ?? claim.id}</span></p>
+              <small>{claim.resolutionNote ?? claim.history.at(-1)?.note}</small>
             </div>
           )}
           <ol className="mini-timeline">{claim.history.map((entry) => <li key={entry.id}><b>{entry.note}</b><small>{formatDateTime(entry.at)} · {entry.actorRole} · {entry.status}</small></li>)}</ol>
-          <p className="fine-print">Claim state only. No refund is created here.</p>
+          <p className="fine-print">Typed evidence only. Claims does not issue money; Payments records the exact refund event separately.</p>
         </details>
-      ))}
+      )})}
       {claims.length === 0 && <div className="empty-state compact"><p>No fictional claims are waiting.</p></div>}
     </div>
     <ConfirmDialog
       open={Boolean(pending)}
-      title={`${titleCase(pending?.action ?? 'review')} this claim?`}
-      confirmLabel="Confirm note & audit"
-      danger={pending?.action === 'reject'}
+      title={pending?.kind === 'review'
+        ? `${titleCase(pending.action)} exact claim ${pending.id}?`
+        : `Record typed remedy for exact claim ${pendingClaim?.id}?`}
+      confirmLabel={pending?.kind === 'review' ? 'Confirm note & audit' : remedyAction === 'refund' ? 'Open exact payment' : 'Confirm typed evidence'}
+      danger={(pending?.kind === 'review' && pending.action === 'reject') || remedyAction === 'no_remedy'}
+      error={dialogError}
       onConfirm={perform}
-      onCancel={() => setPending(null)}
+      onCancel={() => {
+        setDialogError(null)
+        setPending(null)
+      }}
     >
       <label className="dialog-note">Required review note
         <textarea rows={3} value={note} onChange={(event) => setNote(event.target.value)} />
       </label>
-      {pending?.action === 'resolve' && (
+      {pendingClaim && (
+        <p>Exact claim <b>{pendingClaim.id}</b> covers <b className="breakable-id">{claimScopeLabel(pendingClaim)}</b>.</p>
+      )}
+      {pending?.kind === 'remedy' && (
         <>
-          <label className="dialog-note">Structured outcome
-            <select value={resolutionOutcome} onChange={(event) => setResolutionOutcome(event.target.value as ClaimResolutionOutcome)}>
-              <option value="replacement_authorized">Replacement authorized</option>
-              <option value="return_rma_created">Return / RMA created</option>
-              <option value="refund_recorded">Refund already recorded</option>
-              <option value="no_remedy">No remedy</option>
-            </select>
-          </label>
-          <label className="dialog-note">
-            {resolutionOutcome === 'refund_recorded' ? 'Audited refund event ID' : 'Fictional DEMO- reference'}
-            <input value={resolutionReference} onChange={(event) => setResolutionReference(event.target.value)} />
-          </label>
+          <fieldset className="remedy-choice">
+            <legend>Choose one exact remedy action</legend>
+            {pendingOptions.map((option) => (
+              <label key={option.value}>
+                <input type="radio" name="claim-remedy" value={option.value} checked={remedyAction === option.value} onChange={() => setRemedyAction(option.value)} />
+                <span>{option.label}</span>
+              </label>
+            ))}
+          </fieldset>
+          {['rma_create', 'rma_received', 'rma_inspected'].includes(remedyAction) && (
+            <label className="dialog-note">Exact fictional RMA reference
+              <input value={remedyReference} onChange={(event) => setRemedyReference(event.target.value)} />
+            </label>
+          )}
+          {remedyAction === 'finalize_refund' && <p>Finalization must use exact linked event <b className="breakable-id">{pendingClaim?.linkedRefundEventId}</b>.</p>}
+          {remedyAction === 'refund' && <p>Payments will offer only the exact full remaining captured balance. Returning here for a separate final audit is still required.</p>}
         </>
       )}
-      <p>This appends claim history and audit evidence. It does not issue a refund.</p>
+      {pending?.kind === 'review' && <p>This appends exact claim history and audit evidence. It does not issue a refund.</p>}
     </ConfirmDialog>
   </>
 }

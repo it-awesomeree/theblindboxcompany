@@ -591,6 +591,9 @@ legend {
 
 .confirm-dialog {
   width: min(520px, calc(100% - 28px));
+  max-height: calc(100dvh - 28px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
   border: 1px solid var(--gold-line);
   border-top: 3px solid var(--gold);
   border-radius: 0;
@@ -620,6 +623,17 @@ legend {
 
 .dialog-copy {
   color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.dialog-error {
+  margin-top: 16px;
+  padding: 12px;
+  border: 1px solid rgba(209, 69, 46, .42);
+  border-left: 3px solid var(--stamp);
+  background: rgba(209, 69, 46, .08);
+  color: #ffc4ba;
+  overflow-wrap: anywhere;
 }
 
 .dialog-actions {
@@ -2066,6 +2080,135 @@ legend {
   font-size: .74rem;
 }
 
+.breakable-id {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.status-pair {
+  display: flex !important;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.remedy-progress {
+  display: grid;
+  gap: 12px;
+}
+
+.remedy-progress-heading {
+  min-height: 58px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
+  border: 1px solid var(--cyan-line);
+  background: rgba(114, 217, 237, .035);
+}
+
+.remedy-progress-heading b {
+  font: 800 .72rem var(--mono);
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+
+.remedy-scope {
+  padding: 18px;
+  border: 1px solid var(--hair);
+  background: var(--room-2);
+}
+
+.remedy-original {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.remedy-original > div {
+  min-width: 0;
+}
+
+.remedy-original span,
+.remedy-original small {
+  color: var(--cyan);
+  font: .58rem/1.5 var(--mono);
+  letter-spacing: .08em;
+}
+
+.remedy-original h3 {
+  margin: 5px 0 2px;
+  font: 900 1rem var(--display);
+  text-transform: uppercase;
+}
+
+.remedy-scope > p {
+  color: var(--muted);
+  font-size: .73rem;
+}
+
+.remedy-evidence {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.remedy-evidence > p,
+.remedy-replacement {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding: 11px;
+  border-left: 2px solid var(--cyan);
+  background: rgba(114, 217, 237, .035);
+  color: var(--muted);
+  font-size: .7rem;
+}
+
+.remedy-evidence > p > b,
+.remedy-replacement b {
+  color: var(--text);
+}
+
+.remedy-evidence .status {
+  justify-self: start;
+}
+
+.remedy-replacement {
+  margin-left: 18px;
+  border: 1px solid var(--cyan-line);
+  border-left-width: 3px;
+}
+
+.remedy-replacement > div:first-child {
+  display: grid;
+}
+
+.remedy-progress-compact {
+  width: 100%;
+  gap: 7px;
+}
+
+.remedy-progress-compact .remedy-progress-heading,
+.remedy-progress-compact .remedy-scope {
+  padding: 9px;
+}
+
+.remedy-progress-compact .remedy-progress-heading {
+  align-items: flex-start;
+  flex-direction: column;
+}
+
+.remedy-progress-compact .remedy-original h3 {
+  font-size: .76rem;
+}
+
+.remedy-progress-compact .remedy-replacement {
+  margin-left: 8px;
+}
+
 /* Reveal */
 .reveal-page {
   background: #050505;
@@ -2300,6 +2443,16 @@ legend {
 
 .account-order-grid .sealed-delivery-summary .tracking-code {
   font-size: .65rem;
+}
+
+.account-order-grid > .account-fulfilment {
+  grid-column: 1 / -1;
+}
+
+.account-order-grid .remedy-scope > p span {
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
 }
 
 .account-prizes {
@@ -2652,6 +2805,12 @@ legend {
   background: var(--room-2);
 }
 
+.focused-record {
+  border-color: var(--cyan);
+  box-shadow: 0 0 0 2px rgba(114, 217, 237, .16);
+  outline: 0;
+}
+
 .admin-record > summary {
   min-height: 72px;
   display: grid;
@@ -2711,8 +2870,25 @@ legend {
 
 .admin-record > .mini-timeline,
 .admin-record > .event-list,
-.admin-record > .record-actions {
+.admin-record > .record-actions,
+.admin-record > .linked-records {
   margin: 16px;
+}
+
+.linked-records {
+  display: grid;
+  justify-items: start;
+  gap: 7px;
+  padding: 11px;
+  border: 1px solid var(--cyan-line);
+  background: rgba(114, 217, 237, .035);
+}
+
+.linked-records > b {
+  color: var(--cyan);
+  font: .62rem var(--mono);
+  letter-spacing: .08em;
+  text-transform: uppercase;
 }
 
 .event-list > div {
@@ -2773,6 +2949,13 @@ legend {
   margin: 16px 0;
 }
 
+.admin-record-id {
+  display: block;
+  margin-top: 5px;
+  color: var(--muted);
+  font: .65rem var(--mono);
+}
+
 .tracking-entry-form {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -2798,9 +2981,61 @@ legend {
   text-transform: none;
 }
 
+.remedy-choice {
+  display: grid;
+  gap: 7px;
+  margin: 16px 0;
+  padding: 12px;
+  border: 1px solid var(--cyan-line);
+}
+
+.remedy-choice label {
+  min-height: 44px;
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  padding: 7px;
+  border: 1px solid var(--hair);
+  cursor: pointer;
+}
+
+.remedy-choice input {
+  width: 18px;
+  min-height: 18px;
+  margin: 0;
+}
+
+.remedy-choice span {
+  color: var(--text);
+  font-size: .72rem;
+}
+
 .claim-record > p {
   margin: 16px;
   color: var(--muted);
+}
+
+.order-scope-list {
+  display: grid;
+  gap: 7px;
+}
+
+.order-scope {
+  display: grid;
+  gap: 4px;
+  padding: 9px;
+  border: 1px solid var(--hair);
+  background: var(--room-2);
+}
+
+.order-scope small {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.order-scope .scope-blocker {
+  color: #ffb0a2;
 }
 
 .tracking-entry-form label {
@@ -3692,6 +3927,22 @@ legend {
 
   .dialog-actions .button {
     width: 100%;
+  }
+
+  .confirm-dialog {
+    width: calc(100% - 16px);
+    max-height: calc(100dvh - 16px);
+    padding: 18px 14px;
+  }
+
+  .remedy-progress-heading,
+  .remedy-original {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .remedy-replacement {
+    margin-left: 8px;
   }
 
   .footer-legal {

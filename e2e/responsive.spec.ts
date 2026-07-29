@@ -381,6 +381,50 @@ test('admin mobile keeps fulfilment actions', async ({ page, isMobile }) => {
   await expectResponsiveInterfaceFloors(page)
 })
 
+test('320px typed remedy dialog stays scrollable, labelled, and restores its opener', async ({ page }) => {
+  test.skip(page.viewportSize()?.width !== 320, 'This exact dialog overflow regression runs at 320px.')
+  await page.addInitScript(() => localStorage.clear())
+  await page.goto('#/auth')
+  await page.getByRole('button', { name: /one-click aina demo/i }).click()
+  await page.goto('#/order/ord-delivered')
+  await page.getByRole('link', { name: /start a demo claim/i }).click()
+  await page.getByLabel(/fictional note/i).fill('DEMO mobile typed remedy dialog evidence.')
+  await page.getByRole('button', { name: /submit demo claim/i }).click()
+  await page.getByRole('button', { name: /log out/i }).click()
+  await page.getByRole('link', { name: /demo sign in/i }).click()
+  await page.getByRole('button', { name: /one-click vault admin/i }).click()
+  await page.getByRole('link', { name: 'Claims', exact: true }).click()
+  const claim = page.locator('.claim-record').first()
+  await claim.getByRole('button', { name: 'Acknowledge' }).click()
+  await page.getByRole('button', { name: /confirm note & audit/i }).click()
+  await claim.getByRole('button', { name: 'Approve' }).click()
+  await page.getByRole('button', { name: /confirm note & audit/i }).click()
+
+  const opener = claim.getByRole('button', { name: /record typed remedy/i })
+  await opener.click()
+  const dialog = page.getByRole('dialog', { name: /record typed remedy for exact claim/i })
+  await expect(dialog).toBeVisible()
+  await expect(dialog).toHaveAttribute('aria-busy', 'false')
+  await expect(dialog.getByRole('group', { name: /choose one exact remedy action/i })).toBeVisible()
+  await expect(dialog.getByLabel(/required review note/i)).toBeVisible()
+  await expectInsideViewport(dialog, page)
+  await expectInsideViewport(dialog.getByRole('button', { name: /go back/i }), page)
+  await expectInsideViewport(dialog.getByRole('button', { name: /confirm typed evidence/i }), page)
+  await expectNoRootOverflow(page)
+  await expectResponsiveInterfaceFloors(page)
+  const dialogMetrics = await dialog.evaluate((element) => ({
+    clientHeight: element.clientHeight,
+    scrollHeight: element.scrollHeight,
+    viewportHeight: window.innerHeight,
+  }))
+  expect(dialogMetrics.clientHeight).toBeLessThanOrEqual(dialogMetrics.viewportHeight - 14)
+  expect(dialogMetrics.scrollHeight).toBeGreaterThanOrEqual(dialogMetrics.clientHeight)
+
+  await page.keyboard.press('Escape')
+  await expect(dialog).toBeHidden()
+  await expect(opener).toBeFocused()
+})
+
 test('66px and 104px sticky site headers keep admin navigation below them after scrolling', async ({ page }) => {
   const width = page.viewportSize()?.width
   test.skip(

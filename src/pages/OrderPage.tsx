@@ -1,6 +1,7 @@
 import { Link, Navigate } from '../lib/router'
 import { useParams } from '../lib/router-core'
 import { Notice } from '../components/Notice'
+import { RemedyProgress } from '../components/RemedyProgress'
 import { StatusBadge } from '../components/StatusBadge'
 import { neutralOrderDeliveryCode, neutralOrderDeliveryStatus } from '../domain/orderStatus'
 import { sealedCustomerTimeline } from '../domain/orderTimeline'
@@ -20,6 +21,7 @@ export function OrderPage() {
   const shipments = state.shipments.filter((entry) => entry.orderId === order.id)
   const latestPayment = payments.at(-1)
   const claims = state.claims.filter((entry) => order.claimIds.includes(entry.id))
+  const refundAwaitingFinalAudit = claims.some((claim) => claim.remedyState === 'refund_linked')
   const everyBoxRevealed =
     boxes.length === order.boxIds.length &&
     boxes.length > 0 &&
@@ -37,7 +39,7 @@ export function OrderPage() {
             <h1>{order.id.toUpperCase()}</h1>
             <p>Created {formatDateTime(order.createdAt)} · totals, address, odds and policy are frozen snapshots.</p>
           </div>
-          {everyBoxRevealed && <StatusBadge value={order.status} />}
+          {everyBoxRevealed && <StatusBadge value={refundAwaitingFinalAudit ? 'refund_linked' : order.status} />}
         </div>
         {order.status === 'pending_payment' && (
           <Notice tone="danger">Payment is not confirmed. No prize has been assigned. <Link to={`/pay/${order.id}/${latestPayment?.id ?? 'new'}`}>Continue mock payment</Link></Notice>
@@ -59,7 +61,14 @@ export function OrderPage() {
             <div className="panel-heading"><div><span>02 / TIMELINE</span><h2>Order events</h2></div></div>
             <ol className="timeline">
               {[...visibleTimeline].reverse().map((entry) => (
-                <li key={entry.id}><span /><div><StatusBadge value={entry.status} /><b>{entry.label}</b><small>{formatDateTime(entry.at)}</small></div></li>
+                <li key={entry.id}>
+                  <span />
+                  <div>
+                    <StatusBadge value={refundAwaitingFinalAudit && entry.status === 'refunded' ? 'refund_linked' : entry.status} />
+                    <b>{refundAwaitingFinalAudit && entry.status === 'refunded' ? 'Refund recorded; final claim audit pending' : entry.label}</b>
+                    <small>{formatDateTime(entry.at)}</small>
+                  </div>
+                </li>
               ))}
             </ol>
             {!everyBoxRevealed && (
@@ -97,21 +106,31 @@ export function OrderPage() {
             <div className="claim-history-grid">
               {claims.map((claim) => (
                 <article className="panel claim-history-card" key={claim.id}>
-                  <div className="panel-heading"><div><span>{claim.id}</span><h3>{claim.kind.replaceAll('_', ' ')}</h3></div><StatusBadge value={claim.status} /></div>
+                  <div className="panel-heading">
+                    <div><span>{claim.id}</span><h3>{claim.kind.replaceAll('_', ' ')}</h3></div>
+                    <div className="status-pair">
+                      <StatusBadge value={claim.status} />
+                      {everyBoxRevealed && claim.remedyState !== 'none' && <StatusBadge value={claim.remedyState} />}
+                    </div>
+                  </div>
                   <p>{claim.note}</p>
-                  {claim.shipmentCandidateIds
-                    ? <small>Linked record: neutral order-level delivery evidence</small>
-                    : everyBoxRevealed && <small>Linked record: {claim.shipmentId ?? claim.boxId}</small>}
-                  {claim.status === 'resolved' && (
+                  {everyBoxRevealed && (
+                    <small className="breakable-id">
+                      Linked record: {claim.shipmentCandidateIds?.join(', ') ?? claim.shipmentId ?? claim.boxId ?? order.id}
+                    </small>
+                  )}
+                  {everyBoxRevealed && claim.status === 'resolved' && (
                     <div className="notice notice-info">
                       <b>Recorded resolution</b>
                       <p>{claim.resolutionOutcome?.replaceAll('_', ' ')} · {claim.resolutionReference}</p>
                       <small>{claim.resolutionNote}</small>
                     </div>
                   )}
-                  <ol className="mini-timeline">
-                    {claim.history.map((entry) => <li key={entry.id}><b>{entry.note}</b><small>{formatDateTime(entry.at)} · {entry.status}</small></li>)}
-                  </ol>
+                  {everyBoxRevealed && (
+                    <ol className="mini-timeline">
+                      {claim.history.map((entry) => <li key={entry.id}><b>{entry.note}</b><small>{formatDateTime(entry.at)} · {entry.status}</small></li>)}
+                    </ol>
+                  )}
                   <p className="fine-print">A claim never creates a refund automatically.</p>
                 </article>
               ))}
@@ -121,7 +140,7 @@ export function OrderPage() {
 
         <section className="subsection">
           <div className="subsection-heading">
-            <div><span>05 / FULFILMENT</span><h2>{everyBoxRevealed ? 'Split tracking' : 'Private-prize tracking'}</h2></div>
+            <div><span>05 / FULFILMENT</span><h2>{everyBoxRevealed ? 'Original delivery groups & remedies' : 'Private-prize tracking'}</h2></div>
             <Link to={`/claim/new?order=${order.id}`}>Start a demo claim</Link>
           </div>
           {!everyBoxRevealed && (
@@ -142,31 +161,7 @@ export function OrderPage() {
               </article>
             </div>
           ) : shipments.length ? (
-            <div className="shipment-grid">
-              {shipments.map((shipment) => (
-                <article className="panel shipment-card" key={shipment.id}>
-                  <div className="panel-heading">
-                    <div>
-                      <span>{shipment.kind}</span>
-                      <h3>{shipment.carrier}</h3>
-                    </div>
-                    <StatusBadge value={shipment.status} />
-                  </div>
-                  <p className="tracking-code">{shipment.trackingNumber}</p>
-                  <div className="shipment-flags">
-                    {shipment.insured && <span>INSURED</span>}{shipment.signatureRequired && <span>SIGNATURE REQUIRED</span>}<span>{shipment.boxIds.length} BOX</span>
-                  </div>
-                  <ol className="mini-timeline">
-                    {shipment.timeline.map((entry) => (
-                      <li key={entry.id}>
-                        <b>{entry.label}</b>
-                        <small>{formatDateTime(entry.at)}</small>
-                      </li>
-                    ))}
-                  </ol>
-                </article>
-              ))}
-            </div>
+            <RemedyProgress state={state} order={order} />
           ) : <div className="empty-state compact"><p>Fulfilment appears only after the valid paid event allocates boxes.</p></div>}
         </section>
       </div>

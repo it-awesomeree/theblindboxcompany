@@ -15,8 +15,20 @@ async function markPaymentDisputed(page: Page, paymentId: string) {
   await expect(payment.locator('summary').getByText('Disputed', { exact: true })).toBeVisible()
 }
 
+const mobile320RemedyJourneys = new Set([
+  'post-delivery return is explicitly confirmed without a refund promise',
+  'RMA creation, receipt and inspection keep the approved claim open',
+  'delivered replacement resolves its claim while the failed original stays immutable',
+  'failed digital delivery and digital reissue use only issue, sent, delivered or failed actions',
+])
+
 test.describe('desktop admin journeys', () => {
-  test.skip(({ isMobile }) => isMobile, 'Detailed admin journeys run once in installed Chrome.')
+  test.skip(
+    ({ isMobile }, testInfo) =>
+      isMobile &&
+      (testInfo.project.name !== 'mobile-320' || !mobile320RemedyJourneys.has(testInfo.title)),
+    'Detailed admin journeys run on desktop; typed remedy regressions also run at 320px.',
+  )
 
   test('direct customer access is rejected by service gate', async ({ page }) => {
     await login(page, 'customer')
@@ -102,6 +114,161 @@ test.describe('desktop admin journeys', () => {
     await expect(dialog).toContainText(/does not create a claim or refund/i)
     await dialog.getByRole('button', { name: /confirm return record & audit/i }).click()
     await expect(page.getByText(/no claim or refund was created/i)).toBeVisible()
+  })
+
+  test('RMA creation, receipt and inspection keep the approved claim open', async ({ page }) => {
+    await login(page, 'customer')
+    await page.goto('#/order/ord-delivered')
+    await page.getByRole('link', { name: /start a demo claim/i }).click()
+    await page.getByLabel(/fictional note/i).fill('DEMO delivered parcel needs typed return evidence.')
+    await page.getByRole('button', { name: /submit demo claim/i }).click()
+
+    await page.getByRole('button', { name: /log out/i }).click()
+    await page.getByRole('link', { name: /demo sign in/i }).click()
+    await page.getByRole('button', { name: /one-click vault admin/i }).click()
+    await page.getByRole('link', { name: 'Claims', exact: true }).click()
+    const claim = page.locator('.claim-record').first()
+    const claimId = (await claim.locator('summary b').first().textContent())!
+    await claim.getByRole('button', { name: 'Acknowledge' }).click()
+    await page.getByRole('button', { name: /confirm note & audit/i }).click()
+    await claim.getByRole('button', { name: 'Approve' }).click()
+    await page.getByRole('button', { name: /confirm note & audit/i }).click()
+
+    for (const [choice, state] of [
+      [/create physical return \/ rma/i, 'Rma Created'],
+      [/record rma received/i, 'Rma Received'],
+      [/record rma inspected/i, 'Rma Inspected'],
+    ] as const) {
+      await claim.getByRole('button', { name: /record typed remedy/i }).click()
+      const dialog = page.getByRole('dialog', { name: new RegExp(claimId) })
+      await expect(dialog.getByRole('radio', { name: choice })).toBeChecked()
+      await dialog.getByRole('button', { name: /confirm typed evidence/i }).click()
+      await expect(claim.getByText('Approved', { exact: true })).toBeVisible()
+      await expect(claim.getByText(state, { exact: true })).toBeVisible()
+    }
+    await expect(claim.getByText(/rma evidence · claim remains approved/i)).toBeVisible()
+    await expect(claim.getByText(/final read-only evidence/i)).toHaveCount(0)
+  })
+
+  test('delivered replacement resolves its claim while the failed original stays immutable', async ({ page }) => {
+    await login(page, 'customer')
+    await page.goto('#/order/ord-failed')
+    await page.getByRole('link', { name: /start a demo claim/i }).click()
+    await page.getByLabel('Claim type').selectOption('non_delivery')
+    await page.getByLabel(/fictional note/i).fill('DEMO original failed delivery needs replacement.')
+    await page.getByRole('button', { name: /submit demo claim/i }).click()
+
+    await page.getByRole('button', { name: /log out/i }).click()
+    await page.getByRole('link', { name: /demo sign in/i }).click()
+    await page.getByRole('button', { name: /one-click vault admin/i }).click()
+    await page.getByRole('link', { name: 'Claims', exact: true }).click()
+    const claim = page.locator('.claim-record').first()
+    const claimId = (await claim.locator('summary b').first().textContent())!
+    await claim.getByRole('button', { name: 'Acknowledge' }).click()
+    await page.getByRole('button', { name: /confirm note & audit/i }).click()
+    await claim.getByRole('button', { name: 'Approve' }).click()
+    await page.getByRole('button', { name: /confirm note & audit/i }).click()
+    await claim.getByRole('button', { name: /record typed remedy/i }).click()
+    const remedyDialog = page.getByRole('dialog', { name: new RegExp(claimId) })
+    await remedyDialog.getByRole('radio', { name: /authorize replacement shipment/i }).check()
+    await remedyDialog.getByRole('button', { name: /confirm typed evidence/i }).click()
+    await expect(claim.getByText('Approved', { exact: true })).toBeVisible()
+    await expect(claim.getByText(/claim remains approved until delivery/i)).toBeVisible()
+    await claim.getByRole('link', { name: /open linked fulfilment record/i }).click()
+
+    const replacement = page.locator('.shipment-admin-card[data-focused="true"]')
+    await expect(replacement.getByText('Replacement shipment', { exact: true })).toBeVisible()
+    for (const action of [/mark picking/i, /mark packed/i, /create label/i, /mark shipped/i, /mark delivered/i]) {
+      await replacement.getByRole('button', { name: action }).click()
+      await page.getByRole('button', { name: /confirm scan & audit/i }).click()
+    }
+    await expect(replacement.getByText('Delivered', { exact: true })).toBeVisible()
+    await replacement.getByRole('link', { name: claimId, exact: true }).click()
+    await expect(page.locator('.claim-record[data-focused="true"]').getByText('Resolved', { exact: true })).toBeVisible()
+
+    await page.getByRole('button', { name: /log out/i }).click()
+    await page.getByRole('link', { name: /demo sign in/i }).click()
+    await page.getByRole('button', { name: /one-click aina demo/i }).click()
+    await page.goto('#/order/ord-failed')
+    const originalScope = page.getByText('shp-failed').locator('xpath=ancestor::article[1]')
+    await expect(originalScope.getByText('Failed Delivery', { exact: true })).toBeVisible()
+    await expect(originalScope.locator('.remedy-replacement').getByText(/replacement delivered/i)).toBeVisible()
+  })
+
+  test('failed digital delivery and digital reissue use only issue, sent, delivered or failed actions', async ({ page }) => {
+    await login(page, 'admin')
+    await page.getByRole('link', { name: 'Fulfilment' }).click()
+    const original = page.locator('.shipment-admin-card').filter({ hasText: 'DIGITAL / shp-digital' })
+    for (const action of [/^issue$/i, /mark sent/i, /mark failed/i]) {
+      await original.getByRole('button', { name: action }).click()
+      await page.getByRole('button', { name: /confirm scan & audit/i }).click()
+    }
+    await expect(original.getByText('Failed', { exact: true })).toBeVisible()
+    await expect(original.getByText(/carrier|tracking/i)).toHaveCount(0)
+
+    await page.getByRole('button', { name: /log out/i }).click()
+    await page.getByRole('link', { name: /demo sign in/i }).click()
+    await page.getByRole('button', { name: /one-click aina demo/i }).click()
+    await page.goto('#/claim/new?order=ord-processing')
+    await page.getByLabel('Claim type').selectOption('non_delivery')
+    await expect(page.getByLabel('Order delivery')).toHaveValue('order-delivery')
+    await page.getByLabel(/fictional note/i).fill('DEMO digital delivery failed and needs reissue.')
+    await page.getByRole('button', { name: /submit demo claim/i }).click()
+
+    await page.getByRole('button', { name: /log out/i }).click()
+    await page.getByRole('link', { name: /demo sign in/i }).click()
+    await page.getByRole('button', { name: /one-click vault admin/i }).click()
+    await page.getByRole('link', { name: 'Claims', exact: true }).click()
+    const claim = page.locator('.claim-record').first()
+    const claimId = (await claim.locator('summary b').first().textContent())!
+    await claim.getByRole('button', { name: 'Acknowledge' }).click()
+    await page.getByRole('button', { name: /confirm note & audit/i }).click()
+    await claim.getByRole('button', { name: 'Approve' }).click()
+    await page.getByRole('button', { name: /confirm note & audit/i }).click()
+    await claim.getByRole('button', { name: /record typed remedy/i }).click()
+    const remedyDialog = page.getByRole('dialog', { name: new RegExp(claimId) })
+    await remedyDialog.getByRole('radio', { name: /authorize digital reissue/i }).check()
+    await remedyDialog.getByRole('button', { name: /confirm typed evidence/i }).click()
+    await claim.getByRole('link', { name: /open linked fulfilment record/i }).click()
+
+    const reissue = page.locator('.shipment-admin-card[data-focused="true"]')
+    await expect(reissue.getByText('Digital reissue', { exact: true })).toBeVisible()
+    await expect(reissue.getByText(/carrier|tracking/i)).toHaveCount(0)
+    await expect(reissue.getByRole('button', { name: /picking|packed|label|shipped/i })).toHaveCount(0)
+    for (const action of [/^issue$/i, /mark sent/i, /mark delivered/i]) {
+      await reissue.getByRole('button', { name: action }).click()
+      await page.getByRole('button', { name: /confirm scan & audit/i }).click()
+    }
+    await expect(reissue.getByText('Delivered', { exact: true })).toBeVisible()
+
+    const physical = page.locator('.shipment-admin-card').filter({ hasText: 'BULKY / shp-processing' })
+    for (const action of [/mark packed/i, /create label/i, /mark shipped/i, /mark delivered/i]) {
+      await physical.getByRole('button', { name: action }).click()
+      await page.getByRole('button', { name: /confirm scan & audit/i }).click()
+    }
+    await page.getByRole('link', { name: 'Orders', exact: true }).click()
+    const order = page.locator('.admin-record').filter({ hasText: 'ORD-PROCESSING' })
+    await order.locator('summary').click()
+    await expect(order.getByText(/2 of 2 original delivery groups complete/i)).toBeVisible()
+    await expect(order.getByText(/replacement: delivered/i)).toBeVisible()
+    await order.getByRole('button', { name: /close order/i }).click()
+    const closeDialog = page.getByRole('dialog', { name: /close this fulfilled order/i })
+    await expect(closeDialog).toContainText(/original delivery.+completed audited linked refund.+delivered replacement/i)
+    await expect(closeDialog).toContainText(/does not require every shipment row to be delivered/i)
+    await closeDialog.getByRole('button', { name: /confirm closure/i }).click()
+    await expect(order.getByText('Closed', { exact: true })).toBeVisible()
+
+    await page.getByRole('button', { name: /log out/i }).click()
+    await page.getByRole('link', { name: /demo sign in/i }).click()
+    await page.getByRole('button', { name: /one-click aina demo/i }).click()
+    await page.goto('#/open/box-processing-02')
+    await page.getByRole('button', { name: /break demo seal/i }).click()
+    await expect(page.getByRole('link', { name: /continue to fulfilment/i })).toBeVisible({ timeout: 5000 })
+    await page.getByRole('link', { name: /continue to fulfilment/i }).click()
+    const digitalScope = page.getByText('shp-digital').locator('xpath=ancestor::article[1]')
+    await expect(digitalScope.getByRole('heading', { name: 'Digital delivery' })).toBeVisible()
+    await expect(digitalScope.getByText('Failed', { exact: true })).toBeVisible()
+    await expect(digitalScope.locator('.remedy-replacement').getByText(/replacement delivered/i)).toBeVisible()
   })
 
   test('disputes hide held digital actions, retain physical evidence, and stay finance-only for customers', async ({ page }) => {

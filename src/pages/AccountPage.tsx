@@ -1,4 +1,5 @@
 import { Link, Navigate } from '../lib/router'
+import { RemedyProgress } from '../components/RemedyProgress'
 import { StatusBadge } from '../components/StatusBadge'
 import { neutralOrderDeliveryCode, neutralOrderDeliveryStatus } from '../domain/orderStatus'
 import { boxRevealEligibility, prizeForBox } from '../domain/selectors'
@@ -44,6 +45,8 @@ export function AccountPage() {
               const payment = state.payments.find((entry) => order.paymentIds.includes(entry.id) && ['succeeded', 'partially_refunded', 'refunded', 'disputed'].includes(entry.status))
               const orderBoxes = order.boxIds.map((id) => state.boxes.find((box) => box.id === id)).filter(Boolean)
               const shipments = state.shipments.filter((entry) => entry.orderId === order.id)
+              const claims = state.claims.filter((entry) => order.claimIds.includes(entry.id))
+              const refundAwaitingFinalAudit = claims.some((claim) => claim.remedyState === 'refund_linked')
               const everyBoxRevealed =
                 orderBoxes.length === order.boxIds.length &&
                 orderBoxes.length > 0 &&
@@ -52,16 +55,27 @@ export function AccountPage() {
                 <article className="panel account-order" key={order.id}>
                   <header>
                     <div><span>{formatDateTime(order.createdAt)}</span><h3>{order.id.toUpperCase()}</h3></div>
-                    {everyBoxRevealed && <StatusBadge value={order.status} />}
+                    {everyBoxRevealed && <StatusBadge value={refundAwaitingFinalAudit ? 'refund_linked' : order.status} />}
                   </header>
                   <div className="account-order-grid">
-                    <div><span>PAYMENT</span>{payment ? <><StatusBadge value={payment.status} />{payment.status === 'disputed' && <small>Captured · under dispute</small>}</> : <small>Not confirmed</small>}</div>
-                    <div><span>BOXES</span><b>{orderBoxes.length} total · {orderBoxes.filter((box) => box?.revealedAt).length} opened</b></div>
                     <div>
+                      <span>PAYMENT</span>
+                      {payment
+                        ? (
+                            <>
+                              <StatusBadge value={refundAwaitingFinalAudit ? 'refund_linked' : payment.status} />
+                              {refundAwaitingFinalAudit && <small>Refund recorded · final claim audit pending</small>}
+                              {payment.status === 'disputed' && <small>Captured · under dispute</small>}
+                            </>
+                          )
+                        : <small>Not confirmed</small>}
+                    </div>
+                    <div><span>BOXES</span><b>{orderBoxes.length} total · {orderBoxes.filter((box) => box?.revealedAt).length} opened</b></div>
+                    <div className="account-fulfilment">
                       <span>FULFILMENT</span>
                       {everyBoxRevealed
                         ? shipments.length > 0
-                          ? <>{shipments.map((shipment, index) => <span key={shipment.id}>Record {index + 1}: <StatusBadge value={shipment.status} /></span>)}</>
+                          ? <RemedyProgress state={state} order={order} compact />
                           : <small>Not queued</small>
                         : (
                           <div className="sealed-delivery-summary">

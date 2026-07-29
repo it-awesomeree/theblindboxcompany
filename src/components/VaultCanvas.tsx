@@ -151,6 +151,40 @@ interface VaultCanvasProps {
   className?: string
 }
 
+type RenderProfile = 'full' | 'balanced' | 'static'
+
+interface NavigatorRenderHints {
+  deviceMemory?: number
+  connection?: {
+    saveData?: boolean
+  }
+}
+
+const BALANCED_FRAME_INTERVAL = 1000 / 30
+
+function selectRenderProfile(): RenderProfile {
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return 'static'
+  if (window.matchMedia('(pointer: coarse)').matches) return 'balanced'
+
+  const dpr = Math.max(1, window.devicePixelRatio || 1)
+  const cores = navigator.hardwareConcurrency
+  const { deviceMemory, connection } = navigator as Navigator & NavigatorRenderHints
+  const modestProcessor = Number.isFinite(cores) && cores > 0 && cores <= 4
+  const modestMemory = typeof deviceMemory === 'number'
+    && Number.isFinite(deviceMemory)
+    && deviceMemory > 0
+    && deviceMemory <= 4
+
+  if (
+    connection?.saveData === true
+    || window.innerWidth < 900
+    || dpr > 2
+    || modestProcessor
+    || modestMemory
+  ) return 'balanced'
+  return 'full'
+}
+
 export function VaultCanvas({
   openSignal = 0,
   holdOpen = false,
@@ -160,7 +194,7 @@ export function VaultCanvas({
 }: VaultCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const fallbackRef = useRef<HTMLDivElement>(null)
-  const engineRef = useRef<{ setOpen: (open: boolean) => void; destroy: () => void } | null>(null)
+  const engineRef = useRef<{ setOpen: (open: boolean) => void } | null>(null)
   const usingFallbackRef = useRef(false)
 
   useEffect(() => {
@@ -182,11 +216,18 @@ export function VaultCanvas({
       }
       usingFallbackRef.current = true
     }
-    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    const profile = selectRenderProfile()
+    canvas.dataset.renderProfile = profile
     const forceFallback = new URLSearchParams(window.location.search).has('nogl')
     let gl: WebGLRenderingContext | null = null
     try {
-      if (!forceFallback) gl = canvas.getContext('webgl', { antialias: false, alpha: false, powerPreference: 'high-performance' })
+      if (!forceFallback) {
+        gl = canvas.getContext('webgl', {
+          antialias: false,
+          alpha: false,
+          powerPreference: profile === 'full' ? 'high-performance' : 'low-power',
+        })
+      }
     } catch {
       gl = null
     }
@@ -288,8 +329,9 @@ export function VaultCanvas({
       flash: gl.getUniformLocation(program, 'uFlash'),
     }
     let running = true
-    let visible = true
-    let frame = 0
+    let pageVisible = document.visibilityState !== 'hidden'
+    let onScreen = true
+    let frameId: number | null = null
     let openTarget = 0
     let openNow = 0
     let flash = 0
@@ -298,8 +340,11 @@ export function VaultCanvas({
     let mouseX = 0
     let mouseY = 0
     let renderedFrames = 0
-    const resize = () => {
-      const scale = Math.min(window.devicePixelRatio || 1, 1.5)
+    let lastDrawTime = 0
+    const resizeDimensions = () => {
+      if (!running || resourcesReleased) return
+      const dprCap = profile === 'full' ? 1.5 : 1
+      const scale = Math.min(window.devicePixelRatio || 1, dprCap)
       const width = Math.max(1, Math.round(canvas.clientWidth * scale))
       const height = Math.max(1, Math.round(canvas.clientHeight * scale))
       if (canvas.width !== width || canvas.height !== height) {
@@ -309,8 +354,9 @@ export function VaultCanvas({
       }
     }
     const draw = (time: number) => {
-      resize()
-      openNow += (openTarget - openNow) * (reduce ? 1 : 0.12)
+      if (!running || resourcesReleased) return
+      resizeDimensions()
+      openNow += (openTarget - openNow) * (profile === 'static' ? 1 : 0.12)
       flash *= 0.86
       mouseX += (mouseTargetX - mouseX) * 0.06
       mouseY += (mouseTargetY - mouseY) * 0.06
@@ -320,16 +366,35 @@ export function VaultCanvas({
       gl!.uniform1f(uniforms.open, openNow)
       gl!.uniform1f(uniforms.flash, flash)
       gl!.drawArrays(gl!.TRIANGLES, 0, 3)
+      lastDrawTime = time
       if (renderedFrames < 2) {
         renderedFrames += 1
         canvas.dataset.webglRenderer = 'live'
         canvas.dataset.webglFrame = String(renderedFrames)
       }
     }
-    const loop = (time: number) => {
-      if (!running) return
-      if (visible) draw(time)
-      frame = window.requestAnimationFrame(loop)
+    const stopLoop = () => {
+      if (frameId === null) return
+      window.cancelAnimationFrame(frameId)
+      frameId = null
+    }
+    const canSchedule = () => (
+      running
+      && !resourcesReleased
+      && profile !== 'static'
+      && pageVisible
+      && onScreen
+    )
+    const schedule = () => {
+      if (!canSchedule() || frameId !== null) return
+      frameId = window.requestAnimationFrame((time) => {
+        frameId = null
+        if (!canSchedule()) return
+        if (profile === 'full' || time - lastDrawTime >= BALANCED_FRAME_INTERVAL) {
+          draw(time)
+        }
+        schedule()
+      })
     }
     const onMove = (event: PointerEvent) => {
       const bounds = canvas.getBoundingClientRect()
@@ -340,40 +405,64 @@ export function VaultCanvas({
       mouseTargetX = 0
       mouseTargetY = 0
     }
-    const observer = new IntersectionObserver(([entry]) => { visible = entry.isIntersecting }, { threshold: 0.02 })
+    const onResize = () => {
+      if (!running || resourcesReleased) return
+      if (profile === 'static') {
+        draw(0)
+      } else {
+        resizeDimensions()
+      }
+    }
+    const onVisibilityChange = () => {
+      pageVisible = document.visibilityState !== 'hidden'
+      if (pageVisible) {
+        schedule()
+      } else {
+        stopLoop()
+      }
+    }
+    const observer = new IntersectionObserver(([entry]) => {
+      if (!entry) return
+      onScreen = entry.isIntersecting
+      if (onScreen) {
+        schedule()
+      } else {
+        stopLoop()
+      }
+    }, { threshold: 0.02 })
     observer.observe(canvas)
     canvas.addEventListener('pointermove', onMove)
     canvas.addEventListener('pointerleave', onLeave)
-    window.addEventListener('resize', resize)
+    window.addEventListener('resize', onResize)
+    document.addEventListener('visibilitychange', onVisibilityChange)
     engineRef.current = {
       setOpen(open) {
+        if (!running || resourcesReleased) return
         openTarget = open ? 1 : 0
         if (open) flash = 1
-        if (reduce) draw(0)
-      },
-      destroy() {
-        running = false
-        window.cancelAnimationFrame(frame)
+        if (profile === 'static') draw(0)
       },
     }
     const onContextLost = (event: Event) => {
       event.preventDefault()
       running = false
-      window.cancelAnimationFrame(frame)
+      stopLoop()
       releaseResources()
+      engineRef.current = null
       showFallback()
     }
     canvas.addEventListener('webglcontextlost', onContextLost)
     draw(0)
-    if (!reduce) frame = window.requestAnimationFrame(loop)
+    schedule()
     return () => {
       running = false
-      window.cancelAnimationFrame(frame)
+      stopLoop()
       observer.disconnect()
       canvas.removeEventListener('pointermove', onMove)
       canvas.removeEventListener('pointerleave', onLeave)
       canvas.removeEventListener('webglcontextlost', onContextLost)
-      window.removeEventListener('resize', resize)
+      window.removeEventListener('resize', onResize)
+      document.removeEventListener('visibilitychange', onVisibilityChange)
       releaseResources()
       engineRef.current = null
     }

@@ -1,6 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { BOX_PRICE_SEN, DEMO_ADMIN_ID, PRIZES, type AdminSection } from '../src/domain/constants'
+import {
+  BOX_PRICE_SEN,
+  DEMO_ADMIN_ID,
+  PRIZES,
+  VALUE_FLOOR_SEN,
+  type AdminSection,
+} from '../src/domain/constants'
 import { AUDIT_EVIDENCE_MAX_BYTES } from '../src/domain/auditEvidence'
+import { exactOddsLabel } from '../src/domain/odds'
+import { sealedCustomerTimeline } from '../src/domain/orderTimeline'
 import type { Role } from '../src/domain/types'
 import { createDemoState, DEMO_ADDRESS } from '../src/data/fixtures'
 import { STORAGE_KEY } from '../src/data/MockRepository'
@@ -142,9 +150,24 @@ describe('customer, payment, allocation and admin services', () => {
       shippingSen: 1200,
       totalSen: 21_200,
     })
+    expect(order.snapshot.valueFloorSen).toBe(VALUE_FLOOR_SEN)
+    expect(createDemoState().orders.every((fixtureOrder) =>
+      fixtureOrder.snapshot.valueFloorSen === VALUE_FLOOR_SEN)).toBe(true)
     expect(order.boxIds).toHaveLength(2)
     expect(services.repository.getSnapshot().series[0].reservedBoxes).toBe(2)
     expect(services.repository.getSnapshot().cart).toHaveLength(0)
+  })
+
+  it('persists the checkout value-floor snapshot as integer sen', () => {
+    const storage = new MemoryStorage()
+    const isolated = new AppServices(storage, () => FIXED_NOW)
+    const order = checkout(isolated)
+    const persisted = JSON.parse(storage.getItem(STORAGE_KEY)!) as {
+      orders: Array<{ id: string; snapshot: { valueFloorSen: number } }>
+    }
+
+    expect(persisted.orders.find((entry) => entry.id === order.id)?.snapshot.valueFloorSen)
+      .toBe(VALUE_FLOOR_SEN)
   })
 
   it('stores deterministic, cloned, JSON-round-trip-safe audit evidence', () => {
@@ -1096,7 +1119,7 @@ describe('customer, payment, allocation and admin services', () => {
     const resolved = services.payments.resolveDispute(
       'pay-unopened',
       'merchant_won',
-      'Confirmed merchant win restarting fulfilment',
+      'Confirmed merchant win for Air fryer PARCEL via Demo Express, physical not digital, box-unopened-01',
       'evt-single-picking-dispute-win',
     )
     snapshot = services.repository.getSnapshot()
@@ -1105,6 +1128,23 @@ describe('customer, payment, allocation and admin services', () => {
     expect(snapshot.orders.find((entry) => entry.id === 'ord-unopened')?.status).toBe('confirmed')
     expect(snapshot.shipments.find((entry) => entry.id === 'shp-unopened')?.status).toBe('unfulfilled')
     expect(snapshot.boxes.find((entry) => entry.id === 'box-unopened-01')?.status).toBe('paid_unopened')
+    const storedTimeline = structuredClone(
+      snapshot.orders.find((entry) => entry.id === 'ord-unopened')!.timeline,
+    )
+    const visibleTimeline = sealedCustomerTimeline(
+      snapshot.orders.find((entry) => entry.id === 'ord-unopened')!,
+    )
+    expect(visibleTimeline.map((entry) => entry.label)).toEqual([
+      'Demo order created',
+      'Mock payment confirmed',
+      'Demo order placed on disputed financial hold',
+      'Demo financial hold resolved',
+    ])
+    expect(JSON.stringify(visibleTimeline)).not.toMatch(
+      /Air fryer|PARCEL|Demo Express|physical|digital|box-unopened|merchant win/i,
+    )
+    expect(snapshot.orders.find((entry) => entry.id === 'ord-unopened')!.timeline)
+      .toEqual(storedTimeline)
     expect(() => validateDemoState(snapshot)).not.toThrow()
   })
 
@@ -1449,9 +1489,32 @@ describe('customer, payment, allocation and admin services', () => {
     })
     expect(damage.changed).toBe(true)
     expect(duplicate).toMatchObject({ changed: false, data: { id: damage.data.id } })
+    expect(valueFloor.message).toMatch(
+      /suspected RM\s*100\.00 value-floor issue.+review threshold.+eligibility does not establish a breach/i,
+    )
     expect(new Set([damage.data.id, valueFloor.data.id, nonDelivery.data.id]).size).toBe(3)
     expect(damage.data.id).toMatch(/^clm-[a-z0-9]{8}-[a-z0-9]{7}$/)
     expect(damage.data.requestId).toMatch(/^req-claim-/)
+  })
+
+  it('uses the order historical floor in the cautious value-floor submission message', () => {
+    services.repository.update((state) => {
+      state.orders.find((order) => order.id === 'ord-delivered')!
+        .snapshot.valueFloorSen = 12_500
+    })
+    services.auth.oneClick('customer')
+
+    const result = services.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'value_floor',
+      boxId: 'box-delivered-01',
+      note: 'DEMO historical value-floor evidence review',
+    })
+
+    expect(result.message).toMatch(
+      /suspected RM\s*125\.00 value-floor issue.+only a review threshold.+does not establish a breach/i,
+    )
+    expect(result.message).not.toMatch(/RM\s*100(?:\.00)?/i)
   })
 
   it('stores sealed delivery claims at order level without allowing exact shipment or sealed value-floor links', () => {
@@ -2047,6 +2110,11 @@ describe('customer, payment, allocation and admin services', () => {
     expect(snapshot.series.find((entry) => entry.status === 'draft')?.draftPrizes?.[0].name).toBe('Draft Maggi Demo')
     expect(snapshot.series.find((entry) => entry.status === 'draft')?.draftPrizes?.[0].shortName)
       .toBe(originalShortName)
+    const edited = snapshot.series.find((entry) => entry.status === 'draft')!.draftPrizes![0]
+    expect(edited.odds).toBe(exactOddsLabel(
+      edited.allocation,
+      snapshot.series.find((entry) => entry.status === 'draft')!.allocationTotal,
+    ))
     expect(() => services.admin.editDraftPrize('maggi', 'Bad floor', 9_999)).toThrow(/RM100 floor/i)
 
     for (const name of ['', '   ', '\n\t']) {

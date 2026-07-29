@@ -7,10 +7,13 @@ import type {
   ShipmentStatus,
   ShippingMethod,
 } from './types'
+import { exactOddsLabel } from './odds'
 
 export const SCHEMA_VERSION = 6 as const
 export const SERIES_ID = 'series-001'
 export const BOX_PRICE_SEN = 10_000
+export const VALUE_FLOOR_SEN = 10_000
+export const SERIES_ALLOCATION_TOTAL = 10_000
 export const MAX_CART_QUANTITY = 10
 export const RESERVATION_MINUTES = 15
 
@@ -57,18 +60,25 @@ export const ADMIN_SECTION_PERMISSIONS: Record<AdminSection, Role[]> = {
   audit: ['admin', 'super_admin'],
 }
 
+const withExactOdds = (
+  definition: Omit<PrizeDefinition, 'odds'>,
+): PrizeDefinition => ({
+  ...definition,
+  odds: exactOddsLabel(definition.allocation, SERIES_ALLOCATION_TOTAL),
+})
+
 export const PRIZES: PrizeDefinition[] = [
-  { id: 'maggi', name: 'Maggi mee × 100 peket', shortName: 'Maggi ×100', valueSen: 13_000, allocation: 2500, odds: '1 in 4', tier: 'Dapur', fulfilment: 'BULKY', insured: false, signatureRequired: false },
-  { id: 'water', name: 'Air mineral × 100 botol', shortName: 'Water ×100', valueSen: 12_000, allocation: 2500, odds: '1 in 4', tier: 'Dapur', fulfilment: 'BULKY', insured: false, signatureRequired: false },
-  { id: 'toilet-roll', name: 'Tisu tandas × 100 gulung', shortName: 'Toilet roll ×100', valueSen: 12_000, allocation: 1250, odds: '1 in 8', tier: 'Dapur', fulfilment: 'BULKY', insured: false, signatureRequired: false },
-  { id: 'eggs', name: 'Telur gred A × 300 biji', shortName: 'Eggs ×300', valueSen: 15_000, allocation: 1250, odds: '1 in 8', tier: 'Dapur', fulfilment: 'BULKY', insured: false, signatureRequired: false },
-  { id: 'rice', name: 'Beras 10kg × 4 karung', shortName: 'Rice 10kg ×4', valueSen: 14_000, allocation: 1000, odds: '1 in 10', tier: 'Dapur', fulfilment: 'BULKY', insured: false, signatureRequired: false },
-  { id: 'tng', name: "Touch 'n Go reload — RM100 tepat", shortName: 'TNG reload RM100', valueSen: 10_000, allocation: 1000, odds: '1 in 10', tier: 'Dapur', fulfilment: 'DIGITAL', insured: false, signatureRequired: false },
-  { id: 'air-fryer', name: 'Air fryer 5L', shortName: 'Air fryer 5L', valueSen: 29_900, allocation: 400, odds: '1 in 25', tier: 'Tech', fulfilment: 'PARCEL', insured: false, signatureRequired: false },
-  { id: 'airpods', name: 'AirPods 4 (ANC)', shortName: 'AirPods 4 ANC', valueSen: 82_900, allocation: 80, odds: '1 in 125', tier: 'Tech', fulfilment: 'PARCEL', insured: true, signatureRequired: true },
-  { id: 'ipad', name: 'iPad (A16, 128GB)', shortName: 'iPad A16 128GB', valueSen: 204_900, allocation: 16, odds: '1 in 625', tier: 'Tech', fulfilment: 'PARCEL', insured: true, signatureRequired: true },
-  { id: 'iphone17', name: 'iPhone 17 (256GB)', shortName: 'iPhone 17 256GB', valueSen: 399_900, allocation: 3, odds: '1 in 3,333', tier: 'Grail', fulfilment: 'PARCEL', insured: true, signatureRequired: true },
-  { id: 'iphone17pm', name: 'iPhone 17 Pro Max (256GB)', shortName: 'iPhone 17 Pro Max 256GB', valueSen: 599_900, allocation: 1, odds: '1 in 10,000', tier: 'Grail', fulfilment: 'PARCEL', insured: true, signatureRequired: true },
+  withExactOdds({ id: 'maggi', name: 'Maggi mee × 100 peket', shortName: 'Maggi ×100', valueSen: 13_000, allocation: 2500, tier: 'Dapur', fulfilment: 'BULKY', insured: false, signatureRequired: false }),
+  withExactOdds({ id: 'water', name: 'Air mineral × 100 botol', shortName: 'Water ×100', valueSen: 12_000, allocation: 2500, tier: 'Dapur', fulfilment: 'BULKY', insured: false, signatureRequired: false }),
+  withExactOdds({ id: 'toilet-roll', name: 'Tisu tandas × 100 gulung', shortName: 'Toilet roll ×100', valueSen: 12_000, allocation: 1250, tier: 'Dapur', fulfilment: 'BULKY', insured: false, signatureRequired: false }),
+  withExactOdds({ id: 'eggs', name: 'Telur gred A × 300 biji', shortName: 'Eggs ×300', valueSen: 15_000, allocation: 1250, tier: 'Dapur', fulfilment: 'BULKY', insured: false, signatureRequired: false }),
+  withExactOdds({ id: 'rice', name: 'Beras 10kg × 4 karung', shortName: 'Rice 10kg ×4', valueSen: 14_000, allocation: 1000, tier: 'Dapur', fulfilment: 'BULKY', insured: false, signatureRequired: false }),
+  withExactOdds({ id: 'tng', name: "Touch 'n Go reload — RM100 tepat", shortName: 'TNG reload RM100', valueSen: 10_000, allocation: 1000, tier: 'Dapur', fulfilment: 'DIGITAL', insured: false, signatureRequired: false }),
+  withExactOdds({ id: 'air-fryer', name: 'Air fryer 5L', shortName: 'Air fryer 5L', valueSen: 29_900, allocation: 400, tier: 'Tech', fulfilment: 'PARCEL', insured: false, signatureRequired: false }),
+  withExactOdds({ id: 'airpods', name: 'AirPods 4 (ANC)', shortName: 'AirPods 4 ANC', valueSen: 82_900, allocation: 80, tier: 'Tech', fulfilment: 'PARCEL', insured: true, signatureRequired: true }),
+  withExactOdds({ id: 'ipad', name: 'iPad (A16, 128GB)', shortName: 'iPad A16 128GB', valueSen: 204_900, allocation: 16, tier: 'Tech', fulfilment: 'PARCEL', insured: true, signatureRequired: true }),
+  withExactOdds({ id: 'iphone17', name: 'iPhone 17 (256GB)', shortName: 'iPhone 17 256GB', valueSen: 399_900, allocation: 3, tier: 'Grail', fulfilment: 'PARCEL', insured: true, signatureRequired: true }),
+  withExactOdds({ id: 'iphone17pm', name: 'iPhone 17 Pro Max (256GB)', shortName: 'iPhone 17 Pro Max 256GB', valueSen: 599_900, allocation: 1, tier: 'Grail', fulfilment: 'PARCEL', insured: true, signatureRequired: true }),
 ]
 
 export const SHIPPING_FEES: Record<ShippingMethod, number> = {

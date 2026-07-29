@@ -1,6 +1,7 @@
-import { SCHEMA_VERSION } from '../domain/constants'
+import { SCHEMA_VERSION, VALUE_FLOOR_SEN } from '../domain/constants'
 import { canonicalizeAuditEvidence } from '../domain/auditEvidence'
 import { cloneState, DomainError } from '../domain/guards'
+import { exactOddsLabel } from '../domain/odds'
 import type { AuditEntry, DemoState } from '../domain/types'
 import { createDemoState } from './fixtures'
 import { isDemoState, validateDemoState } from './StateValidator'
@@ -111,8 +112,36 @@ export function migrateDemoStateV5(value: unknown): DemoState {
           ? { after: canonicalizeAuditEvidence(audit.after, `Version 5 audit ${index + 1} after evidence`) }
           : {}),
       }))
+  const series = legacy.series.map((entry) => ({
+    ...entry,
+    ...(entry.publishedPrizes
+      ? {
+          publishedPrizes: entry.publishedPrizes.map((prize) => ({
+            ...prize,
+            odds: exactOddsLabel(prize.allocation, entry.allocationTotal),
+          })),
+        }
+      : {}),
+    ...(entry.draftPrizes
+      ? {
+          draftPrizes: entry.draftPrizes.map((prize) => ({
+            ...prize,
+            odds: exactOddsLabel(prize.allocation, entry.allocationTotal),
+          })),
+        }
+      : {}),
+  }))
+  const orders = legacy.orders.map((order) => ({
+    ...order,
+    snapshot: {
+      ...order.snapshot,
+      valueFloorSen: VALUE_FLOOR_SEN,
+    },
+  }))
   const candidate = {
     ...legacy,
+    series,
+    orders,
     schemaVersion: SCHEMA_VERSION,
     auditCount: audits.length,
     auditHeadId: audits.at(-1)?.id ?? '',

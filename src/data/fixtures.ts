@@ -5,7 +5,9 @@ import {
   POLICY_ACKNOWLEDGEMENT,
   PRIZES,
   SCHEMA_VERSION,
+  SERIES_ALLOCATION_TOTAL,
   SERIES_ID,
+  VALUE_FLOOR_SEN,
 } from '../domain/constants'
 import type {
   Address,
@@ -135,6 +137,7 @@ const order = (
       seriesId: SERIES_ID,
       quantity,
       unitPriceSen: BOX_PRICE_SEN,
+      valueFloorSen: VALUE_FLOOR_SEN,
       shippingMethod: 'standard',
       address: DEMO_ADDRESS,
       oddsVersion: 'series-001-v1',
@@ -266,7 +269,7 @@ const series: PrizeSeries[] = [{
   id: SERIES_ID,
   name: 'Series 001',
   status: 'published',
-  allocationTotal: 10_000,
+  allocationTotal: SERIES_ALLOCATION_TOTAL,
   reservedBoxes: 0,
   oddsVersion: 'series-001-v1',
   policyVersion: 'floor-policy-v1',

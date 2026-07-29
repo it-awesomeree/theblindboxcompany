@@ -3,6 +3,7 @@ import { Navigate } from '../lib/router'
 import { useNavigate, useSearchParams } from '../lib/router-core'
 import { Notice } from '../components/Notice'
 import type { ClaimKind } from '../domain/types'
+import { formatMYR } from '../lib/format'
 import { useAppState } from '../state/AppStateContext'
 
 export function ClaimPage() {
@@ -19,6 +20,7 @@ export function ClaimPage() {
   if (!user) return <Navigate to="/auth" replace />
   if (!order) return <Navigate to="/not-found" replace />
 
+  const formattedValueFloor = formatMYR(order.snapshot.valueFloorSen)
   const orderBoxes = state.boxes.filter((box) => box.orderId === order.id)
   const everyBoxRevealed =
     order.boxIds.length > 0 &&
@@ -28,7 +30,7 @@ export function ClaimPage() {
     ? eligible.boxes.map((box, index) => ({
         token: `box-record-${index + 1}`,
         id: box.id,
-        label: `Box ${String(box.number).padStart(2, '0')} · revealed`,
+        label: `Box ${String(box.number).padStart(2, '0')} · revealed · suspected-issue review`,
       }))
     : everyBoxRevealed
       ? eligible.shipments.map((shipment, index) => ({
@@ -80,7 +82,7 @@ export function ClaimPage() {
             <select value={kind} onChange={(event) => { setKind(event.target.value as ClaimKind); setLinkedToken('') }}>
               <option value="damage">Damage</option>
               <option value="non_delivery">Non-delivery</option>
-              <option value="value_floor">Value below RM100 floor</option>
+              <option value="value_floor">Suspected {formattedValueFloor} value-floor issue</option>
             </select>
           </label>
           <label>{kind === 'value_floor' ? 'Revealed box' : everyBoxRevealed ? 'Delivery record' : 'Order delivery'}
@@ -102,7 +104,7 @@ export function ClaimPage() {
           <button className="button" type="submit" disabled={!selectedToken}>Submit demo claim</button>
         </form>
         <p className="fine-print">
-          Damage needs delivered physical evidence. Non-delivery can use an overdue, failed, lost, or returned-to-sender delivery, but never a customer return after delivery. Value-floor review still needs that exact box revealed.
+          Damage needs delivered physical evidence. Non-delivery can use an overdue, failed, lost, or returned-to-sender delivery, but never a customer return after delivery. A suspected value-floor issue can only be reviewed after that exact box is revealed. The stored suspected-review threshold for this order is {formattedValueFloor}; eligibility for review does not mean its declared prize is actually below that threshold.
         </p>
       </div>
     </section>

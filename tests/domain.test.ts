@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { BOX_PRICE_SEN, PRIZES } from '../src/domain/constants'
+import {
+  PRIZES,
+  SERIES_ALLOCATION_TOTAL,
+  VALUE_FLOOR_SEN,
+} from '../src/domain/constants'
 import {
   canTransitionOrder,
   canTransitionBox,
@@ -25,13 +29,118 @@ import {
   shipmentTrackingActionEligibility,
 } from '../src/domain/fulfillmentEligibility'
 import { createDemoState } from '../src/data/fixtures'
+import { exactOddsLabel } from '../src/domain/odds'
+import { valueFloorClaimEligibility } from '../src/domain/claimEligibility'
+import { sealedCustomerTimeline } from '../src/domain/orderTimeline'
 
 describe('Series 001 and domain guards', () => {
   it('has exactly 10,000 fixed allocations and every value clears RM100', () => {
-    expect(PRIZES.reduce((sum, prize) => sum + prize.allocation, 0)).toBe(10_000)
-    expect(PRIZES.every((prize) => prize.valueSen >= BOX_PRICE_SEN)).toBe(true)
+    expect(PRIZES.reduce((sum, prize) => sum + prize.allocation, 0))
+      .toBe(SERIES_ALLOCATION_TOTAL)
+    expect(PRIZES.every((prize) => prize.valueSen >= VALUE_FLOOR_SEN)).toBe(true)
     expect(PRIZES.at(-1)?.allocation).toBe(1)
     expect(PRIZES.at(-1)?.valueSen).toBe(599_900)
+  })
+
+  it('derives exact canonical odds without rounding away the numerator', () => {
+    expect(exactOddsLabel(3, 10_000)).toBe('3 in 10,000')
+    expect(exactOddsLabel(2500, 10_000)).toBe('2,500 in 10,000')
+    expect(PRIZES.find((prize) => prize.id === 'iphone17')?.odds).toBe('3 in 10,000')
+    expect(PRIZES.every((prize) =>
+      prize.odds === exactOddsLabel(prize.allocation, SERIES_ALLOCATION_TOTAL)))
+      .toBe(true)
+    expect(() => exactOddsLabel(0, 10_000)).toThrow(/positive integer/i)
+    expect(() => exactOddsLabel(1.5, 10_000)).toThrow(/positive integer/i)
+    expect(() => exactOddsLabel(1, -1)).toThrow(/positive integer/i)
+    expect(() => exactOddsLabel(10_001, 10_000)).toThrow(/cannot exceed/i)
+  })
+
+  it('rejects sealed boxes and describes revealed eligibility as suspected-issue review only', () => {
+    const state = createDemoState()
+    const sealed = state.boxes.find((box) => box.id === 'box-unopened-01')
+    const revealed = state.boxes.find((box) => box.id === 'box-delivered-01')
+
+    expect(valueFloorClaimEligibility(sealed, '2026-07-29T00:00:00.000Z'))
+      .toEqual({
+        eligible: false,
+        reason: 'Review of a suspected value-floor issue requires a revealed box.',
+      })
+    expect(valueFloorClaimEligibility(revealed, '2026-07-29T00:00:00.000Z'))
+      .toEqual({
+        eligible: true,
+        reason: 'This revealed box is eligible for review of a suspected value-floor issue.',
+      })
+    expect(valueFloorClaimEligibility(revealed, '2026-07-18T07:59:59.999Z').eligible)
+      .toBe(false)
+  })
+
+  it('shows one neutral resolution after a sealed dispute without mutating or leaking stored reasons', () => {
+    const order = structuredClone(
+      createDemoState().orders.find((entry) => entry.id === 'ord-unopened')!,
+    )
+    order.status = 'confirmed'
+    order.timeline.push(
+      {
+        id: 'tl-secret-progress',
+        status: 'processing',
+        label: 'Air fryer PARCEL via Demo Express for box-unopened-01',
+        at: '2026-07-28T01:00:00.000Z',
+      },
+      {
+        id: 'tl-secret-hold',
+        status: 'disputed',
+        label: 'Admin reason with physical and digital split secrets',
+        at: '2026-07-28T02:00:00.000Z',
+        financialHoldPreviousStatus: 'processing',
+      },
+      {
+        id: 'tl-secret-resolved',
+        status: 'confirmed',
+        label: 'Merchant won because Air fryer ships by Demo Express',
+        at: '2026-07-28T03:00:00.000Z',
+      },
+      {
+        id: 'tl-secret-after',
+        status: 'processing',
+        label: 'Shipment restarted for box-unopened-01',
+        at: '2026-07-28T04:00:00.000Z',
+      },
+    )
+    const stored = structuredClone(order.timeline)
+
+    const visible = sealedCustomerTimeline(order)
+
+    expect(visible.map(({ id, status, at, label }) => ({ id, status, at, label })))
+      .toEqual([
+        {
+          id: order.timeline[0].id,
+          status: 'pending_payment',
+          at: order.timeline[0].at,
+          label: 'Demo order created',
+        },
+        {
+          id: order.timeline[1].id,
+          status: 'confirmed',
+          at: order.timeline[1].at,
+          label: 'Mock payment confirmed',
+        },
+        {
+          id: 'tl-secret-hold',
+          status: 'disputed',
+          at: '2026-07-28T02:00:00.000Z',
+          label: 'Demo order placed on disputed financial hold',
+        },
+        {
+          id: 'tl-secret-resolved',
+          status: 'confirmed',
+          at: '2026-07-28T03:00:00.000Z',
+          label: 'Demo financial hold resolved',
+        },
+      ])
+    expect(JSON.stringify(visible)).not.toMatch(
+      /Air fryer|PARCEL|Demo Express|box-unopened|physical|digital|merchant won/i,
+    )
+    expect(order.timeline).toEqual(stored)
   })
 
   it('formats integer sen as MYR', () => {

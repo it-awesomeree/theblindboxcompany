@@ -7,6 +7,7 @@ import {
   PAYMENT_TRANSITIONS,
   POLICY_ACKNOWLEDGEMENT,
   SCHEMA_VERSION,
+  SERIES_ALLOCATION_TOTAL,
   SERIES_ID,
   SHIPPING_FEES,
   SHIPMENT_TRANSITIONS,
@@ -301,7 +302,7 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
   assert(
     publishedSeries.length === 1 &&
       publishedSeries[0].id === SERIES_ID &&
-      publishedSeries[0].allocationTotal === 10_000,
+      publishedSeries[0].allocationTotal === SERIES_ALLOCATION_TOTAL,
     'Published Series 001 must contain exactly 10,000 boxes.',
   )
   for (const series of state.series) {
@@ -313,7 +314,8 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
       assert(Array.isArray(series.publishedPrizes) && series.publishedPrizes.length > 0, 'Published series snapshot is required.')
       unique(series.publishedPrizes.map((prize) => prize.id), 'Published prize')
       assert(
-        series.publishedPrizes.every(isValidPrizeDefinition),
+        series.publishedPrizes.every((prize) =>
+          isValidPrizeDefinition(prize, series.allocationTotal)),
         'Published prize definitions are invalid.',
       )
       assert(
@@ -342,7 +344,8 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
       )
       unique(series.draftPrizes.map((prize) => prize.id), 'Draft prize')
       assert(
-        series.draftPrizes.every(isValidPrizeDefinition),
+        series.draftPrizes.every((prize) =>
+          isValidPrizeDefinition(prize, series.allocationTotal)),
         'Draft prize definitions are invalid.',
       )
       assert(
@@ -400,6 +403,11 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
     assert(
       integer(order.snapshot.quantity, 1) && order.snapshot.quantity <= MAX_CART_QUANTITY,
       'Order quantity is invalid.',
+    )
+    assert(
+      Number.isSafeInteger(order.snapshot.valueFloorSen) &&
+        order.snapshot.valueFloorSen > 0,
+      'Order value-floor snapshot must be a positive bounded safe integer-sen amount.',
     )
     assert(
       [order.snapshot.unitPriceSen, order.snapshot.totals.itemSubtotalSen, order.snapshot.totals.shippingSen, order.snapshot.totals.totalSen]

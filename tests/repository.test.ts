@@ -7,7 +7,12 @@ import {
   canonicalizeAuditEvidence,
 } from '../src/domain/auditEvidence'
 import { CLAIM_EVIDENCE_WIDENING_NOTE } from '../src/domain/claimStatus'
-import { BOX_PRICE_SEN, MAX_CART_QUANTITY } from '../src/domain/constants'
+import {
+  BOX_PRICE_SEN,
+  MAX_CART_QUANTITY,
+  VALUE_FLOOR_SEN,
+} from '../src/domain/constants'
+import { exactOddsLabel } from '../src/domain/odds'
 import type { DemoState } from '../src/domain/types'
 import { AppServices } from '../src/services/AppServices'
 import {
@@ -140,6 +145,19 @@ function auditBusinessFields(audit: DemoState['audits'][number]) {
 function toVersion5(state: DemoState = createDemoState()) {
   const businessState = structuredClone(state) as Partial<DemoState>
   const audits = state.audits.map(auditBusinessFields)
+  for (const order of businessState.orders ?? []) {
+    delete (order.snapshot as Partial<typeof order.snapshot>).valueFloorSen
+  }
+  for (const series of businessState.series ?? []) {
+    for (const prize of [
+      ...(series.publishedPrizes ?? []),
+      ...(series.draftPrizes ?? []),
+    ]) {
+      prize.odds = prize.id === 'iphone17'
+        ? '1 in 3,333'
+        : `legacy odds ${prize.allocation}`
+    }
+  }
   delete businessState.auditCount
   delete businessState.auditHeadId
   delete businessState.audits
@@ -148,6 +166,26 @@ function toVersion5(state: DemoState = createDemoState()) {
     schemaVersion: 5 as const,
     audits,
   }
+}
+
+function ordersWithoutValueFloor(orders: DemoState['orders']) {
+  return structuredClone(orders).map((order) => {
+    delete (order.snapshot as Partial<typeof order.snapshot>).valueFloorSen
+    return order
+  })
+}
+
+function seriesWithoutOdds(series: DemoState['series']) {
+  const copy = structuredClone(series)
+  for (const entry of copy) {
+    for (const prize of [
+      ...(entry.publishedPrizes ?? []),
+      ...(entry.draftPrizes ?? []),
+    ]) {
+      delete (prize as Partial<typeof prize>).odds
+    }
+  }
+  return copy
 }
 
 function stateWithTwoAudits() {
@@ -194,7 +232,10 @@ describe('MockRepository recovery and persistence', () => {
   })
 
   it('migrates valid custom version 5 business data once and then loads version 6 without writes', () => {
-    const custom = servicesWithClaim('damage').repository.exportForTest()
+    const customServices = servicesWithClaim('damage')
+    customServices.auth.oneClick('admin')
+    customServices.admin.copyPublishedToDraft()
+    const custom = customServices.repository.exportForTest()
     custom.revision = 42
     custom.sessionUserId = 'usr-demo-customer'
     custom.cart[0].quantity = 3
@@ -210,7 +251,24 @@ describe('MockRepository recovery and persistence', () => {
     expect(snapshot.schemaVersion).toBe(6)
     expect(snapshot.revision).toBe(legacy.revision)
     expect(snapshot.users).toEqual(legacy.users)
-    expect(snapshot.orders).toEqual(legacy.orders)
+    expect(ordersWithoutValueFloor(snapshot.orders)).toEqual(legacy.orders)
+    expect(snapshot.orders.every((order) =>
+      order.snapshot.valueFloorSen === VALUE_FLOOR_SEN)).toBe(true)
+    expect(seriesWithoutOdds(snapshot.series)).toEqual(seriesWithoutOdds(legacy.series!))
+    for (const series of snapshot.series) {
+      for (const prize of [
+        ...(series.publishedPrizes ?? []),
+        ...(series.draftPrizes ?? []),
+      ]) {
+        expect(prize.odds).toBe(exactOddsLabel(prize.allocation, series.allocationTotal))
+      }
+      expect((series.publishedPrizes ?? series.draftPrizes)
+        ?.find((prize) => prize.id === 'iphone17')?.odds).toBe('3 in 10,000')
+    }
+    expect(legacy.series?.every((series) =>
+      (series.publishedPrizes ?? series.draftPrizes)
+        ?.find((prize) => prize.id === 'iphone17')?.odds === '1 in 3,333'))
+      .toBe(true)
     expect(snapshot.payments).toEqual(legacy.payments)
     expect(snapshot.boxes).toEqual(legacy.boxes)
     expect(snapshot.shipments).toEqual(legacy.shipments)
@@ -259,7 +317,10 @@ describe('MockRepository recovery and persistence', () => {
       auditHeadId: 'audit-migration-v5-empty-anchor',
     })
     expect(snapshot.users).toEqual(legacy.users)
-    expect(snapshot.orders).toEqual(legacy.orders)
+    expect(ordersWithoutValueFloor(snapshot.orders)).toEqual(legacy.orders)
+    expect(snapshot.orders.every((order) =>
+      order.snapshot.valueFloorSen === VALUE_FLOOR_SEN)).toBe(true)
+    expect(seriesWithoutOdds(snapshot.series)).toEqual(seriesWithoutOdds(legacy.series!))
     expect(snapshot.payments).toEqual(legacy.payments)
     expect(snapshot.boxes).toEqual(legacy.boxes)
     expect(snapshot.shipments).toEqual(legacy.shipments)
@@ -804,6 +865,27 @@ describe('MockRepository recovery and persistence', () => {
     expect(() => validateDemoState(services.repository.getSnapshot())).not.toThrow()
   })
 
+  it('accepts a different positive historical value-floor snapshot', () => {
+    const state = createDemoState()
+    state.orders[0].snapshot.valueFloorSen = 12_500
+
+    expect(() => validateDemoState(state)).not.toThrow()
+  })
+
+  it.each([
+    ['zero', 0],
+    ['negative', -1],
+    ['fractional', 12_500.5],
+    ['unsafe and too large', Number.MAX_SAFE_INTEGER + 1],
+  ] as const)('rejects a %s order value-floor snapshot', (_label, valueFloorSen) => {
+    const state = createDemoState()
+    state.orders[0].snapshot.valueFloorSen = valueFloorSen
+
+    expect(() => validateDemoState(state)).toThrow(
+      /positive bounded safe integer-sen amount/i,
+    )
+  })
+
   it.each(['oddsVersion', 'policyVersion'] as const)(
     'rejects an order snapshot whose %s does not match its published series',
     (versionKey) => {
@@ -1165,6 +1247,9 @@ describe('MockRepository recovery and persistence', () => {
     ['blank odds', (state: DemoState) => {
       state.series.find((entry) => entry.status === 'draft')!.draftPrizes![0].odds = ''
     }],
+    ['odds drift from allocation truth', (state: DemoState) => {
+      state.series.find((entry) => entry.status === 'draft')!.draftPrizes![0].odds = '1 in 4'
+    }],
     ['invalid tier', (state: DemoState) => {
       state.series.find((entry) => entry.status === 'draft')!.draftPrizes![0].tier = 'Ultra' as never
     }],
@@ -1187,6 +1272,20 @@ describe('MockRepository recovery and persistence', () => {
 
     expect(repository.recoveryNotice).toMatch(/replaced/i)
     expect(repository.getSnapshot()).toEqual(createDemoState())
+  })
+
+  it('recovers persisted published odds that drift from allocation truth', () => {
+    const malformed = createDemoState()
+    malformed.series[0].publishedPrizes!
+      .find((prize) => prize.id === 'iphone17')!.odds = '1 in 3,333'
+    const storage = new MemoryStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(malformed))
+
+    const repository = new MockRepository(storage)
+
+    expect(repository.recoveryNotice).toMatch(/replaced/i)
+    expect(repository.getSnapshot().series[0].publishedPrizes!
+      .find((prize) => prize.id === 'iphone17')?.odds).toBe('3 in 10,000')
   })
 
   it.each([
@@ -1326,6 +1425,19 @@ describe('MockRepository recovery and persistence', () => {
     ['missing order snapshot', (state) => { delete (state.orders[0] as Partial<DemoState['orders'][number]>).snapshot }],
     ['missing order totals', (state) => { delete (state.orders[0].snapshot as Partial<DemoState['orders'][number]['snapshot']>).totals }],
     ['missing order address', (state) => { delete (state.orders[0].snapshot as Partial<DemoState['orders'][number]['snapshot']>).address }],
+    ['missing order value-floor snapshot', (state) => {
+      delete (state.orders[0].snapshot as Partial<DemoState['orders'][number]['snapshot']>)
+        .valueFloorSen
+    }],
+    ['zero order value-floor snapshot', (state) => {
+      state.orders[0].snapshot.valueFloorSen = 0
+    }],
+    ['fractional order value-floor snapshot', (state) => {
+      state.orders[0].snapshot.valueFloorSen = VALUE_FLOOR_SEN + 0.5
+    }],
+    ['published prize odds drift', (state) => {
+      state.series[0].publishedPrizes![0].odds = '1 in 4'
+    }],
     ['non-fictional order address', (state) => { state.orders[0].snapshot.address.line1 = '12 Real Street' }],
     ['non-fictional order phone', (state) => { state.orders[0].snapshot.address.phone = '010-123-4567' }],
     ['unnormalized order address', (state) => { state.orders[0].snapshot.address.city = '  Kuala Lumpur  ' }],

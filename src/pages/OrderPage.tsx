@@ -51,6 +51,7 @@ export function OrderPage() {
               <div><dt>Shipping</dt><dd>{order.snapshot.shippingMethod} · {formatMYR(order.snapshot.totals.shippingSen)}</dd></div>
               <div><dt>Total</dt><dd className="money">{formatMYR(order.snapshot.totals.totalSen)}</dd></div>
               <div><dt>Odds / policy</dt><dd>{order.snapshot.oddsVersion}<br />{order.snapshot.policyVersion}</dd></div>
+              <div><dt>Value-floor review snapshot</dt><dd>{formatMYR(order.snapshot.valueFloorSen)} · suspected-issue threshold only, not a breach finding</dd></div>
               <div><dt>Fake address</dt><dd>{order.snapshot.address.recipient}<br />{order.snapshot.address.line1}<br />{order.snapshot.address.postcode} {order.snapshot.address.city}</dd></div>
             </dl>
           </div>
@@ -80,7 +81,7 @@ export function OrderPage() {
                   <div className="box-icon" aria-hidden="true"><span>{box.revealedAt ? 'OPEN' : 'SEALED'}</span></div>
                   {everyBoxRevealed && <StatusBadge value={box.status} />}
                   <h3>{box.revealedAt ? prize?.name : box.prizeId ? 'Paid prize sealed' : 'Waiting for payment'}</h3>
-                  <p>{box.revealedAt ? `${formatMYR(prize?.valueSen ?? 0)} · ${prize?.tier}` : 'The opener cannot choose or change this allocation.'}</p>
+                  <p>{box.revealedAt ? `Declared fixture value ${formatMYR(prize?.valueSen ?? 0)} · ${prize?.tier} · not a finding of a value-floor breach` : 'The opener cannot choose or change this allocation.'}</p>
                   {box.prizeId && reveal.eligible && (
                     <Link className="button button-full" to={`/open/${box.id}`}>{box.revealedAt ? 'View immutable reveal' : 'Open now'}</Link>
                   )}

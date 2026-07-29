@@ -123,6 +123,7 @@ export interface OrderSnapshot {
   seriesId: string
   quantity: number
   unitPriceSen: number
+  valueFloorSen: number
   shippingMethod: ShippingMethod
   address: Address
   oddsVersion: string

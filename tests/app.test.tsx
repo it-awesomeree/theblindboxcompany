@@ -13,6 +13,7 @@ import { VaultCanvas } from '../src/components/VaultCanvas'
 import { Notice } from '../src/components/Notice'
 import { createDemoState, DEMO_ADDRESS } from '../src/data/fixtures'
 import { STORAGE_KEY } from '../src/data/MockRepository'
+import { validateDemoState } from '../src/data/StateValidator'
 import { sealedCustomerTimeline } from '../src/domain/orderTimeline'
 
 function renderApp(storage = new MemoryStorage()) {
@@ -29,6 +30,14 @@ describe('app components', () => {
     expect(screen.getByRole('heading', { name: /the blind box that always wins/i })).toBeVisible()
     expect(screen.getByText(/proposed demo tagline/i)).toBeVisible()
     expect(screen.getByText(/boosted demo opener/i)).toBeVisible()
+  })
+
+  it('renders allocation-derived exact odds without the rounded legacy label', () => {
+    renderApp()
+
+    expect(screen.getByRole('cell', { name: '3 in 10,000' })).toBeVisible()
+    expect(screen.getAllByRole('cell', { name: '2,500 in 10,000' })).toHaveLength(2)
+    expect(screen.queryByText('1 in 3,333')).not.toBeInTheDocument()
   })
 
   it('announces danger notices assertively while info and success stay polite', () => {
@@ -1472,11 +1481,51 @@ describe('app components', () => {
     expect(screen.getByText(/sealed prizes stay private/i)).toBeVisible()
 
     await user.selectOptions(screen.getByLabelText('Claim type'), 'value_floor')
-    expect(screen.getByLabelText('Revealed box')).toBeVisible()
-    expect(screen.getByRole('option', { name: /box 01 · revealed/i })).toHaveTextContent(/box 01 · revealed/i)
+    const revealedBox = screen.getByLabelText('Revealed box')
+    expect(revealedBox).toBeVisible()
+    expect(within(revealedBox).getAllByRole('option')).toHaveLength(1)
+    expect(screen.getByRole('option', { name: /box 01 · revealed · suspected-issue review/i }))
+      .toBeVisible()
     expect(screen.queryByRole('option', { name: /box-processing-02/i })).not.toBeInTheDocument()
+    expect(screen.getByText(
+      /stored suspected-review threshold for this order is RM\s*100\.00.+eligibility for review does not mean its declared prize is actually below that threshold/i,
+    )).toBeVisible()
     expect(screen.getByLabelText(/fictional note/i)).toBeVisible()
     expect(screen.getByRole('button', { name: /submit demo claim/i })).toBeEnabled()
+  })
+
+  it('uses a valid RM125 historical floor across claim and order review views', async () => {
+    const user = userEvent.setup()
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    services.repository.update((state) => {
+      state.orders.find((order) => order.id === 'ord-delivered')!
+        .snapshot.valueFloorSen = 12_500
+    })
+    expect(() => validateDemoState(services.repository.getSnapshot())).not.toThrow()
+    services.auth.oneClick('customer')
+    window.history.replaceState({}, '', '#/claim/new?order=ord-delivered')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+
+    await user.selectOptions(screen.getByLabelText('Claim type'), 'value_floor')
+    const claimMain = within(screen.getByRole('main'))
+    expect(claimMain.getByRole('option', {
+      name: /suspected RM\s*125\.00 value-floor issue/i,
+    })).toBeVisible()
+    expect(claimMain.getByText(
+      /stored suspected-review threshold for this order is RM\s*125\.00/i,
+    )).toBeVisible()
+    expect(claimMain.queryByText(/RM\s*100(?:\.00)?/i)).not.toBeInTheDocument()
+
+    cleanup()
+    window.history.replaceState({}, '', '#/order/ord-delivered')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+
+    const floorRow = screen.getByText('Value-floor review snapshot').closest('div')
+    expect(floorRow).toHaveTextContent(/RM\s*125\.00/)
+    expect(floorRow).toHaveTextContent(/suspected-issue threshold only, not a breach finding/i)
+    expect(floorRow).not.toHaveTextContent(/RM\s*100(?:\.00)?/i)
+    expect(screen.getByText(/declared fixture value.+not a finding of a value-floor breach/i))
+      .toBeVisible()
   })
 
   it('maps a sealed eligible delivery record through a neutral claim option', async () => {

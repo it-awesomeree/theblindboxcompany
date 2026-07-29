@@ -23,6 +23,7 @@ import type {
   DemoState,
 } from '../domain/types'
 import type { MockRepository } from '../data/MockRepository'
+import { formatMYR } from '../lib/format'
 import { AuditService } from './AuditService'
 
 export interface SubmitClaimInput {
@@ -135,7 +136,11 @@ export class ClaimService {
     let shipmentCandidateIds: string[] | undefined
 
     if (input.kind === 'damage' || input.kind === 'non_delivery') {
-      assert(!input.boxId, 'Delivery claims cannot link a value-floor box.', 'CLAIM_LINK_INVALID')
+      assert(
+        !input.boxId,
+        'Delivery claims cannot link a suspected value-floor issue box.',
+        'CLAIM_LINK_INVALID',
+      )
       if (everyBoxRevealed) {
         assert(
           input.shipmentId && selectedShipment && !orderLevelDelivery,
@@ -170,7 +175,7 @@ export class ClaimService {
     } else {
       assert(
         input.boxId && selectedBox && !input.shipmentId && !orderLevelDelivery,
-        'Choose the revealed box for this value-floor claim.',
+        'Choose the revealed box for suspected value-floor issue review.',
         'CLAIM_LINK_REQUIRED',
       )
       const eligibility = valueFloorClaimEligibility(selectedBox, now)
@@ -351,7 +356,9 @@ export class ClaimService {
       return {
         data: customerClaimReceipt(claim),
         changed: true,
-        message: 'Demo claim submitted for review.',
+        message: input.kind === 'value_floor'
+          ? `Suspected ${formatMYR(order.snapshot.valueFloorSen)} value-floor issue submitted for review; this is only a review threshold and eligibility does not establish a breach.`
+          : 'Demo claim submitted for review.',
       }
     })
   }

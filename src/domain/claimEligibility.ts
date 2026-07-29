@@ -64,7 +64,13 @@ export function shipmentClaimEligibility(
 
 export function valueFloorClaimEligibility(box: Box | undefined, at: string): ClaimEligibility {
   if (!box?.revealedAt || !box.prizeId || time(box.revealedAt) > time(at)) {
-    return { eligible: false, reason: 'Value-floor claims require a revealed box.' }
+    return {
+      eligible: false,
+      reason: 'Review of a suspected value-floor issue requires a revealed box.',
+    }
   }
-  return { eligible: true, reason: 'This revealed box can be used for a value-floor claim.' }
+  return {
+    eligible: true,
+    reason: 'This revealed box is eligible for review of a suspected value-floor issue.',
+  }
 }

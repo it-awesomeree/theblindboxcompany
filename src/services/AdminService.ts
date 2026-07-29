@@ -1,5 +1,10 @@
-import { ADMIN_SECTION_PERMISSIONS, type AdminSection } from '../domain/constants'
+import {
+  ADMIN_SECTION_PERMISSIONS,
+  VALUE_FLOOR_SEN,
+  type AdminSection,
+} from '../domain/constants'
 import { isOpenClaimStatus } from '../domain/claimStatus'
+import { exactOddsLabel } from '../domain/odds'
 import {
   assert,
   assertAdmin,
@@ -205,13 +210,22 @@ export class AdminService {
       assert(draft?.draftPrizes, 'Create a draft copy before editing.', 'DRAFT_MISSING')
       const prize = draft.draftPrizes.find((entry) => entry.id === prizeId)
       assert(prize, 'Draft prize was not found.', 'PRIZE_MISSING')
-      assert(Number.isInteger(valueSen) && valueSen >= 10_000, 'Every draft prize must keep the RM100 floor.', 'FLOOR_VIOLATION')
+      assert(
+        Number.isInteger(valueSen) && valueSen >= VALUE_FLOOR_SEN,
+        'Every draft prize must keep the RM100 floor.',
+        'FLOOR_VIOLATION',
+      )
       const cleanName = sanitizeText(name, 120)
       assert(cleanName.length > 0, 'Draft prize name cannot be blank.', 'INVALID_PRIZE_NAME')
       const before = structuredClone(prize)
       prize.name = cleanName
       prize.valueSen = valueSen
-      assert(isValidPrizeDefinition(prize), 'Draft prize definition is invalid.', 'INVALID_PRIZE_DEFINITION')
+      prize.odds = exactOddsLabel(prize.allocation, draft.allocationTotal)
+      assert(
+        isValidPrizeDefinition(prize, draft.allocationTotal),
+        'Draft prize definition is invalid.',
+        'INVALID_PRIZE_DEFINITION',
+      )
       const now = this.now()
       this.audit.append(state, {
         actorId: actor.id,

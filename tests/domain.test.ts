@@ -38,9 +38,11 @@ import {
 import { sealedCustomerTimeline } from '../src/domain/orderTimeline'
 import { resolveOrderFulfillment } from '../src/domain/orderFulfillment'
 import {
+  claimHoldsRemedyEntitlement,
   orderBoxSettlementAllocations,
   requiredSettlementForBoxScope,
 } from '../src/domain/remedyPolicy'
+import type { Claim } from '../src/domain/types'
 
 describe('Series 001 and domain guards', () => {
   it('has exactly 10,000 fixed allocations and every value clears RM100', () => {
@@ -253,6 +255,69 @@ describe('Series 001 and domain guards', () => {
       .toBe(order.snapshot.totals.totalSen)
     expect(requiredSettlementForBoxScope(order, ['box-7', 'box-1']))
       .toBe(20_343)
+  })
+
+  it('classifies only active and grandfathered completion claims as remedy entitlement holders', () => {
+    const base: Claim = {
+      id: 'clm-remedy-policy',
+      requestId: 'req-clm-remedy-policy',
+      orderId: 'ord-delivered',
+      userId: 'usr-customer',
+      kind: 'damage',
+      note: 'DEMO remedy policy classification',
+      shipmentId: 'shp-delivered',
+      status: 'approved',
+      remedyState: 'none',
+      remedyBoxIds: ['box-delivered-01'],
+      requiredSettlementSen: 11_200,
+      createdAt: '2026-07-28T00:00:00.000Z',
+      updatedAt: '2026-07-28T00:00:00.000Z',
+      history: [],
+    }
+    for (const remedyState of [
+      'replacement_authorized',
+      'replacement_delivered',
+      'refund_linked',
+      'refund_completed',
+    ] as const) {
+      expect(claimHoldsRemedyEntitlement({ ...base, remedyState })).toBe(true)
+    }
+    for (const resolutionOutcome of [
+      'replacement_authorized',
+      'refund_recorded',
+    ] as const) {
+      expect(claimHoldsRemedyEntitlement({
+        ...base,
+        status: 'resolved',
+        remedyState: 'none',
+        resolutionOutcome,
+      })).toBe(true)
+    }
+    for (const remedyState of [
+      'none',
+      'rma_created',
+      'rma_received',
+      'rma_inspected',
+      'no_remedy',
+    ] as const) {
+      expect(claimHoldsRemedyEntitlement({ ...base, remedyState })).toBe(false)
+    }
+    expect(claimHoldsRemedyEntitlement({
+      ...base,
+      status: 'rejected',
+      remedyState: 'replacement_authorized',
+    })).toBe(false)
+    expect(claimHoldsRemedyEntitlement({
+      ...base,
+      remedyState: 'refund_completed',
+      legacyUnderSettledRefund: true,
+    })).toBe(false)
+    expect(claimHoldsRemedyEntitlement({
+      ...base,
+      status: 'resolved',
+      remedyState: 'none',
+      resolutionOutcome: 'return_rma_created',
+    })).toBe(false)
   })
 
   it('guards box transitions while keeping reveal and shipment independent', () => {

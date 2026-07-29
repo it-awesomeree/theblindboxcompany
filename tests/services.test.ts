@@ -134,6 +134,24 @@ function approveClaim(services: AppServices, claimId: string) {
   )
 }
 
+function overlappingCrossKindClaims() {
+  const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+  services.auth.oneClick('customer')
+  const damage = services.claims.submit({
+    orderId: 'ord-delivered',
+    kind: 'damage',
+    shipmentId: 'shp-delivered',
+    note: 'DEMO overlapping delivered physical damage complaint',
+  }).data
+  const valueFloor = services.claims.submit({
+    orderId: 'ord-delivered',
+    kind: 'value_floor',
+    boxId: 'box-delivered-01',
+    note: 'DEMO overlapping revealed value-floor complaint',
+  }).data
+  return { services, damage, valueFloor }
+}
+
 function physicalReplacementScenario(
   status:
     | 'unfulfilled'
@@ -3145,6 +3163,90 @@ describe('customer, payment, allocation and admin services', () => {
       action: 'user.reactivated',
       targetId: 'usr-suspended',
     })
+  })
+
+  it('allows overlapping cross-kind complaint records before either holds a remedy entitlement', () => {
+    const { services: isolated, damage, valueFloor } = overlappingCrossKindClaims()
+    const snapshot = isolated.repository.getSnapshot()
+
+    expect(snapshot.claims.filter((claim) =>
+      [damage.id, valueFloor.id].includes(claim.id))).toHaveLength(2)
+    expect(damage.remedyBoxIds).toEqual(['box-delivered-01'])
+    expect(valueFloor.remedyBoxIds).toEqual(damage.remedyBoxIds)
+    expect([damage.remedyState, valueFloor.remedyState]).toEqual(['none', 'none'])
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+  })
+
+  it.each([
+    ['damage', 'value_floor'],
+    ['value_floor', 'damage'],
+  ] as const)(
+    'blocks a second overlapping cross-kind replacement when %s is authorized before %s',
+    (firstKind, secondKind) => {
+      const { services: isolated, damage, valueFloor } = overlappingCrossKindClaims()
+      const claims = { damage, value_floor: valueFloor }
+      approveClaim(isolated, claims[firstKind].id)
+      approveClaim(isolated, claims[secondKind].id)
+      const replacement = isolated.claims.authorizeReplacement(
+        claims[firstKind].id,
+        `Confirmed ${firstKind} overlapping replacement authorization`,
+      ).data
+      const beforeConflict = structuredClone(isolated.repository.getSnapshot())
+
+      expect(() => isolated.claims.authorizeReplacement(
+        claims[secondKind].id,
+        `Attempted ${secondKind} overlapping replacement authorization`,
+      )).toThrow(expect.objectContaining({ code: 'REMEDY_SCOPE_CONFLICT' }))
+      expect(isolated.repository.getSnapshot()).toEqual(beforeConflict)
+      expect(beforeConflict.shipments.filter((shipment) =>
+        shipment.purpose === 'replacement')).toEqual([
+        expect.objectContaining({
+          id: replacement.id,
+          sourceClaimId: claims[firstKind].id,
+          boxIds: ['box-delivered-01'],
+        }),
+      ])
+    },
+  )
+
+  it('blocks an overlapping claim refund after another claim authorizes a replacement', () => {
+    const { services: isolated, damage, valueFloor } = overlappingCrossKindClaims()
+    approveClaim(isolated, damage.id)
+    approveClaim(isolated, valueFloor.id)
+    isolated.claims.authorizeReplacement(
+      damage.id,
+      'Confirmed damage replacement before overlapping claim refund',
+    )
+    const beforeConflict = structuredClone(isolated.repository.getSnapshot())
+
+    expect(() => isolated.payments.refund(
+      'pay-delivered',
+      valueFloor.requiredSettlementSen,
+      'Attempted overlapping value-floor claim refund',
+      'req-overlap-replacement-then-refund',
+      valueFloor.id,
+    )).toThrow(expect.objectContaining({ code: 'REMEDY_SCOPE_CONFLICT' }))
+    expect(isolated.repository.getSnapshot()).toEqual(beforeConflict)
+  })
+
+  it('blocks an overlapping replacement after another claim links a refund', () => {
+    const { services: isolated, damage, valueFloor } = overlappingCrossKindClaims()
+    approveClaim(isolated, damage.id)
+    approveClaim(isolated, valueFloor.id)
+    isolated.payments.refund(
+      'pay-delivered',
+      damage.requiredSettlementSen,
+      'Confirmed damage claim refund before overlapping replacement',
+      'req-overlap-refund-then-replacement',
+      damage.id,
+    )
+    const beforeConflict = structuredClone(isolated.repository.getSnapshot())
+
+    expect(() => isolated.claims.authorizeReplacement(
+      valueFloor.id,
+      'Attempted value-floor replacement after overlapping claim refund',
+    )).toThrow(expect.objectContaining({ code: 'REMEDY_SCOPE_CONFLICT' }))
+    expect(isolated.repository.getSnapshot()).toEqual(beforeConflict)
   })
 
   it('snapshots disjoint value-floor sibling scopes and resolves only the delivered replacement box', () => {

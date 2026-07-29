@@ -1,7 +1,7 @@
 import { isOpenClaimStatus } from '../domain/claimStatus'
 import { resolveOrderFulfillment } from '../domain/orderFulfillment'
-import type { DemoState, Order, Shipment } from '../domain/types'
-import { formatDateTime } from '../lib/format'
+import type { Claim, DemoState, Order, Shipment } from '../domain/types'
+import { formatDateTime, formatMYR, titleCase } from '../lib/format'
 import { StatusBadge } from './StatusBadge'
 
 function deliveryLabel(shipment: Shipment) {
@@ -9,6 +9,16 @@ function deliveryLabel(shipment: Shipment) {
     return shipment.purpose === 'replacement' ? 'Digital reissue' : 'Digital delivery'
   }
   return shipment.purpose === 'replacement' ? 'Replacement shipment' : 'Original shipment'
+}
+
+function settlementAmountLabel(claim: Claim) {
+  return `Accepted ${formatMYR(claim.acceptedSettlementSen ?? 0)} · required ${formatMYR(claim.requiredSettlementSen)}`
+}
+
+function settlementPolicyLabel(claim: Claim) {
+  return claim.settlementPolicy
+    ? `Settlement policy: ${titleCase(claim.settlementPolicy)}`
+    : 'No valid completion settlement policy'
 }
 
 export function RemedyProgress({
@@ -26,7 +36,7 @@ export function RemedyProgress({
   return (
     <div className={`remedy-progress${compact ? ' remedy-progress-compact' : ''}`}>
       <div className="remedy-progress-heading">
-        <b>{completed} of {resolution.scopes.length} original delivery groups complete</b>
+        <b>{completed} of {resolution.scopes.length} box fulfilment scopes complete</b>
         <StatusBadge value={resolution.status} />
       </div>
       {resolution.scopes.map((scope, index) => {
@@ -37,12 +47,22 @@ export function RemedyProgress({
           .map((claimId) => state.claims.find((claim) => claim.id === claimId))
           .filter((claim) => claim !== undefined)
         const openClaims = claims.filter((claim) => isOpenClaimStatus(claim.status))
-        const replacement = state.shipments.find((shipment) =>
-          shipment.purpose === 'replacement' &&
-          shipment.replacementForShipmentId === original.id &&
-          claims.some((claim) => claim.id === shipment.sourceClaimId))
-        const refundLinked = claims.find((claim) => claim.remedyState === 'refund_linked')
-        const refundComplete = claims.find((claim) => claim.remedyState === 'refund_completed')
+        const replacement = scope.replacementShipmentId
+          ? state.shipments.find((shipment) =>
+              shipment.id === scope.replacementShipmentId &&
+              shipment.orderId === order.id &&
+              shipment.purpose === 'replacement' &&
+              scope.boxIds.every((boxId) => shipment.boxIds.includes(boxId)) &&
+              claims.some((claim) => claim.id === shipment.sourceClaimId))
+          : undefined
+        const refundLinked = claims.find((claim) =>
+          claim.remedyState === 'refund_linked' &&
+          claim.legacyUnderSettledRefund !== true)
+        const refundComplete = claims.find((claim) =>
+          claim.remedyState === 'refund_completed' &&
+          claim.legacyUnderSettledRefund !== true)
+        const legacyUnderSettledRefund = claims.find((claim) =>
+          claim.legacyUnderSettledRefund === true)
         const rma = claims.find((claim) => claim.rma)?.rma
         const completion = scope.completedBy === 'original'
           ? 'Original delivery complete'
@@ -53,12 +73,13 @@ export function RemedyProgress({
               : undefined
 
         return (
-          <article className="remedy-scope" key={scope.originalShipmentId}>
+          <article className="remedy-scope" key={`${scope.originalShipmentId}:${scope.boxIds.join(',')}`}>
             <div className="remedy-original">
               <div>
-                <span>GROUP {String(index + 1).padStart(2, '0')} / IMMUTABLE ORIGINAL EVIDENCE</span>
+                <span>SCOPE {String(index + 1).padStart(2, '0')} / IMMUTABLE ORIGINAL EVIDENCE</span>
                 <h3>{deliveryLabel(original)}</h3>
                 <small className="breakable-id">{original.id}</small>
+                <small>Scope boxes: <span className="breakable-id scope-box-ids">{scope.boxIds.join(', ')}</span></small>
               </div>
               <StatusBadge value={original.status} />
             </div>
@@ -93,6 +114,8 @@ export function RemedyProgress({
                 <p>
                   <b>Refund waiting for final claim audit</b>
                   <span className="breakable-id">{refundLinked.id} · {refundLinked.linkedRefundEventId}</span>
+                  <span>{settlementAmountLabel(refundLinked)}</span>
+                  <span>{settlementPolicyLabel(refundLinked)}</span>
                   <StatusBadge value="refund_linked" />
                 </p>
               )}
@@ -100,7 +123,18 @@ export function RemedyProgress({
                 <p>
                   <b>Audited refund complete</b>
                   <span className="breakable-id">{refundComplete.id} · {refundComplete.linkedRefundEventId}</span>
+                  <span>{settlementAmountLabel(refundComplete)}</span>
+                  <span>{settlementPolicyLabel(refundComplete)}</span>
                   <StatusBadge value="refund_completed" />
+                </p>
+              )}
+              {legacyUnderSettledRefund && (
+                <p>
+                  <b>Immutable legacy under-settled refund evidence</b>
+                  <span className="breakable-id">{legacyUnderSettledRefund.id} · {legacyUnderSettledRefund.linkedRefundEventId}</span>
+                  <span>{settlementAmountLabel(legacyUnderSettledRefund)}</span>
+                  <span>{settlementPolicyLabel(legacyUnderSettledRefund)}</span>
+                  <span>This immutable record does not complete this delivery/remedy scope.</span>
                 </p>
               )}
               {replacement && (
@@ -117,7 +151,11 @@ export function RemedyProgress({
                     {replacement.status === 'delivered'
                       ? 'Replacement delivered'
                       : ['failed', 'failed_delivery', 'lost', 'returned', 'cancelled'].includes(replacement.status)
-                        ? 'Replacement exception · claim remains open'
+                        ? refundComplete
+                          ? 'Replacement exception · box fulfilment scope was settled by refund'
+                          : refundLinked?.settlementPolicy === 'terminal_replacement_fallback'
+                            ? 'Replacement exception · settlement is waiting for final claim audit'
+                            : 'Replacement exception · claim remains open'
                         : 'Replacement in progress'}
                   </p>
                   {!compact && (
@@ -137,7 +175,7 @@ export function RemedyProgress({
               )}
               {completion && <p><b>{completion}</b><StatusBadge value={scope.status} /></p>}
               {!completion && openClaims.length === 0 && (
-                <p><b>Original delivery group is still in progress</b><StatusBadge value={scope.status} /></p>
+                <p><b>Box fulfilment scope is still in progress</b><StatusBadge value={scope.status} /></p>
               )}
             </div>
           </article>

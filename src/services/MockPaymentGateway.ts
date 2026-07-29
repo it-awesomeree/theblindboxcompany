@@ -20,6 +20,7 @@ import {
 } from '../domain/refundLink'
 import { refreshOrderFulfillment } from '../domain/orderFulfillment'
 import {
+  assertNoRemedyScopeConflict,
   isTerminalReplacementRefundFallback,
   remainingPaymentBalance,
 } from '../domain/remedyPolicy'
@@ -633,6 +634,7 @@ export class MockPaymentGateway {
           'A claim must be approved before its refund can be linked.',
           'CLAIM_NOT_APPROVED',
         )
+        assertNoRemedyScopeConflict(state.claims, linkedClaim)
         const replacement = linkedClaim.replacementShipmentId
           ? state.shipments.find((shipment) =>
               shipment.id === linkedClaim.replacementShipmentId &&

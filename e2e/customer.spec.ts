@@ -21,17 +21,16 @@ async function reachCheckout(page: Page) {
   await page.getByRole('button', { name: /create pending demo attempt/i }).click()
 }
 
-const mobile320CustomerRemedyJourneys = new Set([
-  'claim-linked full refund requires exact Payments action and separate Claims finalization',
-])
+const mobile320RemedyTag = '@mobile320-remedy'
 
 test.describe('desktop customer journeys', () => {
-  test.skip(
-    ({ isMobile }, testInfo) =>
+  test.beforeEach(({ isMobile }, testInfo) => {
+    test.skip(
       isMobile &&
-      (testInfo.project.name !== 'mobile-320' || !mobile320CustomerRemedyJourneys.has(testInfo.title)),
-    'Detailed customer journeys run on desktop; the audited refund regression also runs at 320px.',
-  )
+        (testInfo.project.name !== 'mobile-320' || !testInfo.tags.includes(mobile320RemedyTag)),
+      'Detailed customer journeys run on desktop; the audited refund regression also runs at 320px.',
+    )
+  })
 
   test('safe customer titles and h1 focus survive browser history', async ({ page }) => {
     await clearAndOpen(page)
@@ -120,7 +119,7 @@ test.describe('desktop customer journeys', () => {
     await page.getByRole('link', { name: /demo sign in/i }).click()
     await page.getByRole('button', { name: /one-click aina demo/i }).click()
     await page.goto('#/order/ord-shipped')
-    await expect(page.getByText('DEMO-P-SHIPPED')).toBeVisible()
+    await expect(page.getByText('DEMO-SHIPPED')).toBeVisible()
     await expect(page.getByText(/signature required/i)).toBeVisible()
     await page.getByRole('link', { name: /start a demo claim/i }).click()
     await expect(page.getByRole('heading', { name: /start a fake claim/i })).toBeVisible()
@@ -287,7 +286,9 @@ test.describe('desktop customer journeys', () => {
     await expect(accountOrder.getByText(/maggi|tng reload/i)).toHaveCount(0)
   })
 
-  test('claim-linked full refund requires exact Payments action and separate Claims finalization', async ({ page }) => {
+  test('claim-linked exact-scope refund requires exact Payments action and separate Claims finalization', {
+    tag: mobile320RemedyTag,
+  }, async ({ page }) => {
     await clearAndOpen(page)
     await page.getByRole('link', { name: /demo sign in/i }).click()
     await page.getByRole('button', { name: /one-click aina demo/i }).click()
@@ -315,19 +316,23 @@ test.describe('desktop customer journeys', () => {
     await claim.getByRole('button', { name: /record typed remedy/i }).click()
     const remedyDialog = page.getByRole('dialog', { name: new RegExp(claimId) })
     await expect(remedyDialog.getByRole('group', { name: /choose one exact remedy action/i })).toBeVisible()
-    await expect(remedyDialog.getByRole('radio', { name: /open exact full linked refund/i })).toBeChecked()
+    await expect(remedyDialog.getByRole('radio', { name: /open exact claim-scope settlement/i })).toBeChecked()
     await remedyDialog.getByRole('button', { name: /open exact payment/i }).click()
 
     const payment = page.locator('.payment-record').filter({ hasText: 'pay-shipped' })
     await payment.locator('summary').click()
-    const linkedRefund = payment.getByRole('button', { name: new RegExp(`linked claim ${claimId}.+refund exact rm\\s*112\\.00`, 'i') })
+    await expect(page.getByText(/unrelated payment actions are hidden; leave or clear this claim workflow/i)).toBeVisible()
+    await expect(payment.getByRole('button', { name: /unlinked partial refund/i })).toHaveCount(0)
+    await expect(payment.getByRole('button', { name: /unlinked refund remaining/i })).toHaveCount(0)
+    await expect(payment.getByRole('button', { name: /mark disputed/i })).toHaveCount(0)
+    const linkedRefund = payment.getByRole('button', { name: new RegExp(`linked claim ${claimId}.+exact claim-scope settlement rm\\s*112\\.00`, 'i') })
     await expect(linkedRefund).toBeVisible()
     await expect(payment.getByRole('button', { name: /linked claim.+partial/i })).toHaveCount(0)
     await linkedRefund.click()
-    const refundDialog = page.getByRole('dialog', { name: new RegExp(`refund rm\\s*112\\.00 for claim ${claimId}`, 'i') })
+    const refundDialog = page.getByRole('dialog', { name: new RegExp(`exact claim-scope settlement of rm\\s*112\\.00 for claim ${claimId}`, 'i') })
     await expect(refundDialog).toContainText('pay-shipped')
     await expect(refundDialog).toContainText(/rm\s*112\.00/i)
-    await refundDialog.getByRole('button', { name: /confirm and audit/i }).click()
+    await refundDialog.getByRole('button', { name: /confirm exact settlement & audit/i }).click()
     await expect(payment.getByText(new RegExp(`linked claim ${claimId}`, 'i')).first()).toBeVisible()
     await page.getByRole('link', { name: 'Back to claim', exact: true }).click()
 

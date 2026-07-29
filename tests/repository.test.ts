@@ -1501,6 +1501,66 @@ describe('MockRepository recovery and persistence', () => {
     expect(() => validateDemoState(snapshot)).not.toThrow()
   })
 
+  it('rejects persisted overlapping remedy entitlement holders across distinct claim kinds', () => {
+    const services = servicesWithClaim('damage')
+    services.auth.oneClick('customer')
+    const valueFloor = services.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'value_floor',
+      boxId: 'box-delivered-01',
+      note: 'DEMO overlapping persisted value-floor complaint',
+    }).data
+    const damage = services.repository.getSnapshot().claims
+      .find((claim) => claim.kind === 'damage')!
+    services.auth.oneClick('admin')
+    for (const claim of [damage, valueFloor]) {
+      services.claims.review(
+        claim.id,
+        'acknowledge',
+        'Confirmed persisted overlap acknowledgement',
+      )
+      services.claims.review(
+        claim.id,
+        'approve',
+        'Confirmed persisted overlap approval',
+      )
+    }
+    services.claims.authorizeReplacement(
+      damage.id,
+      'Confirmed persisted damage replacement authorization',
+    )
+    services.claims.review(
+      valueFloor.id,
+      'resolve',
+      'Confirmed second complaint closed without another remedy',
+      { outcome: 'no_remedy', reference: 'DEMO-NO-OVERLAP-SECOND' },
+    )
+    const corrupt = services.repository.exportForTest()
+    const grandfathered = corrupt.claims.find((claim) =>
+      claim.id === valueFloor.id)!
+    grandfathered.remedyState = 'none'
+    grandfathered.resolutionOutcome = 'replacement_authorized'
+    grandfathered.legacyTypedResolution = true
+    const resolutionAudit = corrupt.audits.find((audit) =>
+      audit.action === 'claim.resolve' &&
+      audit.targetId === grandfathered.id)!
+    ;(resolutionAudit.after as Record<string, unknown>).resolutionOutcome =
+      'replacement_authorized'
+
+    expect(() => validateDemoState(corrupt)).toThrow(
+      expect.objectContaining({ code: 'REMEDY_SCOPE_CONFLICT' }),
+    )
+
+    const raw = JSON.stringify(corrupt)
+    const storage = new MemoryStorage()
+    storage.seed(STORAGE_KEY, raw)
+    const repository = new MockRepository(storage)
+    expect(repository.recoveryNotice).toMatch(
+      /stored version 8 demo data failed the safety checks/i,
+    )
+    expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+  })
+
   it('keeps original version 6 bytes when migration persistence fails', () => {
     const legacy = toVersion6(createDemoState())
     const raw = JSON.stringify(legacy)

@@ -38,6 +38,8 @@ import {
   resolveOrderFulfillment,
 } from '../domain/orderFulfillment'
 import {
+  assertNoRemedyScopeConflict,
+  claimHoldsRemedyEntitlement,
   expectedClaimRemedySnapshot,
   isTerminalReplacementRefundFallback,
   orderBoxSettlementAllocations,
@@ -1696,6 +1698,11 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
           claim.legacyTypedResolution === undefined,
         'Only resolved claims may store structured resolution evidence.',
       )
+    }
+  }
+  for (const claim of state.claims) {
+    if (claimHoldsRemedyEntitlement(claim)) {
+      assertNoRemedyScopeConflict(state.claims, claim)
     }
   }
   unique(

@@ -19,6 +19,7 @@ import {
 import { matchingAppliedPaymentRefundAudit } from '../domain/refundLink'
 import { refreshOrderFulfillment } from '../domain/orderFulfillment'
 import {
+  assertNoRemedyScopeConflict,
   remedyBoxIdsForEvidence,
   requiredSettlementForBoxScope,
 } from '../domain/remedyPolicy'
@@ -858,6 +859,7 @@ export class ClaimService {
         'Replacement authorization requires one exact original shipment scope.',
         'REPLACEMENT_SCOPE_AMBIGUOUS',
       )
+      assertNoRemedyScopeConflict(state.claims, claim)
       const original = originalForClaim(state, claim)
       assert(original, 'Replacement original shipment scope was not found.', 'REPLACEMENT_ORIGINAL_MISSING')
       assert(

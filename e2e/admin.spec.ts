@@ -15,20 +15,16 @@ async function markPaymentDisputed(page: Page, paymentId: string) {
   await expect(payment.locator('summary').getByText('Disputed', { exact: true })).toBeVisible()
 }
 
-const mobile320RemedyJourneys = new Set([
-  'post-delivery return is explicitly confirmed without a refund promise',
-  'RMA creation, receipt and inspection keep the approved claim open',
-  'delivered replacement resolves its claim while the failed original stays immutable',
-  'failed digital delivery and digital reissue use only issue, sent, delivered or failed actions',
-])
+const mobile320RemedyTag = '@mobile320-remedy'
 
 test.describe('desktop admin journeys', () => {
-  test.skip(
-    ({ isMobile }, testInfo) =>
+  test.beforeEach(({ isMobile }, testInfo) => {
+    test.skip(
       isMobile &&
-      (testInfo.project.name !== 'mobile-320' || !mobile320RemedyJourneys.has(testInfo.title)),
-    'Detailed admin journeys run on desktop; typed remedy regressions also run at 320px.',
-  )
+        (testInfo.project.name !== 'mobile-320' || !testInfo.tags.includes(mobile320RemedyTag)),
+      'Detailed admin journeys run on desktop; typed remedy regressions also run at 320px.',
+    )
+  })
 
   test('direct customer access is rejected by service gate', async ({ page }) => {
     await login(page, 'customer')
@@ -71,7 +67,7 @@ test.describe('desktop admin journeys', () => {
     await expect(page.getByText(/showing orders for/i)).toContainText('Aina Demo')
     await expect(page.locator('.admin-record')).toHaveCount(6)
 
-    await page.getByPlaceholder(/order, user, payment or tracking/i).fill('DEMO-P-SHIPPED')
+    await page.getByPlaceholder(/order, user, payment or tracking/i).fill('DEMO-SHIPPED')
     await expect(page.locator('.admin-record')).toHaveCount(1)
     await expect(page.locator('.admin-record summary')).toContainText('ORD-SHIPPED')
     await page.getByRole('button', { name: /clear filters/i }).click()
@@ -105,7 +101,9 @@ test.describe('desktop admin journeys', () => {
     await expect(page.getByRole('button', { name: /copy published series to draft/i })).toBeVisible()
   })
 
-  test('post-delivery return is explicitly confirmed without a refund promise', async ({ page }) => {
+  test('post-delivery return is explicitly confirmed without a refund promise', {
+    tag: mobile320RemedyTag,
+  }, async ({ page }) => {
     await login(page, 'admin')
     await page.getByRole('link', { name: 'Fulfilment' }).click()
     const delivered = page.locator('.shipment-admin-card').filter({ hasText: 'shp-delivered' })
@@ -116,7 +114,9 @@ test.describe('desktop admin journeys', () => {
     await expect(page.getByText(/no claim or refund was created/i)).toBeVisible()
   })
 
-  test('RMA creation, receipt and inspection keep the approved claim open', async ({ page }) => {
+  test('RMA creation, receipt and inspection keep the approved claim open', {
+    tag: mobile320RemedyTag,
+  }, async ({ page }) => {
     await login(page, 'customer')
     await page.goto('#/order/ord-delivered')
     await page.getByRole('link', { name: /start a demo claim/i }).click()
@@ -144,13 +144,19 @@ test.describe('desktop admin journeys', () => {
       await expect(dialog.getByRole('radio', { name: choice })).toBeChecked()
       await dialog.getByRole('button', { name: /confirm typed evidence/i }).click()
       await expect(claim.getByText('Approved', { exact: true })).toBeVisible()
-      await expect(claim.getByText(state, { exact: true })).toBeVisible()
+      await expect(claim.locator('summary').getByText(state, { exact: true })).toBeVisible()
+      const rmaEvidenceNotice = claim
+        .getByText('RMA evidence · claim remains approved', { exact: true })
+        .locator('..')
+      await expect(rmaEvidenceNotice.getByText(state, { exact: true })).toBeVisible()
     }
     await expect(claim.getByText(/rma evidence · claim remains approved/i)).toBeVisible()
     await expect(claim.getByText(/final read-only evidence/i)).toHaveCount(0)
   })
 
-  test('delivered replacement resolves its claim while the failed original stays immutable', async ({ page }) => {
+  test('delivered replacement resolves its claim while the failed original stays immutable', {
+    tag: mobile320RemedyTag,
+  }, async ({ page }) => {
     await login(page, 'customer')
     await page.goto('#/order/ord-failed')
     await page.getByRole('link', { name: /start a demo claim/i }).click()
@@ -173,8 +179,17 @@ test.describe('desktop admin journeys', () => {
     await remedyDialog.getByRole('radio', { name: /authorize replacement shipment/i }).check()
     await remedyDialog.getByRole('button', { name: /confirm typed evidence/i }).click()
     await expect(claim.getByText('Approved', { exact: true })).toBeVisible()
-    await expect(claim.getByText(/claim remains approved until delivery/i)).toBeVisible()
-    await claim.getByRole('link', { name: /open linked fulfilment record/i }).click()
+    await expect(claim.getByText('Approved claim · typed remedy remains open', { exact: true })).toBeVisible()
+    await expect(claim.locator('summary').getByText('Replacement Authorized', { exact: true })).toBeVisible()
+    const replacementEvidenceNotice = claim
+      .getByText('Replacement shipment · replacement in progress · refund fallback unavailable', { exact: true })
+      .locator('..')
+    const openReplacement = replacementEvidenceNotice.getByRole('link', {
+      name: /open linked fulfilment record/i,
+    })
+    await expect(replacementEvidenceNotice).toBeVisible()
+    await expect(openReplacement).toBeVisible()
+    await openReplacement.click()
 
     const replacement = page.locator('.shipment-admin-card[data-focused="true"]')
     await expect(replacement.getByText('Replacement shipment', { exact: true })).toBeVisible()
@@ -195,7 +210,110 @@ test.describe('desktop admin journeys', () => {
     await expect(originalScope.locator('.remedy-replacement').getByText(/replacement delivered/i)).toBeVisible()
   })
 
-  test('failed digital delivery and digital reissue use only issue, sent, delivered or failed actions', async ({ page }) => {
+  test('lost physical replacement exposes an exact full-remaining terminal fallback', {
+    tag: mobile320RemedyTag,
+  }, async ({ page }) => {
+    await login(page, 'customer')
+    await page.goto('#/order/ord-failed')
+    await page.getByRole('link', { name: /start a demo claim/i }).click()
+    await page.getByLabel('Claim type').selectOption('non_delivery')
+    await page.getByLabel(/fictional note/i).fill('DEMO lost replacement fallback browser evidence.')
+    await page.getByRole('button', { name: /submit demo claim/i }).click()
+
+    await page.getByRole('button', { name: /log out/i }).click()
+    await page.getByRole('link', { name: /demo sign in/i }).click()
+    await page.getByRole('button', { name: /one-click vault admin/i }).click()
+    await page.getByRole('link', { name: 'Claims', exact: true }).click()
+    let claim = page.locator('.claim-record').first()
+    const claimId = (await claim.locator('summary b').first().textContent())!
+    await claim.getByRole('button', { name: 'Acknowledge' }).click()
+    await page.getByRole('button', { name: /confirm note & audit/i }).click()
+    await claim.getByRole('button', { name: 'Approve' }).click()
+    await page.getByRole('button', { name: /confirm note & audit/i }).click()
+    await claim.getByRole('button', { name: /record typed remedy/i }).click()
+    const remedyDialog = page.getByRole('dialog', { name: new RegExp(claimId) })
+    await remedyDialog.getByRole('radio', { name: /authorize replacement shipment/i }).check()
+    await remedyDialog.getByRole('button', { name: /confirm typed evidence/i }).click()
+    await expect(claim.getByText(/replacement in progress · refund fallback unavailable/i)).toBeVisible()
+    await expect(claim.getByRole('button', { name: /record typed remedy/i })).toHaveCount(0)
+
+    await page.getByRole('link', { name: 'Payments', exact: true }).click()
+    const payment = page.locator('.payment-record').filter({ hasText: 'pay-failed' })
+    await payment.locator('summary').click()
+    await payment.getByRole('button', { name: /unlinked partial refund rm10/i }).click()
+    await page.getByRole('dialog', { name: /partial refund of rm\s*10\.00/i })
+      .getByRole('button', { name: /confirm and audit/i }).click()
+    await expect(payment.locator('summary')).toContainText(/refunded rm\s*10\.00/i)
+
+    await page.getByRole('link', { name: 'Claims', exact: true }).click()
+    claim = page.locator('.claim-record').filter({ hasText: claimId })
+    await claim.getByRole('link', { name: /open linked fulfilment record/i }).click()
+    const replacement = page.locator('.shipment-admin-card[data-focused="true"]')
+    for (const action of [/mark picking/i, /mark packed/i, /create label/i, /mark shipped/i, /mark lost/i]) {
+      await replacement.getByRole('button', { name: action }).click()
+      await page.getByRole('button', { name: /confirm scan & audit/i }).click()
+    }
+    await expect(replacement.getByText('Lost', { exact: true })).toBeVisible()
+    await replacement.getByRole('link', { name: claimId, exact: true }).click()
+
+    claim = page.locator('.claim-record[data-focused="true"]')
+    await expect(claim.getByText(/terminal replacement fallback available/i)).toBeVisible()
+    await claim.getByRole('button', { name: /record typed remedy/i }).click()
+    const fallbackRouteDialog = page.getByRole('dialog', { name: new RegExp(claimId) })
+    await expect(fallbackRouteDialog.getByRole('radio', {
+      name: /open terminal replacement fallback in payments/i,
+    })).toBeChecked()
+    await expect(fallbackRouteDialog).toContainText(/exact full remaining balance/i)
+    await fallbackRouteDialog.getByRole('button', { name: /open exact payment/i }).click()
+
+    const filteredPayment = page.locator('.payment-record').filter({ hasText: 'pay-failed' })
+    await filteredPayment.locator('summary').click()
+    await expect(page.getByText(/unrelated payment actions are hidden; leave or clear this claim workflow/i)).toBeVisible()
+    await expect(filteredPayment.getByRole('button', { name: /unlinked partial refund/i })).toHaveCount(0)
+    await expect(filteredPayment.getByRole('button', { name: /unlinked refund remaining/i })).toHaveCount(0)
+    await expect(filteredPayment.getByRole('button', { name: /mark disputed/i })).toHaveCount(0)
+    const fallback = filteredPayment.getByRole('button', {
+      name: new RegExp(`linked claim ${claimId}.+terminal replacement fallback rm\\s*102\\.00`, 'i'),
+    })
+    await expect(fallback).toBeVisible()
+    await fallback.click()
+    const fallbackDialog = page.getByRole('dialog', {
+      name: new RegExp(`terminal replacement fallback of rm\\s*102\\.00 for claim ${claimId}`, 'i'),
+    })
+    await expect(fallbackDialog).toContainText('pay-failed')
+    await expect(fallbackDialog).toContainText(/required claim settlementrm\s*112\.00/i)
+    await expect(fallbackDialog).toContainText(/remaining payment balancerm\s*102\.00/i)
+    await expect(fallbackDialog).toContainText(/terminal replacement fallback/i)
+    const amountRow = fallbackDialog.locator('.detail-list > div').filter({ hasText: 'Amount to refund' })
+    const confirmFallback = fallbackDialog.getByRole('button', { name: /confirm terminal fallback & audit/i })
+    await expect(amountRow).toBeVisible()
+    await expect(amountRow).toContainText(/rm\s*102\.00/i)
+    await expect(confirmFallback).toBeVisible()
+    const overflow = await fallbackDialog.evaluate((dialog) => {
+      const bounds = dialog.getBoundingClientRect()
+      return {
+        bodyScrollWidth: document.body.scrollWidth,
+        clientWidth: document.documentElement.clientWidth,
+        dialogClientWidth: dialog.clientWidth,
+        dialogScrollWidth: dialog.scrollWidth,
+        left: bounds.left,
+        right: bounds.right,
+        rootScrollWidth: document.documentElement.scrollWidth,
+      }
+    })
+    expect(overflow.rootScrollWidth).toBeLessThanOrEqual(overflow.clientWidth + 1)
+    expect(overflow.bodyScrollWidth).toBeLessThanOrEqual(overflow.clientWidth + 1)
+    expect(overflow.dialogScrollWidth).toBeLessThanOrEqual(overflow.dialogClientWidth + 1)
+    expect(overflow.left).toBeGreaterThanOrEqual(-1)
+    expect(overflow.right).toBeLessThanOrEqual(overflow.clientWidth + 1)
+    await confirmFallback.click()
+    await expect(filteredPayment.locator('summary')).toContainText(/refunded rm\s*112\.00/i)
+    await expect(filteredPayment.getByText(new RegExp(`linked claim ${claimId}`, 'i')).first()).toBeVisible()
+  })
+
+  test('failed digital delivery and digital reissue use only issue, sent, delivered or failed actions', {
+    tag: mobile320RemedyTag,
+  }, async ({ page }) => {
     await login(page, 'admin')
     await page.getByRole('link', { name: 'Fulfilment' }).click()
     const original = page.locator('.shipment-admin-card').filter({ hasText: 'DIGITAL / shp-digital' })
@@ -249,7 +367,7 @@ test.describe('desktop admin journeys', () => {
     await page.getByRole('link', { name: 'Orders', exact: true }).click()
     const order = page.locator('.admin-record').filter({ hasText: 'ORD-PROCESSING' })
     await order.locator('summary').click()
-    await expect(order.getByText(/2 of 2 original delivery groups complete/i)).toBeVisible()
+    await expect(order.getByText(/2 of 2 box fulfilment scopes complete/i)).toBeVisible()
     await expect(order.getByText(/replacement: delivered/i)).toBeVisible()
     await order.getByRole('button', { name: /close order/i }).click()
     const closeDialog = page.getByRole('dialog', { name: /close this fulfilled order/i })

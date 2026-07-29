@@ -8,6 +8,85 @@ import type {
   Shipment,
 } from './types'
 
+const REMEDY_ENTITLEMENT_STATES = new Set<Claim['remedyState']>([
+  'replacement_authorized',
+  'replacement_delivered',
+  'refund_linked',
+  'refund_completed',
+])
+
+const GRANDFATHERED_COMPLETION_OUTCOMES = new Set<
+  NonNullable<Claim['resolutionOutcome']>
+>([
+  'replacement_authorized',
+  'refund_recorded',
+])
+
+export const REMEDY_SCOPE_CONFLICT_CODE = 'REMEDY_SCOPE_CONFLICT'
+
+export interface RemedyScopeConflict {
+  orderId: string
+  holderClaimId: string
+  remedyBoxIds: string[]
+}
+
+export function claimHoldsRemedyEntitlement(claim: Claim) {
+  if (
+    claim.status === 'rejected' ||
+    claim.legacyUnderSettledRefund === true
+  ) {
+    return false
+  }
+  return (
+    REMEDY_ENTITLEMENT_STATES.has(claim.remedyState) ||
+    (
+      claim.status === 'resolved' &&
+      claim.resolutionOutcome !== undefined &&
+      GRANDFATHERED_COMPLETION_OUTCOMES.has(claim.resolutionOutcome)
+    )
+  )
+}
+
+export function findRemedyScopeConflict(
+  claims: readonly Claim[],
+  currentClaim: Pick<Claim, 'id' | 'orderId' | 'remedyBoxIds'>,
+): RemedyScopeConflict | undefined {
+  const requestedBoxIds = new Set(currentClaim.remedyBoxIds)
+  for (const holder of claims) {
+    if (
+      holder.id === currentClaim.id ||
+      holder.orderId !== currentClaim.orderId ||
+      !claimHoldsRemedyEntitlement(holder)
+    ) {
+      continue
+    }
+    const overlappingBoxIds = holder.remedyBoxIds.filter((boxId) =>
+      requestedBoxIds.has(boxId))
+    if (overlappingBoxIds.length > 0) {
+      return {
+        orderId: currentClaim.orderId,
+        holderClaimId: holder.id,
+        remedyBoxIds: overlappingBoxIds,
+      }
+    }
+  }
+  return undefined
+}
+
+export function assertNoRemedyScopeConflict(
+  claims: readonly Claim[],
+  currentClaim: Pick<Claim, 'id' | 'orderId' | 'remedyBoxIds'>,
+) {
+  const conflict = findRemedyScopeConflict(claims, currentClaim)
+  assert(
+    conflict === undefined,
+    conflict
+      ? `Claim ${currentClaim.id} overlaps remedy entitlement held by claim ${conflict.holderClaimId} for box scope ${conflict.remedyBoxIds.join(', ')}.`
+      : 'Claim remedy entitlement scope is available.',
+    REMEDY_SCOPE_CONFLICT_CODE,
+  )
+}
+
 export function canonicalOrderBoxScope(
   order: Order,
   requestedBoxIds: readonly string[],

@@ -9,13 +9,16 @@ import { AppStateProvider } from '../src/state/AppState'
 import {
   MemoryStorage,
   FIXED_NOW,
+  makeProcessingOrderSingleGroupedPhysicalShipment,
   makeProcessingOrderTwoPhysicalShipments,
 } from './helpers'
 import { VaultCanvas } from '../src/components/VaultCanvas'
 import { Notice } from '../src/components/Notice'
 import { createDemoState, DEMO_ADDRESS } from '../src/data/fixtures'
-import { STORAGE_KEY } from '../src/data/MockRepository'
+import { migrateDemoStateV7, STORAGE_KEY } from '../src/data/MockRepository'
 import { validateDemoState } from '../src/data/StateValidator'
+import { resolveOrderFulfillment } from '../src/domain/orderFulfillment'
+import type { DemoState } from '../src/domain/types'
 import { sealedCustomerTimeline } from '../src/domain/orderTimeline'
 
 function renderApp(storage = new MemoryStorage()) {
@@ -1017,7 +1020,7 @@ describe('app components', () => {
     window.history.replaceState({}, '', '#/account')
     render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
     const revealedRecord = screen.getByText('ORD-PROCESSING').closest('article')!
-    expect(within(revealedRecord).getByText(/1 of 2 original delivery groups complete/i)).toBeVisible()
+    expect(within(revealedRecord).getByText(/1 of 2 box fulfilment scopes complete/i)).toBeVisible()
     expect(within(revealedRecord).getByRole('heading', { name: 'Original shipment' })).toBeVisible()
     expect(within(revealedRecord).getByRole('heading', { name: 'Digital delivery' })).toBeVisible()
     expect(within(revealedRecord).getByText('Delivered')).toBeVisible()
@@ -1292,7 +1295,7 @@ describe('app components', () => {
     await user.click(within(record).getByRole('button', { name: /record typed remedy/i }))
     const remedyDialog = screen.getByRole('dialog', { name: new RegExp(claim.id) })
     expect(within(remedyDialog).getByRole('group', { name: /choose one exact remedy action/i })).toBeVisible()
-    expect(within(remedyDialog).getByRole('radio', { name: /open exact full linked refund/i })).toBeChecked()
+    expect(within(remedyDialog).getByRole('radio', { name: /open exact claim-scope settlement/i })).toBeChecked()
     await user.click(within(remedyDialog).getByRole('button', { name: /open exact payment/i }))
     expect(await screen.findByRole('heading', { name: 'Payments' })).toBeVisible()
     expect(screen.getByText(/showing only payments for exact order/i)).toHaveTextContent('ord-shipped')
@@ -1300,16 +1303,20 @@ describe('app components', () => {
     expect(screen.queryByText('pay-unopened')).not.toBeInTheDocument()
     const paymentRecord = screen.getByText('pay-shipped').closest('details')!
     await user.click(paymentRecord.querySelector('summary')!)
+    expect(screen.getByText(/unrelated payment actions are hidden; leave or clear this claim workflow/i)).toBeVisible()
+    expect(within(paymentRecord).queryByRole('button', { name: /unlinked partial refund/i })).not.toBeInTheDocument()
+    expect(within(paymentRecord).queryByRole('button', { name: /unlinked refund remaining/i })).not.toBeInTheDocument()
+    expect(within(paymentRecord).queryByRole('button', { name: /mark disputed/i })).not.toBeInTheDocument()
     const linkedRefund = within(paymentRecord).getByRole('button', {
-      name: new RegExp(`linked claim ${claim.id}.+refund exact rm\\s*112\\.00`, 'i'),
+      name: new RegExp(`linked claim ${claim.id}.+exact claim-scope settlement rm\\s*112\\.00`, 'i'),
     })
     expect(within(paymentRecord).queryByRole('button', { name: /linked claim.+partial/i })).not.toBeInTheDocument()
     await user.click(linkedRefund)
-    const refundDialog = screen.getByRole('dialog', { name: new RegExp(`refund rm\\s*112\\.00 for claim ${claim.id}`, 'i') })
+    const refundDialog = screen.getByRole('dialog', { name: new RegExp(`exact claim-scope settlement of rm\\s*112\\.00 for claim ${claim.id}`, 'i') })
     expect(refundDialog).toHaveTextContent(claim.id)
     expect(refundDialog).toHaveTextContent('pay-shipped')
     expect(refundDialog).toHaveTextContent(/rm\s*112\.00/i)
-    await user.click(within(refundDialog).getByRole('button', { name: /confirm and audit/i }))
+    await user.click(within(refundDialog).getByRole('button', { name: /confirm exact settlement & audit/i }))
 
     const linkedState = services.repository.getSnapshot()
     const linkedClaim = linkedState.claims.find((entry) => entry.id === claim.id)!
@@ -1317,6 +1324,8 @@ describe('app components', () => {
     expect(linkedPayment.refundedSen).toBe(linkedPayment.amountSen)
     expect(linkedClaim.status).toBe('approved')
     expect(linkedClaim.remedyState).toBe('refund_linked')
+    expect(linkedClaim.acceptedSettlementSen).toBe(11_200)
+    expect(linkedClaim.settlementPolicy).toBe('exact_scope')
     expect(linkedClaim.linkedRefundEventId).toBeTruthy()
     expect(within(paymentRecord).getByText(new RegExp(`linked claim ${claim.id}`, 'i'))).toBeVisible()
 
@@ -1350,6 +1359,458 @@ describe('app components', () => {
     window.history.replaceState({}, '', '#/order/ord-shipped')
     render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
     expect(screen.getAllByText(/audited refund complete/i).length).toBeGreaterThan(0)
+  })
+
+  it('settles exactly one RM106 value-floor remedy scope against an RM212 payment', async () => {
+    const user = userEvent.setup()
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    services.auth.oneClick('customer')
+    const claim = services.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'value_floor',
+      boxId: 'box-processing-01',
+      note: 'DEMO one-box value-floor exact-scope settlement evidence',
+    }).data
+    expect(claim.remedyBoxIds).toEqual(['box-processing-01'])
+    expect(claim.requiredSettlementSen).toBe(10_600)
+
+    services.auth.oneClick('admin')
+    services.claims.review(claim.id, 'acknowledge', 'Confirmed exact-scope acknowledgement')
+    services.claims.review(claim.id, 'approve', 'Confirmed exact-scope approval')
+    window.history.replaceState({}, '', `#/admin/claims?claim=${encodeURIComponent(claim.id)}`)
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+
+    const claimRecord = screen.getByText(claim.id, { selector: 'summary b' }).closest('details')!
+    expect(claimRecord).toHaveTextContent(/remedy box scopebox-processing-01/i)
+    expect(claimRecord).toHaveTextContent(/required settlementrm\s*106\.00/i)
+    await user.click(within(claimRecord).getByRole('button', { name: /record typed remedy/i }))
+    const remedyDialog = screen.getByRole('dialog', { name: new RegExp(claim.id) })
+    expect(within(remedyDialog).getByRole('radio', {
+      name: /open exact claim-scope settlement in payments/i,
+    })).toBeChecked()
+    expect(remedyDialog).toHaveTextContent(/exact required settlement of rm\s*106\.00/i)
+    expect(remedyDialog).toHaveTextContent('box-processing-01')
+    await user.click(within(remedyDialog).getByRole('button', { name: /open exact payment/i }))
+
+    const paymentRecord = screen.getByText('pay-processing', { selector: 'summary b' }).closest('details')!
+    await user.click(paymentRecord.querySelector('summary')!)
+    const settle = within(paymentRecord).getByRole('button', {
+      name: new RegExp(`linked claim ${claim.id}.+exact claim-scope settlement rm\\s*106\\.00`, 'i'),
+    })
+    await user.click(settle)
+    const refundDialog = screen.getByRole('dialog', {
+      name: new RegExp(`exact claim-scope settlement of rm\\s*106\\.00 for claim ${claim.id}`, 'i'),
+    })
+    expect(refundDialog).toHaveTextContent(claim.id)
+    expect(refundDialog).toHaveTextContent('pay-processing')
+    expect(refundDialog).toHaveTextContent(/remedy box scopebox-processing-01/i)
+    expect(refundDialog).toHaveTextContent(/required claim settlementrm\s*106\.00/i)
+    expect(refundDialog).toHaveTextContent(/remaining payment balancerm\s*212\.00/i)
+    expect(refundDialog).toHaveTextContent(/amount to refundrm\s*106\.00/i)
+    expect(refundDialog).toHaveTextContent(/may leave a separate remaining balance/i)
+    await user.click(within(refundDialog).getByRole('button', {
+      name: /confirm exact settlement & audit/i,
+    }))
+
+    const linkedState = services.repository.getSnapshot()
+    const linkedPayment = linkedState.payments.find((entry) => entry.id === 'pay-processing')!
+    const linkedClaim = linkedState.claims.find((entry) => entry.id === claim.id)!
+    const linkedEvent = linkedPayment.events.find((entry) =>
+      entry.refundIntent?.claimId === claim.id)!
+    expect(linkedPayment).toMatchObject({
+      amountSen: 21_200,
+      refundedSen: 10_600,
+      status: 'partially_refunded',
+    })
+    expect(linkedEvent.refundIntent?.amountSen).toBe(10_600)
+    expect(linkedClaim).toMatchObject({
+      acceptedSettlementSen: 10_600,
+      remedyBoxIds: ['box-processing-01'],
+      remedyState: 'refund_linked',
+      settlementPolicy: 'exact_scope',
+      status: 'approved',
+    })
+
+    cleanup()
+    window.history.replaceState({}, '', `#/admin/claims?claim=${encodeURIComponent(claim.id)}`)
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+    const focusedClaim = screen.getByText(claim.id, { selector: 'summary b' }).closest('details')!
+    await user.click(within(focusedClaim).getByRole('button', { name: /record typed remedy/i }))
+    await user.click(within(screen.getByRole('dialog', { name: new RegExp(claim.id) }))
+      .getByRole('button', { name: /confirm typed evidence/i }))
+
+    const finalizedState = services.repository.getSnapshot()
+    const finalizedClaim = finalizedState.claims.find((entry) => entry.id === claim.id)!
+    const fulfillment = resolveOrderFulfillment(finalizedState, 'ord-processing')
+    const settledScope = fulfillment.scopes.find((scope) =>
+      scope.boxIds.includes('box-processing-01'))!
+    const untouchedScope = fulfillment.scopes.find((scope) =>
+      scope.boxIds.includes('box-processing-02'))!
+    expect(finalizedClaim).toMatchObject({
+      remedyState: 'refund_completed',
+      settlementPolicy: 'exact_scope',
+      status: 'resolved',
+    })
+    expect(settledScope).toMatchObject({ completedBy: 'refund', status: 'fulfilled' })
+    expect(untouchedScope.status).toBe('confirmed')
+    expect(fulfillment.status).toBe('partially_fulfilled')
+
+    cleanup()
+    services.auth.oneClick('customer')
+    services.openBox('box-processing-02')
+    window.history.replaceState({}, '', '#/order/ord-processing')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+    const completedEvidence = screen.getAllByText('Audited refund complete')
+      .map((element) => element.closest('p'))
+      .find((element) => element?.textContent?.includes('Accepted'))!
+    expect(completedEvidence).toHaveTextContent(/accepted rm\s*106\.00.+required rm\s*106\.00/i)
+    expect(completedEvidence).toHaveTextContent(/settlement policy: exact scope/i)
+    expect(screen.getByText(/1 of 2 box fulfilment scopes complete/i)).toBeVisible()
+  })
+
+  it('offers a lost physical replacement fallback for the exact post-partial remaining balance', async () => {
+    const user = userEvent.setup()
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    services.auth.oneClick('customer')
+    const claim = services.claims.submit({
+      orderId: 'ord-failed',
+      kind: 'non_delivery',
+      shipmentId: 'shp-failed',
+      note: 'DEMO lost replacement terminal fallback evidence',
+    }).data
+    services.auth.oneClick('admin')
+    services.claims.review(claim.id, 'acknowledge', 'Confirmed fallback acknowledgement')
+    services.claims.review(claim.id, 'approve', 'Confirmed fallback approval')
+    const replacement = services.claims.authorizeReplacement(
+      claim.id,
+      'Confirmed physical replacement before terminal fallback',
+    ).data
+    services.payments.refund(
+      'pay-failed',
+      1000,
+      'Confirmed prior unlinked partial refund',
+      'req-prior-unlinked-partial-fallback',
+    )
+    window.history.replaceState({}, '', `#/admin/claims?claim=${encodeURIComponent(claim.id)}`)
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+
+    const claimRecord = screen.getByText(claim.id, { selector: 'summary b' }).closest('details')!
+    expect(claimRecord).toHaveTextContent(/replacement in progress · refund fallback unavailable/i)
+    expect(claimRecord).toHaveTextContent(/only if this exact replacement is lost or returned/i)
+    expect(within(claimRecord).queryByRole('button', { name: /record typed remedy/i }))
+      .not.toBeInTheDocument()
+
+    for (const status of ['picking', 'packed', 'label_created', 'shipped', 'failed_delivery'] as const) {
+      services.fulfilment.advance(
+        replacement.id,
+        status,
+        `Confirmed terminal fallback replacement ${status}`,
+      )
+    }
+    await waitFor(() => {
+      expect(claimRecord).toHaveTextContent(/physical replacement is failed delivery/i)
+      expect(claimRecord).toHaveTextContent(/only lost or returned is eligible/i)
+      expect(within(claimRecord).queryByRole('button', { name: /record typed remedy/i }))
+        .not.toBeInTheDocument()
+    })
+    services.fulfilment.advance(
+      replacement.id,
+      'lost',
+      'Confirmed terminal fallback replacement lost',
+    )
+
+    await waitFor(() => {
+      expect(claimRecord).toHaveTextContent(/terminal replacement fallback available/i)
+      expect(within(claimRecord).getByRole('button', { name: /record typed remedy/i })).toBeVisible()
+    })
+    await user.click(within(claimRecord).getByRole('button', { name: /record typed remedy/i }))
+    const remedyDialog = screen.getByRole('dialog', { name: new RegExp(claim.id) })
+    expect(within(remedyDialog).getByRole('radio', {
+      name: /open terminal replacement fallback in payments/i,
+    })).toBeChecked()
+    expect(remedyDialog).toHaveTextContent(/selected payment’s exact full remaining balance/i)
+    await user.click(within(remedyDialog).getByRole('button', { name: /open exact payment/i }))
+
+    const paymentRecord = screen.getByText('pay-failed', { selector: 'summary b' }).closest('details')!
+    await user.click(paymentRecord.querySelector('summary')!)
+    const fallback = within(paymentRecord).getByRole('button', {
+      name: new RegExp(`linked claim ${claim.id}.+terminal replacement fallback rm\\s*102\\.00`, 'i'),
+    })
+    await user.click(fallback)
+    const fallbackDialog = screen.getByRole('dialog', {
+      name: new RegExp(`terminal replacement fallback of rm\\s*102\\.00 for claim ${claim.id}`, 'i'),
+    })
+    expect(fallbackDialog).toHaveTextContent(claim.id)
+    expect(fallbackDialog).toHaveTextContent('pay-failed')
+    expect(fallbackDialog).toHaveTextContent(/required claim settlementrm\s*112\.00/i)
+    expect(fallbackDialog).toHaveTextContent(/remaining payment balancerm\s*102\.00/i)
+    expect(fallbackDialog).toHaveTextContent(/settlement policyterminal replacement fallback/i)
+    expect(fallbackDialog).toHaveTextContent(/amount to refundrm\s*102\.00/i)
+    await user.click(within(fallbackDialog).getByRole('button', {
+      name: /confirm terminal fallback & audit/i,
+    }))
+
+    const snapshot = services.repository.getSnapshot()
+    const payment = snapshot.payments.find((entry) => entry.id === 'pay-failed')!
+    const linkedClaim = snapshot.claims.find((entry) => entry.id === claim.id)!
+    const linkedEvent = payment.events.find((entry) =>
+      entry.refundIntent?.claimId === claim.id)!
+    expect(payment).toMatchObject({
+      amountSen: 11_200,
+      refundedSen: 11_200,
+      status: 'refunded',
+    })
+    expect(linkedEvent.refundIntent?.amountSen).toBe(10_200)
+    expect(linkedClaim).toMatchObject({
+      acceptedSettlementSen: 10_200,
+      remedyState: 'refund_linked',
+      settlementPolicy: 'terminal_replacement_fallback',
+      status: 'approved',
+    })
+
+    cleanup()
+    services.auth.oneClick('customer')
+    window.history.replaceState({}, '', '#/order/ord-failed')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+    const waitingScope = screen.getByText('box-failed-01', { selector: '.scope-box-ids' })
+      .closest('article')!
+    expect(within(waitingScope).getByText(replacement.id, { exact: true })).toBeVisible()
+    expect(waitingScope).toHaveTextContent(/replacement exception · settlement is waiting for final claim audit/i)
+    expect(waitingScope).not.toHaveTextContent(/replacement exception · claim remains open/i)
+
+    cleanup()
+    services.auth.oneClick('admin')
+    services.claims.review(
+      claim.id,
+      'resolve',
+      'Confirmed terminal fallback final claim audit',
+      { outcome: 'refund_recorded', reference: linkedEvent.id },
+    )
+    services.auth.oneClick('customer')
+    window.history.replaceState({}, '', '#/order/ord-failed')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+    const settledScope = screen.getByText('box-failed-01', { selector: '.scope-box-ids' })
+      .closest('article')!
+    expect(within(settledScope).getByText(replacement.id, { exact: true })).toBeVisible()
+    expect(settledScope).toHaveTextContent(/replacement exception · box fulfilment scope was settled by refund/i)
+    expect(settledScope).not.toHaveTextContent(/replacement exception · claim remains open/i)
+  })
+
+  it('keeps grouped two-box scope cards keyed and limits replacement/refund evidence to the exact box', async () => {
+    const user = userEvent.setup()
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    makeProcessingOrderSingleGroupedPhysicalShipment(services)
+    services.auth.oneClick('customer')
+    services.openBox('box-processing-02')
+    const claim = services.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'value_floor',
+      boxId: 'box-processing-01',
+      note: 'DEMO grouped shipment exact-box evidence',
+    }).data
+    services.auth.oneClick('admin')
+    services.claims.review(claim.id, 'acknowledge', 'Confirmed grouped-scope acknowledgement')
+    services.claims.review(claim.id, 'approve', 'Confirmed grouped-scope approval')
+    const replacement = services.claims.authorizeReplacement(
+      claim.id,
+      'Confirmed grouped-scope exact replacement',
+    ).data
+    for (const status of ['picking', 'packed', 'label_created', 'shipped', 'lost'] as const) {
+      services.fulfilment.advance(
+        replacement.id,
+        status,
+        `Confirmed grouped-scope replacement ${status}`,
+      )
+    }
+    const payment = services.repository.getSnapshot().payments
+      .find((entry) => entry.id === 'pay-processing')!
+    services.payments.refund(
+      payment.id,
+      payment.amountSen - payment.refundedSen,
+      'Confirmed grouped-scope terminal fallback',
+      'req-grouped-scope-terminal-fallback',
+      claim.id,
+    )
+
+    const consoleError = vi.spyOn(console, 'error')
+    try {
+      services.auth.oneClick('customer')
+      window.history.replaceState({}, '', '#/order/ord-processing')
+      render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+
+      expect(document.querySelectorAll('.remedy-scope')).toHaveLength(2)
+      const affectedScope = screen.getByText('box-processing-01', { selector: '.scope-box-ids' })
+        .closest('article')!
+      const siblingScope = screen.getByText('box-processing-02', { selector: '.scope-box-ids' })
+        .closest('article')!
+      expect(within(affectedScope).getByText(replacement.id, { exact: true })).toBeVisible()
+      expect(affectedScope).toHaveTextContent(/refund waiting for final claim audit/i)
+      expect(affectedScope).toHaveTextContent(/settlement is waiting for final claim audit/i)
+      expect(within(siblingScope).queryByText(replacement.id, { exact: true })).not.toBeInTheDocument()
+      expect(siblingScope).not.toHaveTextContent(/refund waiting for final claim audit/i)
+      expect(siblingScope).not.toHaveTextContent(/replacement exception/i)
+
+      cleanup()
+      services.auth.oneClick('admin')
+      window.history.replaceState({}, '', '#/admin/orders')
+      render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+      const orderRecord = screen.getByText('ORD-PROCESSING').closest('details')!
+      await user.click(orderRecord.querySelector('summary')!)
+      const adminAffectedScope = within(orderRecord)
+        .getByText('box-processing-01', { selector: '.scope-box-ids' })
+        .closest('article')!
+      const adminSiblingScope = within(orderRecord)
+        .getByText('box-processing-02', { selector: '.scope-box-ids' })
+        .closest('article')!
+      expect(adminAffectedScope).toHaveTextContent(replacement.id)
+      expect(adminAffectedScope).toHaveTextContent(/refund: waiting final audit/i)
+      expect(adminSiblingScope).not.toHaveTextContent(replacement.id)
+      expect(adminSiblingScope).toHaveTextContent(/refund: not used/i)
+
+      const consoleMessages = consoleError.mock.calls
+        .flatMap((call) => call.map((value) => String(value)))
+        .join(' ')
+      expect(consoleMessages).not.toMatch(/same key|unique ["']key["'] prop/i)
+    } finally {
+      consoleError.mockRestore()
+    }
+  })
+
+  it('shows an insufficient exact-scope balance as read-only with no linked action', async () => {
+    const user = userEvent.setup()
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    services.auth.oneClick('customer')
+    const claim = services.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'value_floor',
+      boxId: 'box-processing-01',
+      note: 'DEMO insufficient exact-scope payment balance evidence',
+    }).data
+    services.auth.oneClick('admin')
+    services.claims.review(claim.id, 'acknowledge', 'Confirmed insufficient-balance acknowledgement')
+    services.claims.review(claim.id, 'approve', 'Confirmed insufficient-balance approval')
+    services.payments.refund(
+      'pay-processing',
+      11_000,
+      'Confirmed unlinked refund leaving insufficient balance',
+      'req-insufficient-claim-scope-balance',
+    )
+    window.history.replaceState(
+      {},
+      '',
+      `#/admin/payments?order=ord-processing&claim=${encodeURIComponent(claim.id)}`,
+    )
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+
+    const paymentRecord = screen.getByText('pay-processing', { selector: 'summary b' }).closest('details')!
+    await user.click(paymentRecord.querySelector('summary')!)
+    expect(paymentRecord).toHaveTextContent(
+      /remaining payment balance rm\s*102\.00 is below the exact claim-scope settlement of rm\s*106\.00/i,
+    )
+    expect(within(paymentRecord).queryByRole('button', {
+      name: /linked claim.+exact claim-scope settlement/i,
+    })).not.toBeInTheDocument()
+  })
+
+  it('hides unrelated payment actions for an invalid claim workflow until it is cleared', async () => {
+    const user = userEvent.setup()
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    services.auth.oneClick('admin')
+    window.history.replaceState({}, '', '#/admin/payments?claim=claim-does-not-exist')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+
+    const alert = screen.getByRole('alert')
+    expect(alert).toHaveTextContent(/exact claim claim-does-not-exist was not found/i)
+    expect(alert).toHaveTextContent(/unrelated payment actions are hidden/i)
+    expect(screen.queryByRole('button', { name: /unlinked partial refund/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /unlinked refund remaining/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /mark disputed/i })).not.toBeInTheDocument()
+
+    await user.click(within(alert).getByRole('button', { name: /clear claim workflow/i }))
+    const paymentRecord = await screen.findByText('pay-unopened', { selector: 'summary b' })
+      .then((element) => element.closest('details')!)
+    await user.click(paymentRecord.querySelector('summary')!)
+    expect(within(paymentRecord).getByRole('button', { name: /unlinked partial refund rm10/i })).toBeVisible()
+    expect(within(paymentRecord).getByRole('button', { name: /mark disputed/i })).toBeVisible()
+  })
+
+  it('renders migrated legacy under-settled evidence without claiming remedy completion', () => {
+    const sourceServices = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    makeProcessingOrderSingleGroupedPhysicalShipment(sourceServices)
+    sourceServices.auth.oneClick('customer')
+    sourceServices.openBox('box-processing-02')
+    const claim = sourceServices.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'value_floor',
+      boxId: 'box-processing-01',
+      note: 'DEMO legacy under-settled customer rendering evidence',
+    }).data
+    sourceServices.auth.oneClick('admin')
+    sourceServices.claims.review(claim.id, 'acknowledge', 'Confirmed legacy UI acknowledgement')
+    sourceServices.claims.review(claim.id, 'approve', 'Confirmed legacy UI approval')
+    sourceServices.payments.refund(
+      'pay-processing',
+      claim.requiredSettlementSen,
+      'Confirmed exact refund before version downgrade',
+      'req-legacy-ui-under-settled',
+      claim.id,
+    )
+    const linkedEventId = sourceServices.repository.getSnapshot().claims
+      .find((entry) => entry.id === claim.id)!.linkedRefundEventId!
+
+    const legacy = structuredClone(sourceServices.repository.exportForTest()) as unknown as Omit<
+      DemoState,
+      'schemaVersion' | 'claims'
+    > & {
+      schemaVersion: number
+      claims: Array<Partial<DemoState['claims'][number]>>
+    }
+    legacy.schemaVersion = 7
+    for (const legacyClaim of legacy.claims) {
+      delete legacyClaim.remedyBoxIds
+      delete legacyClaim.requiredSettlementSen
+      delete legacyClaim.acceptedSettlementSen
+      delete legacyClaim.settlementPolicy
+      delete legacyClaim.legacyUnderSettledRefund
+    }
+    const payment = legacy.payments.find((entry) => entry.id === 'pay-processing')!
+    payment.events.find((entry) => entry.id === linkedEventId)!.refundIntent!.amountSen = 1000
+    payment.refundedSen = 1000
+    const paymentAudit = legacy.audits.find((audit) =>
+      audit.eventId === linkedEventId && audit.targetType === 'payment')!
+    ;(paymentAudit.after as Record<string, unknown>).refundedSen = 1000
+
+    const migrated = migrateDemoStateV7(legacy)
+    expect(() => validateDemoState(migrated)).not.toThrow()
+    expect(migrated.claims[0]).toMatchObject({
+      acceptedSettlementSen: 1000,
+      legacyUnderSettledRefund: true,
+      requiredSettlementSen: 10_600,
+    })
+    const storage = new MemoryStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(migrated))
+    const services = new AppServices(storage, () => FIXED_NOW)
+    services.auth.oneClick('customer')
+    window.history.replaceState({}, '', '#/order/ord-processing')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+
+    const legacyEvidence = screen.getByText(
+      'Immutable legacy under-settled refund evidence',
+    ).closest('p')!
+    expect(legacyEvidence).toHaveTextContent(/accepted rm\s*10\.00.+required rm\s*106\.00/i)
+    expect(legacyEvidence).toHaveTextContent(/does not complete this delivery\/remedy scope/i)
+    expect(legacyEvidence).toHaveTextContent(/no valid completion settlement policy/i)
+    expect(screen.queryByText(/audited refund complete/i)).not.toBeInTheDocument()
+    expect(screen.getByText(/0 of 2 box fulfilment scopes complete/i)).toBeVisible()
+
+    cleanup()
+    services.auth.oneClick('admin')
+    window.history.replaceState({}, '', `#/admin/claims?claim=${encodeURIComponent(claim.id)}`)
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+    const legacyRecord = screen.getByText(claim.id, { selector: 'summary b' }).closest('details')!
+    expect(legacyRecord).toHaveTextContent(/approved legacy claim · immutable evidence cannot finalize/i)
+    expect(within(legacyRecord).queryByRole('button', { name: /record typed remedy/i })).not.toBeInTheDocument()
+    expect(within(legacyRecord).queryByRole('radio', { name: /finalize exact audited refund link/i })).not.toBeInTheDocument()
   })
 
   it.each(['disputed', 'refunded'] as const)(
@@ -1605,7 +2066,7 @@ describe('app components', () => {
     render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
     const record = screen.getByText('ORD-PROCESSING').closest('details')!
     await user.click(record.querySelector('summary')!)
-    expect(within(record).getByText(/2 of 2 original delivery groups complete/i)).toBeVisible()
+    expect(within(record).getByText(/2 of 2 box fulfilment scopes complete/i)).toBeVisible()
     expect(within(record).getByText(/replacement: delivered/i)).toBeVisible()
     await user.click(within(record).getByRole('button', { name: /close order/i }))
     const dialog = screen.getByRole('dialog', { name: /close this fulfilled order/i })
@@ -1719,12 +2180,14 @@ describe('app components', () => {
     expect(screen.queryByText(/signature required/i)).not.toBeInTheDocument()
     expect(screen.queryByText('shp-unopened', { exact: false })).not.toBeInTheDocument()
     const fulfilment = screen.getByRole('heading', { name: /private-prize tracking/i }).closest('section')!
+    expect(screen.getByText('All fulfilment details stay combined until every box in this order is revealed.')).toBeVisible()
     expect(fulfilment.querySelectorAll('.shipment-card')).toHaveLength(1)
     expect(fulfilment.querySelectorAll('.sealed-delivery-summary .status')).toHaveLength(1)
 
     view.unmount()
     window.history.replaceState({}, '', '#/order/ord-shipped')
     render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+    expect(screen.getByRole('heading', { name: 'Box fulfilment scopes & remedies' })).toBeVisible()
     expect(screen.getByText('DEMO-SHIPPED')).toBeVisible()
     expect(screen.getByText('Demo Express')).toBeVisible()
     expect(screen.getByText(/signature required/i)).toBeVisible()

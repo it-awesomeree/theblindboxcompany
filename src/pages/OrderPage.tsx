@@ -140,7 +140,7 @@ export function OrderPage() {
 
         <section className="subsection">
           <div className="subsection-heading">
-            <div><span>05 / FULFILMENT</span><h2>{everyBoxRevealed ? 'Original delivery groups & remedies' : 'Private-prize tracking'}</h2></div>
+            <div><span>05 / FULFILMENT</span><h2>{everyBoxRevealed ? 'Box fulfilment scopes & remedies' : 'Private-prize tracking'}</h2></div>
             <Link to={`/claim/new?order=${order.id}`}>Start a demo claim</Link>
           </div>
           {!everyBoxRevealed && (
@@ -157,7 +157,7 @@ export function OrderPage() {
                   <StatusBadge value={neutralOrderDeliveryStatus(order.status)} />
                 </div>
                 <p className="tracking-code">{neutralOrderDeliveryCode(order.id)}</p>
-                <p>All delivery groups stay combined until every box in this order is revealed.</p>
+                <p>All fulfilment details stay combined until every box in this order is revealed.</p>
               </article>
             </div>
           ) : shipments.length ? (

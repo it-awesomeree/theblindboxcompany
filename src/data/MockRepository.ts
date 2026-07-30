@@ -1,17 +1,58 @@
 import { SCHEMA_VERSION, VALUE_FLOOR_SEN } from '../domain/constants'
 import { canonicalizeAuditEvidence } from '../domain/auditEvidence'
-import { assert, cloneState, DomainError } from '../domain/guards'
+import { sameInstant } from '../domain/auditSequence'
+import {
+  assert,
+  cloneState,
+  DomainError,
+  makeId,
+} from '../domain/guards'
+import {
+  LEGACY_DIRECT_REPLACEMENT_MIGRATION_ACTION,
+  LEGACY_DIRECT_REPLACEMENT_MIGRATION_REASON,
+  legacyDirectReplacementMigrationAfter,
+  legacyDirectReplacementMigrationBefore,
+  legacyDirectReplacementMigrationId,
+  legacyDirectReplacementMigrationRequestId,
+} from '../domain/migrationEvidence'
 import { exactOddsLabel } from '../domain/odds'
 import {
   expectedBoxStatusForScope,
   resolveOrderFulfillment,
 } from '../domain/orderFulfillment'
 import {
+  acceptedDisputeResolutionShapeIsValid,
+  immediatePriorAcceptedPaymentStatus,
+} from '../domain/paymentEligibility'
+import {
+  LEGACY_IGNORED_EVENT_MIGRATION_ACTION,
+  LEGACY_IGNORED_EVENT_MIGRATION_REASON,
+  ignoredPaymentEventRequestId,
+  legacyIgnoredPaymentEventMigrationEvidence,
+  legacyIgnoredPaymentEventMigrationId,
+  legacyIgnoredPaymentEventMigrationRequestId,
+  matchingLegacyIgnoredPaymentEventSourceAudit,
+} from '../domain/paymentEventEvidence'
+import {
   expectedClaimRemedySnapshot,
   isTerminalReplacementRefundFallback,
+  matchingAppliedUnlinkedRefundAudit,
+  preservedCompletedClaimIdsForUnlinkedRefund,
   terminalReplacementFallbackAmount,
 } from '../domain/remedyPolicy'
-import type { AuditEntry, Claim, DemoState, Shipment } from '../domain/types'
+import {
+  matchingReplacementAuthorizationAudit,
+  matchingReplacementDeliveryAudit,
+  matchingShipmentTransitionAudit,
+  RMA_RECEIVED_ACTION,
+} from '../domain/remedyEvidence'
+import type {
+  AuditEntry,
+  Claim,
+  DemoState,
+  LegacyDirectPostDeliveryReplacementEvidence,
+  Shipment,
+} from '../domain/types'
 import { createDemoState } from './fixtures'
 import { isDemoState, validateDemoState } from './StateValidator'
 
@@ -38,6 +79,9 @@ type LegacyDemoStateV7 = Omit<
 > & {
   schemaVersion: 7
   claims: LegacyClaimV7[]
+}
+export type LegacyDemoStateV8 = Omit<DemoState, 'schemaVersion'> & {
+  schemaVersion: 8
 }
 type LegacyShipmentV6 = Omit<
   Shipment,
@@ -73,7 +117,7 @@ interface LoadedState {
   notice: string | null
   needsPersist: boolean
   migratedFromRaw?: string
-  migratedFromVersion?: 5 | 6 | 7
+  migratedFromVersion?: 5 | 6 | 7 | 8
   protectedRaw?: string
   requiresConfirmedReset?: boolean
   storageWasMissing?: boolean
@@ -390,7 +434,15 @@ function linkedRefundEvidence(
     }
     const priorRefundedSen = payment.events
       .slice(0, eventIndex)
-      .reduce((sum, prior) => sum + (prior.refundIntent?.amountSen ?? 0), 0)
+      .reduce(
+        (sum, prior) =>
+          sum + (
+            prior.ignoredReason
+              ? 0
+              : (prior.refundIntent?.amountSen ?? 0)
+          ),
+        0,
+      )
     return {
       amountSen: amountSen!,
       payment,
@@ -400,7 +452,926 @@ function linkedRefundEvidence(
   return undefined
 }
 
-export function migrateDemoStateV7(value: unknown): DemoState {
+function appendVersion9MigrationAudit(
+  state: DemoState,
+  input: Omit<
+    AuditEntry,
+    'id' | 'sequence' | 'previousId' | 'before' | 'after'
+  > & {
+    idSeed: string
+    before?: unknown
+    after?: unknown
+  },
+) {
+  const hasBefore = Object.prototype.hasOwnProperty.call(input, 'before')
+  const hasAfter = Object.prototype.hasOwnProperty.call(input, 'after')
+  const {
+    idSeed,
+    before,
+    after,
+    ...audit
+  } = input
+  const id = `audit-migration-v9-${idSeed}`
+  assert(
+    !state.audits.some((entry) => entry.id === id),
+    `Synthetic migration audit identity ${id} collides with stored history.`,
+    'MIGRATION_ID_COLLISION',
+  )
+  const entry: AuditEntry = {
+    id,
+    sequence: state.auditCount + 1,
+    ...(state.auditHeadId ? { previousId: state.auditHeadId } : {}),
+    ...audit,
+    ...(hasBefore
+      ? {
+          before: canonicalizeAuditEvidence(
+            before,
+            `Migration audit ${id} before evidence`,
+          ),
+        }
+      : {}),
+    ...(hasAfter
+      ? {
+          after: canonicalizeAuditEvidence(
+            after,
+            `Migration audit ${id} after evidence`,
+          ),
+        }
+      : {}),
+  }
+  state.audits.push(entry)
+  state.auditCount = entry.sequence
+  state.auditHeadId = entry.id
+  return entry
+}
+
+function exactRecord(
+  value: unknown,
+  expected: Record<string, unknown>,
+) {
+  if (!record(value)) return false
+  const expectedKeys = Object.keys(expected).sort()
+  const actualKeys = Object.keys(value)
+  return (
+    actualKeys.length === expectedKeys.length &&
+    actualKeys.every((key, index) => key === expectedKeys[index]) &&
+    expectedKeys.every((key) =>
+      JSON.stringify(value[key]) === JSON.stringify(expected[key]))
+  )
+}
+
+function originalForMigratedClaim(
+  state: LegacyDemoStateV8,
+  claim: Claim,
+) {
+  const originalId =
+    claim.shipmentId ??
+    (
+      claim.shipmentCandidateIds?.length === 1
+        ? claim.shipmentCandidateIds[0]
+        : undefined
+    ) ??
+    (
+      claim.boxId
+        ? state.boxes.find((box) =>
+            box.id === claim.boxId &&
+            box.orderId === claim.orderId)?.shipmentId
+        : undefined
+    )
+  const matches = state.shipments.filter((shipment) =>
+    shipment.id === originalId &&
+    shipment.orderId === claim.orderId &&
+    shipment.purpose === 'original')
+  return matches.length === 1 ? matches[0] : undefined
+}
+
+function allTimelineIds(state: LegacyDemoStateV8 | DemoState) {
+  return state.shipments.flatMap((shipment) =>
+    shipment.timeline.map((entry) => entry.id))
+}
+
+export function version9RmaReturnedTimelineId(
+  claimId: string,
+  originalShipmentId: string,
+) {
+  return `stl-migration-v9-${makeId(
+    'rma-returned',
+    `${claimId}:${originalShipmentId}`,
+  )}`
+}
+
+export function version9RmaReceiptAuditId(claimId: string) {
+  return `audit-migration-v9-${makeId('rma-receipt', claimId)}`
+}
+
+interface Version8RmaReceiptPlan {
+  claimId: string
+  originalShipmentId: string
+  originalStatusBeforeReceipt: 'delivered' | 'returned'
+  insertReturnedTimeline: boolean
+  oldAudit: AuditEntry
+}
+
+interface Version8DirectReplacementPlan {
+  claimId: string
+  evidence: LegacyDirectPostDeliveryReplacementEvidence
+}
+
+interface Version8IgnoredEventPlan {
+  paymentId: string
+  eventId: string
+  before: Record<string, unknown>
+  after: Record<string, unknown>
+}
+
+interface Version8MigrationPlan {
+  rmaReceipts: Version8RmaReceiptPlan[]
+  directReplacements: Version8DirectReplacementPlan[]
+  ignoredEvents: Version8IgnoredEventPlan[]
+}
+
+function preflightVersion8RmaReceipts(
+  state: LegacyDemoStateV8,
+) {
+  const plans: Version8RmaReceiptPlan[] = []
+  const timelineIds = allTimelineIds(state)
+  for (const claim of state.claims) {
+    if (!claim.rma || claim.rma.status === 'created') continue
+    const original = originalForMigratedClaim(state, claim)
+    const receivedAt = claim.rma.receivedAt
+    const receivedReason = claim.rma.receivedReason
+    assert(
+      original &&
+        original.kind !== 'DIGITAL' &&
+        receivedAt &&
+        receivedReason &&
+        claim.rma.reference &&
+        claim.history.some((entry) =>
+          entry.status === 'approved' &&
+          entry.at === receivedAt &&
+          entry.note === receivedReason),
+      'Legacy RMA receipt is missing its exact physical original, time, reason, or immutable claim history.',
+      'MIGRATION_SOURCE_INVALID',
+    )
+    const oldAudits = state.audits.filter((audit) =>
+      audit.outcome === 'applied' &&
+      ['support', 'admin', 'super_admin'].includes(audit.actorRole) &&
+      audit.action === RMA_RECEIVED_ACTION &&
+      audit.targetType === 'claim' &&
+      audit.targetId === claim.id &&
+      audit.reason === receivedReason &&
+      sameInstant(audit.at, receivedAt) &&
+      audit.requestId === makeId(
+        'req',
+        `${claim.id}:rma:received:${receivedAt}`,
+      ) &&
+      audit.eventId === undefined &&
+      exactRecord(audit.before, {
+        remedyState: 'rma_created',
+        rmaStatus: 'created',
+      }) &&
+      exactRecord(audit.after, {
+        remedyState: 'rma_received',
+        rmaReference: claim.rma!.reference,
+        rmaStatus: 'received',
+      }))
+    assert(
+      oldAudits.length === 1 &&
+        claim.history.some((entry) =>
+          entry.status === 'approved' &&
+          entry.at === receivedAt &&
+          entry.note === receivedReason &&
+          entry.actorId === oldAudits[0].actorId &&
+          entry.actorRole === oldAudits[0].actorRole),
+      'Legacy RMA receipt audit is malformed or ambiguous.',
+      'MIGRATION_SOURCE_INVALID',
+    )
+    const entriesAtReceipt = original.timeline.filter((entry) =>
+      Date.parse(entry.at) <= Date.parse(receivedAt))
+    const originalStatusBeforeReceipt = entriesAtReceipt.at(-1)?.status
+    const originalIndexAtReceipt = original.timeline.reduce(
+      (lastIndex, entry, index) =>
+        Date.parse(entry.at) <= Date.parse(receivedAt)
+          ? index
+          : lastIndex,
+      -1,
+    )
+    assert(
+      (
+        originalStatusBeforeReceipt === 'delivered' ||
+        originalStatusBeforeReceipt === 'returned'
+      ) &&
+        original.timeline.some((entry) =>
+          entry.status === 'delivered' &&
+          Date.parse(entry.at) <= Date.parse(claim.createdAt)) &&
+        original.timeline.every((entry, index) =>
+          index === 0 ||
+          Date.parse(entry.at) >= Date.parse(original.timeline[index - 1].at)),
+      'Legacy RMA receipt original history is malformed or does not prove delivery before the claim and receipt.',
+      'MIGRATION_SOURCE_INVALID',
+    )
+    if (originalStatusBeforeReceipt === 'returned') {
+      assert(
+        originalIndexAtReceipt > 0 &&
+          matchingShipmentTransitionAudit(
+            state as unknown as DemoState,
+            original,
+            originalIndexAtReceipt,
+          ),
+        'Legacy original returned before RMA receipt is missing its exact source transition audit.',
+        'MIGRATION_SOURCE_INVALID',
+      )
+    }
+    const insertReturnedTimeline =
+      originalStatusBeforeReceipt === 'delivered'
+    const timelineId = version9RmaReturnedTimelineId(claim.id, original.id)
+    if (insertReturnedTimeline) {
+      assert(
+        !timelineIds.includes(timelineId),
+        `Synthetic migration timeline identity ${timelineId} collides with stored history.`,
+        'MIGRATION_ID_COLLISION',
+      )
+    }
+    assert(
+      !state.audits.some((audit) =>
+        audit.id === version9RmaReceiptAuditId(claim.id)),
+      `Synthetic migration audit identity ${version9RmaReceiptAuditId(claim.id)} collides with stored history.`,
+      'MIGRATION_ID_COLLISION',
+    )
+    plans.push({
+      claimId: claim.id,
+      originalShipmentId: original.id,
+      originalStatusBeforeReceipt,
+      insertReturnedTimeline,
+      oldAudit: oldAudits[0],
+    })
+  }
+  return plans
+}
+
+function matchingVersion8ReplacementTransitionAudit(
+  state: LegacyDemoStateV8,
+  shipment: Shipment,
+  index: number,
+) {
+  const entry = shipment.timeline[index]
+  const previous = shipment.timeline[index - 1]
+  if (!entry || !previous) return undefined
+
+  const financialStop = entry.status === 'cancelled' && Boolean(entry.financialHold)
+  const disputeResume =
+    previous.status === 'cancelled' &&
+    previous.financialHold === 'disputed' &&
+    entry.status === 'unfulfilled'
+  let matches: AuditEntry[]
+  if (financialStop && entry.financialHold) {
+    matches = state.audits.filter((audit) =>
+      audit.outcome === 'applied' &&
+      ['finance', 'admin', 'super_admin'].includes(audit.actorRole) &&
+      audit.action === `order.financial_hold_${entry.financialHold}` &&
+      audit.targetType === 'order' &&
+      audit.targetId === shipment.orderId &&
+      audit.reason === entry.label &&
+      audit.at === entry.at &&
+      entry.id === makeId(
+        'stl',
+        `${shipment.id}:financial-stop:${audit.requestId}`,
+      ) &&
+      record(audit.before) &&
+      Array.isArray(audit.before.shipments) &&
+      audit.before.shipments.some((value) =>
+        record(value) &&
+        value.id === shipment.id &&
+        value.status === previous.status) &&
+      record(audit.after) &&
+      Array.isArray(audit.after.stoppedShipmentIds) &&
+      audit.after.stoppedShipmentIds.includes(shipment.id))
+  } else if (disputeResume) {
+    matches = state.audits.filter((audit) =>
+      audit.outcome === 'applied' &&
+      ['finance', 'admin', 'super_admin'].includes(audit.actorRole) &&
+      audit.action === 'order.dispute_resolved' &&
+      audit.targetType === 'order' &&
+      audit.targetId === shipment.orderId &&
+      audit.reason === entry.label &&
+      audit.at === entry.at &&
+      entry.id === makeId(
+        'stl',
+        `${shipment.id}:dispute-resolved:${audit.requestId}`,
+      ) &&
+      exactRecord(audit.before, { status: 'disputed' }) &&
+      record(audit.after) &&
+      typeof audit.after.status === 'string' &&
+      exactRecord(audit.after, { status: audit.after.status }))
+  } else {
+    matches = state.audits.filter((audit) =>
+      audit.outcome === 'applied' &&
+      ['fulfilment', 'admin', 'super_admin'].includes(audit.actorRole) &&
+      audit.action === 'shipment.transitioned' &&
+      audit.targetType === 'shipment' &&
+      audit.targetId === shipment.id &&
+      audit.reason === entry.label &&
+      audit.at === entry.at &&
+      exactRecord(audit.before, { status: previous.status }) &&
+      record(audit.after) &&
+      typeof audit.after.orderStatus === 'string' &&
+      typeof audit.after.financialHoldPreserved === 'boolean' &&
+      [
+        'confirmed',
+        'processing',
+        'partially_fulfilled',
+        'fulfilled',
+        'closed',
+        'cancelled',
+        'refunded',
+        'disputed',
+      ].includes(audit.after.orderStatus) &&
+      exactRecord(audit.after, {
+        financialHoldPreserved: audit.after.financialHoldPreserved,
+        orderStatus: audit.after.orderStatus,
+        status: entry.status,
+      }))
+  }
+  if (!financialStop && !disputeResume) {
+    const requestId = entry.id.startsWith('stl-')
+      ? `req-${entry.id.slice('stl-'.length)}`
+      : ''
+    matches = matches.filter((audit) => audit.requestId === requestId)
+  }
+  return matches.length === 1 ? matches[0] : undefined
+}
+
+function preflightVersion8DirectReplacements(
+  state: LegacyDemoStateV8,
+) {
+  const plans: Version8DirectReplacementPlan[] = []
+  for (const replacement of state.shipments.filter((shipment) =>
+    shipment.purpose === 'replacement')) {
+    const claims = state.claims.filter((claim) =>
+      claim.id === replacement.sourceClaimId &&
+      claim.replacementShipmentId === replacement.id)
+    const originals = state.shipments.filter((shipment) =>
+      shipment.id === replacement.replacementForShipmentId &&
+      shipment.purpose === 'original' &&
+      shipment.orderId === replacement.orderId)
+    if (claims.length !== 1 || originals.length !== 1) continue
+    const claim = claims[0]
+    const original = originals[0]
+    const authorization = claim.replacementAuthorization
+    const deliveredBeforeAuthorization = Boolean(
+      authorization &&
+        original.timeline.some((entry) =>
+          entry.status === 'delivered' &&
+          Date.parse(entry.at) <= Date.parse(authorization.at)),
+    )
+    if (!deliveredBeforeAuthorization || claim.rma !== undefined) continue
+    const authorizationAudit = matchingReplacementAuthorizationAudit(
+      state as unknown as DemoState,
+      claim,
+      original,
+      replacement,
+    )
+    assert(
+      authorization &&
+        authorizationAudit &&
+        authorizationAudit.requestId === makeId(
+          'req',
+          `${claim.id}:replacement:${authorization.at}`,
+        ) &&
+        authorizationAudit.eventId === undefined &&
+        ['delivered', 'returned'].includes(original.status) &&
+        replacement.timeline.every((_, index) =>
+          index === 0 ||
+          Boolean(matchingVersion8ReplacementTransitionAudit(
+            state,
+            replacement,
+            index,
+          ))) &&
+        claim.history.some((entry) =>
+          entry.status === (
+            replacement.status === 'delivered' ? 'approved' : claim.status
+          ) &&
+          entry.at === authorization.at &&
+          entry.note === authorization.reason &&
+          entry.actorId === authorizationAudit.actorId &&
+          entry.actorRole === authorizationAudit.actorRole),
+      'Legacy direct post-delivery replacement authorization is malformed or ambiguous.',
+      'MIGRATION_SOURCE_INVALID',
+    )
+    if (replacement.status === 'delivered') {
+      assert(
+        claim.status === 'resolved' &&
+          claim.remedyState === 'replacement_delivered' &&
+          claim.resolutionOutcome === 'replacement_authorized' &&
+          claim.resolutionReference === replacement.id &&
+          matchingReplacementDeliveryAudit(
+            state as unknown as DemoState,
+            claim,
+            replacement,
+          ),
+        'Legacy delivered direct replacement is missing its exact completion evidence.',
+        'MIGRATION_SOURCE_INVALID',
+      )
+    } else {
+      assert(
+        claim.status === 'approved' &&
+          claim.remedyState === 'replacement_authorized' &&
+          claim.resolutionOutcome === undefined &&
+          claim.resolutionReference === undefined,
+        'Legacy incomplete direct replacement has an ambiguous claim outcome.',
+        'MIGRATION_SOURCE_INVALID',
+      )
+    }
+    const evidence: LegacyDirectPostDeliveryReplacementEvidence = {
+      originalShipmentId: original.id,
+      originalStatusAtMigration: original.status as 'delivered' | 'returned',
+      replacementShipmentId: replacement.id,
+      replacementStatusAtMigration: replacement.status,
+    }
+    assert(
+      !state.audits.some((audit) =>
+        audit.id === legacyDirectReplacementMigrationId(claim.id)),
+      `Synthetic migration audit identity ${legacyDirectReplacementMigrationId(claim.id)} collides with stored history.`,
+      'MIGRATION_ID_COLLISION',
+    )
+    plans.push({ claimId: claim.id, evidence })
+  }
+  return plans
+}
+
+function preflightVersion8IgnoredEvents(
+  state: LegacyDemoStateV8,
+) {
+  const plans: Version8IgnoredEventPlan[] = []
+  for (const payment of state.payments) {
+    for (const event of payment.events) {
+      if (event.ignoredReason === undefined) continue
+      assert(
+        event.ignoredOutcome === undefined &&
+          event.ignoredPriorStatus === undefined &&
+          event.ignoredRelatedPaymentId === undefined &&
+          event.ignoredRoute === undefined &&
+          event.ignoredInputReason === undefined &&
+          event.refundIntent === undefined &&
+          ['mock_webhook', 'admin_reconcile'].includes(event.source) &&
+          event.requestId === ignoredPaymentEventRequestId(event.id),
+        'Legacy ignored payment event contains forged current-schema evidence.',
+        'MIGRATION_SOURCE_INVALID',
+      )
+      const migration = legacyIgnoredPaymentEventMigrationEvidence(
+        state,
+        payment,
+        event,
+      )
+      assert(
+        migration,
+        'Legacy ignored payment event outcome is malformed or ambiguous.',
+        'MIGRATION_SOURCE_INVALID',
+      )
+      const oldSourceAudit = matchingLegacyIgnoredPaymentEventSourceAudit(
+        state,
+        payment,
+        event,
+      )
+      assert(
+        (
+          event.source === 'admin_reconcile' &&
+          Boolean(oldSourceAudit)
+        ) ||
+          (
+            event.source === 'mock_webhook' &&
+            oldSourceAudit === null
+          ),
+        event.source === 'admin_reconcile'
+          ? 'Legacy ignored admin event is missing its exact old-writer audit.'
+          : 'Legacy ignored mock webhook event has forged admin-only audit evidence.',
+        'MIGRATION_SOURCE_INVALID',
+      )
+      assert(
+        !state.audits.some((audit) =>
+          audit.id === legacyIgnoredPaymentEventMigrationId(event.id)),
+        `Synthetic migration audit identity ${legacyIgnoredPaymentEventMigrationId(event.id)} collides with stored history.`,
+        'MIGRATION_ID_COLLISION',
+      )
+      plans.push({
+        paymentId: payment.id,
+        eventId: event.id,
+        before: migration.before,
+        after: migration.after,
+      })
+    }
+  }
+  return plans
+}
+
+function assertVersion8EffectiveDeliveryUniqueness(
+  state: LegacyDemoStateV8,
+) {
+  const deliveredBoxIds = state.shipments
+    .filter((shipment) => shipment.status === 'delivered')
+    .flatMap((shipment) => shipment.boxIds)
+  assert(
+    new Set(deliveredBoxIds).size === deliveredBoxIds.length,
+    'Version 8 source duplicates an effectively delivered shipment box and could not have passed the previous reader.',
+    'MIGRATION_SOURCE_INVALID',
+  )
+}
+
+function preflightVersion8Migration(
+  state: LegacyDemoStateV8,
+): Version8MigrationPlan {
+  // Frozen c3c8c28 reader invariant: no two currently delivered shipments
+  // could persist the same box. Migration must not manufacture an exception.
+  assertVersion8EffectiveDeliveryUniqueness(state)
+  assert(
+    state.claims.every((claim) =>
+      !Object.prototype.hasOwnProperty.call(
+        claim,
+        'legacyDirectPostDeliveryReplacement',
+      )) &&
+      state.audits.every((audit) =>
+        ![
+          LEGACY_DIRECT_REPLACEMENT_MIGRATION_ACTION,
+          LEGACY_IGNORED_EVENT_MIGRATION_ACTION,
+        ].includes(audit.action)),
+    'Version 8 source contains forged migration-only markers or audits.',
+    'MIGRATION_SOURCE_INVALID',
+  )
+  preflightVersion8DisputeResolutionHistory(state)
+  const plan = {
+    rmaReceipts: preflightVersion8RmaReceipts(state),
+    directReplacements: preflightVersion8DirectReplacements(state),
+    ignoredEvents: preflightVersion8IgnoredEvents(state),
+  }
+  const syntheticAuditIds = [
+    ...plan.rmaReceipts.map((entry) =>
+      version9RmaReceiptAuditId(entry.claimId)),
+    ...plan.directReplacements.map((entry) =>
+      legacyDirectReplacementMigrationId(entry.claimId)),
+    ...plan.ignoredEvents.map((entry) =>
+      legacyIgnoredPaymentEventMigrationId(entry.eventId)),
+  ]
+  assert(
+    new Set(syntheticAuditIds).size === syntheticAuditIds.length,
+    'Two version 8 records would generate the same synthetic migration audit identity.',
+    'MIGRATION_ID_COLLISION',
+  )
+  const syntheticTimelineIds = plan.rmaReceipts
+    .filter((entry) => entry.insertReturnedTimeline)
+    .map((entry) =>
+      version9RmaReturnedTimelineId(
+        entry.claimId,
+        entry.originalShipmentId,
+      ))
+  assert(
+    new Set(syntheticTimelineIds).size === syntheticTimelineIds.length,
+    'Two version 8 RMA receipts would generate the same synthetic return timeline identity.',
+    'MIGRATION_ID_COLLISION',
+  )
+  return plan
+}
+
+function applyVersion8RmaReceiptPlans(
+  state: DemoState,
+  plans: Version8RmaReceiptPlan[],
+) {
+  for (const plan of plans) {
+    const claim = state.claims.find((entry) => entry.id === plan.claimId)!
+    const original = state.shipments.find((entry) =>
+      entry.id === plan.originalShipmentId)!
+    if (plan.insertReturnedTimeline) {
+      const receivedAt = claim.rma!.receivedAt!
+      const insertAt = original.timeline.findIndex((entry) =>
+        Date.parse(entry.at) > Date.parse(receivedAt))
+      const timeline = {
+        id: version9RmaReturnedTimelineId(claim.id, original.id),
+        status: 'returned' as const,
+        label: claim.rma!.receivedReason!,
+        at: receivedAt,
+      }
+      if (insertAt < 0) {
+        original.timeline.push(timeline)
+      } else {
+        original.timeline.splice(insertAt, 0, timeline)
+      }
+      original.status = original.timeline.at(-1)!.status
+    }
+    appendVersion9MigrationAudit(state, {
+      idSeed: makeId('rma-receipt', claim.id),
+      outcome: 'applied',
+      actorId: plan.oldAudit.actorId,
+      actorRole: plan.oldAudit.actorRole,
+      action: RMA_RECEIVED_ACTION,
+      targetType: 'claim',
+      targetId: claim.id,
+      reason: claim.rma!.receivedReason!,
+      at: claim.rma!.receivedAt!,
+      requestId: makeId('migration-v9-rma-receipt', claim.id),
+      before: {
+        originalShipmentId: original.id,
+        originalShipmentStatus: plan.originalStatusBeforeReceipt,
+        remedyState: 'rma_created',
+        rmaStatus: 'created',
+      },
+      after: {
+        originalShipmentId: original.id,
+        originalShipmentStatus: 'returned',
+        remedyState: 'rma_received',
+        rmaReference: claim.rma!.reference,
+        rmaStatus: 'received',
+      },
+    })
+  }
+}
+
+function applyVersion8DirectReplacementPlans(
+  state: DemoState,
+  plans: Version8DirectReplacementPlan[],
+) {
+  for (const plan of plans) {
+    const claim = state.claims.find((entry) => entry.id === plan.claimId)!
+    claim.legacyDirectPostDeliveryReplacement = plan.evidence
+    appendVersion9MigrationAudit(state, {
+      idSeed: legacyDirectReplacementMigrationId(claim.id)
+        .slice('audit-migration-v9-'.length),
+      outcome: 'applied',
+      actorId: 'system',
+      actorRole: 'super_admin',
+      action: LEGACY_DIRECT_REPLACEMENT_MIGRATION_ACTION,
+      targetType: 'claim',
+      targetId: claim.id,
+      reason: LEGACY_DIRECT_REPLACEMENT_MIGRATION_REASON,
+      at: claim.replacementAuthorization!.at,
+      requestId: legacyDirectReplacementMigrationRequestId(claim.id),
+      before: legacyDirectReplacementMigrationBefore(plan.evidence),
+      after: legacyDirectReplacementMigrationAfter(plan.evidence),
+    })
+  }
+}
+
+function applyVersion8IgnoredEventPlans(
+  state: DemoState,
+  plans: Version8IgnoredEventPlan[],
+) {
+  for (const plan of plans) {
+    const payment = state.payments.find((entry) =>
+      entry.id === plan.paymentId)!
+    const event = payment.events.find((entry) => entry.id === plan.eventId)!
+    appendVersion9MigrationAudit(state, {
+      idSeed: legacyIgnoredPaymentEventMigrationId(event.id)
+        .slice('audit-migration-v9-'.length),
+      outcome: 'applied',
+      actorId: 'system',
+      actorRole: 'super_admin',
+      action: LEGACY_IGNORED_EVENT_MIGRATION_ACTION,
+      targetType: 'payment',
+      targetId: payment.id,
+      reason: LEGACY_IGNORED_EVENT_MIGRATION_REASON,
+      at: event.processedAt,
+      requestId: legacyIgnoredPaymentEventMigrationRequestId(event.id),
+      eventId: event.id,
+      before: plan.before,
+      after: plan.after,
+    })
+  }
+}
+
+function appendVersion9MissingShipmentTransitionAudits(state: DemoState) {
+  for (const shipment of state.shipments) {
+    for (let index = 1; index < shipment.timeline.length; index += 1) {
+      if (matchingShipmentTransitionAudit(state, shipment, index)) continue
+      const timeline = shipment.timeline[index]
+      const previous = shipment.timeline[index - 1]
+      if (timeline.status === 'cancelled' && timeline.financialHold) {
+        const sourceAudit = matchingVersion8ReplacementTransitionAudit(
+          state as unknown as LegacyDemoStateV8,
+          shipment,
+          index,
+        )
+        assert(
+          sourceAudit,
+          'Version 8 financial-stop history is missing its exact source audit.',
+          'MIGRATION_SOURCE_INVALID',
+        )
+        const stopped = state.shipments.flatMap((candidate) =>
+          candidate.orderId === shipment.orderId
+            ? candidate.timeline.flatMap((entry, candidateIndex) =>
+                candidateIndex > 0 &&
+                entry.id === makeId(
+                  'stl',
+                  `${candidate.id}:financial-stop:${sourceAudit.requestId}`,
+                ) &&
+                entry.status === 'cancelled' &&
+                entry.financialHold === timeline.financialHold &&
+                entry.label === timeline.label &&
+                sameInstant(entry.at, timeline.at)
+                  ? [{
+                      id: candidate.id,
+                      status: candidate.timeline[candidateIndex - 1].status,
+                    }]
+                  : [])
+            : [])
+          .sort((left, right) => left.id.localeCompare(right.id))
+        appendVersion9MigrationAudit(state, {
+          idSeed: `${shipment.orderId}-${index}-financial-stop`,
+          outcome: 'applied',
+          actorId: 'system',
+          actorRole: 'super_admin',
+          action: `order.financial_hold_${timeline.financialHold}`,
+          targetType: 'order',
+          targetId: shipment.orderId,
+          reason: timeline.label,
+          at: timeline.at,
+          before: {
+            shipments: stopped,
+          },
+          after: {
+            stoppedShipmentIds: stopped.map((entry) => entry.id),
+          },
+          requestId: sourceAudit.requestId,
+        })
+      } else if (
+        previous.status === 'cancelled' &&
+        previous.financialHold === 'disputed' &&
+        timeline.status === 'unfulfilled'
+      ) {
+        const sourceAudit = matchingVersion8ReplacementTransitionAudit(
+          state as unknown as LegacyDemoStateV8,
+          shipment,
+          index,
+        )
+        assert(
+          sourceAudit,
+          'Version 8 dispute-resume history is missing its exact source audit.',
+          'MIGRATION_SOURCE_INVALID',
+        )
+        const resumedShipmentIds = state.shipments
+          .filter((candidate) =>
+            candidate.orderId === shipment.orderId &&
+            candidate.timeline.some((entry, candidateIndex) =>
+              candidateIndex > 0 &&
+              entry.id === makeId(
+                'stl',
+                `${candidate.id}:dispute-resolved:${sourceAudit.requestId}`,
+              ) &&
+              entry.status === 'unfulfilled' &&
+              entry.label === timeline.label &&
+              sameInstant(entry.at, timeline.at) &&
+              candidate.timeline[candidateIndex - 1]?.status === 'cancelled' &&
+              candidate.timeline[candidateIndex - 1]?.financialHold ===
+                'disputed'))
+          .map((candidate) => candidate.id)
+          .sort((left, right) => left.localeCompare(right))
+        appendVersion9MigrationAudit(state, {
+          idSeed: `${shipment.orderId}-${index}-dispute-resume`,
+          outcome: 'applied',
+          actorId: 'system',
+          actorRole: 'super_admin',
+          action: 'order.dispute_resolved',
+          targetType: 'order',
+          targetId: shipment.orderId,
+          reason: timeline.label,
+          at: timeline.at,
+          before: { status: 'disputed' },
+          after: {
+            resumedShipmentIds,
+            status: record(sourceAudit.after) &&
+              typeof sourceAudit.after.status === 'string'
+              ? sourceAudit.after.status
+              : 'confirmed',
+          },
+          requestId: sourceAudit.requestId,
+        })
+      } else {
+        const orderStatus = state.orders.find((order) =>
+          order.id === shipment.orderId)?.status ?? 'confirmed'
+        appendVersion9MigrationAudit(state, {
+          idSeed: `${shipment.id}-${index}-transition`,
+          outcome: 'applied',
+          actorId: 'system',
+          actorRole: 'super_admin',
+          action: 'shipment.transitioned',
+          targetType: 'shipment',
+          targetId: shipment.id,
+          reason: timeline.label,
+          at: timeline.at,
+          before: { status: previous.status },
+          after: {
+            financialHoldPreserved: [
+              'cancelled',
+              'refunded',
+              'disputed',
+            ].includes(orderStatus),
+            orderStatus,
+            status: timeline.status,
+          },
+          requestId: `migration-v9-${shipment.id}-${index}-transition`,
+        })
+      }
+    }
+  }
+}
+
+function appendVersion9MissingUnlinkedRefundAudits(state: DemoState) {
+  for (const payment of state.payments) {
+    for (const [eventIndex, event] of payment.events.entries()) {
+      const intent = event.refundIntent
+      if (
+        !intent ||
+        intent.claimId !== undefined ||
+        event.ignoredReason !== undefined ||
+        matchingAppliedUnlinkedRefundAudit(state, payment, event)
+      ) {
+        continue
+      }
+      const priorAccepted = payment.events
+        .slice(0, eventIndex)
+        .filter((entry) => entry.ignoredReason === undefined)
+      const priorStatus = priorAccepted.at(-1)?.type
+      const priorRefundedSen = priorAccepted.reduce(
+        (sum, entry) => sum + (entry.refundIntent?.amountSen ?? 0),
+        0,
+      )
+      assert(
+        priorStatus &&
+          ['partially_refunded', 'refunded'].includes(event.type),
+        'Legacy unlinked refund history is incomplete.',
+        'MIGRATION_SOURCE_INVALID',
+      )
+      const boundary = {
+        at: event.processedAt,
+        sequence: state.auditCount + 1,
+      }
+      const preservedCompletedClaimIds =
+        preservedCompletedClaimIdsForUnlinkedRefund(
+          state,
+          payment,
+          boundary,
+        )
+      const disputeOrigin = priorStatus === 'disputed'
+      appendVersion9MigrationAudit(state, {
+        idSeed: `${payment.id}-${event.id}-refund`,
+        outcome: 'applied',
+        actorId: 'system',
+        actorRole: 'super_admin',
+        action: event.type === 'refunded'
+          ? 'payment.refunded'
+          : 'payment.partially_refunded',
+        targetType: 'payment',
+        targetId: payment.id,
+        reason: intent.reason,
+        at: event.processedAt,
+        before: {
+          refundedSen: priorRefundedSen,
+          status: priorStatus,
+        },
+        after: {
+          allocationsReturned: 0,
+          amountSen: intent.amountSen,
+          ...(disputeOrigin ? { orderStatus: 'refunded' } : {}),
+          ...(preservedCompletedClaimIds.length > 0
+            ? { preservedCompletedClaimIds }
+            : {}),
+          refundedSen: priorRefundedSen + intent.amountSen,
+          status: event.type,
+        },
+        requestId: event.requestId,
+        eventId: event.id,
+      })
+    }
+  }
+}
+
+function preflightVersion8DisputeResolutionHistory(
+  state: LegacyDemoStateV8,
+) {
+  for (const payment of state.payments) {
+    assert(
+      Array.isArray(payment.events),
+      'Legacy payment event history is incomplete.',
+      'MIGRATION_SOURCE_INVALID',
+    )
+    for (const [eventIndex, event] of payment.events.entries()) {
+      if (
+        event.ignoredReason === undefined &&
+        immediatePriorAcceptedPaymentStatus(payment, eventIndex) ===
+          'disputed'
+      ) {
+        assert(
+          acceptedDisputeResolutionShapeIsValid(
+            state as unknown as DemoState,
+            payment,
+            eventIndex,
+          ),
+          'Legacy dispute resolution history is malformed or ambiguous.',
+          'MIGRATION_SOURCE_INVALID',
+        )
+      }
+    }
+  }
+}
+
+export function migrateDemoStateV7ToV8(value: unknown): LegacyDemoStateV8 {
   if (
     !record(value) ||
     value.schemaVersion !== 7 ||
@@ -412,12 +1383,13 @@ export function migrateDemoStateV7(value: unknown): DemoState {
   const legacy = structuredClone(value) as LegacyDemoStateV7
   const candidate = {
     ...legacy,
-    schemaVersion: SCHEMA_VERSION,
+    schemaVersion: 8 as const,
     claims: [],
-  } as DemoState
+  } as LegacyDemoStateV8
+  const candidateForRules = candidate as unknown as DemoState
   candidate.claims = legacy.claims.map((claim) => {
-    const snapshot = expectedClaimRemedySnapshot(candidate, claim)
-    const refund = linkedRefundEvidence(candidate, claim)
+    const snapshot = expectedClaimRemedySnapshot(candidateForRules, claim)
+    const refund = linkedRefundEvidence(candidateForRules, claim)
     const replacement = claim.replacementShipmentId
       ? candidate.shipments.find((shipment) =>
           shipment.id === claim.replacementShipmentId &&
@@ -485,9 +1457,42 @@ export function migrateDemoStateV7(value: unknown): DemoState {
       legacyRecordedBoxIds: [...shipment.boxIds],
     }
   })
-  normalizeMigratedFulfillment(candidate)
+  normalizeMigratedFulfillment(candidateForRules)
+  return candidate
+}
+
+export function migrateDemoStateV8(value: unknown): DemoState {
+  if (
+    !record(value) ||
+    value.schemaVersion !== 8 ||
+    !Array.isArray(value.orders) ||
+    !Array.isArray(value.payments) ||
+    !Array.isArray(value.shipments) ||
+    !Array.isArray(value.claims) ||
+    !Array.isArray(value.audits)
+  ) {
+    throw new DomainError('Stored data is not a version 8 demo state.', 'MIGRATION_SOURCE_INVALID')
+  }
+  const legacy = structuredClone(value) as LegacyDemoStateV8
+  const migrationPlan = preflightVersion8Migration(legacy)
+  const candidate = {
+    ...legacy,
+    schemaVersion: SCHEMA_VERSION,
+  } as DemoState
+  applyVersion8RmaReceiptPlans(candidate, migrationPlan.rmaReceipts)
+  applyVersion8DirectReplacementPlans(
+    candidate,
+    migrationPlan.directReplacements,
+  )
+  applyVersion8IgnoredEventPlans(candidate, migrationPlan.ignoredEvents)
+  appendVersion9MissingShipmentTransitionAudits(candidate)
+  appendVersion9MissingUnlinkedRefundAudits(candidate)
   validateDemoState(candidate)
   return candidate
+}
+
+export function migrateDemoStateV7(value: unknown): DemoState {
+  return migrateDemoStateV8(migrateDemoStateV7ToV8(value))
 }
 
 export function migrateDemoStateV6(value: unknown): DemoState {
@@ -507,6 +1512,7 @@ export class MockRepository {
   private protectedRaw?: string
   private pendingPersist = false
   private migratedFromRaw?: string
+  private migratedFromVersion?: 5 | 6 | 7 | 8
   private storageWasMissing = false
   recoveryNotice: string | null = null
 
@@ -520,6 +1526,7 @@ export class MockRepository {
     this.protectedRaw = loaded.protectedRaw
     this.pendingPersist = loaded.needsPersist
     this.migratedFromRaw = loaded.migratedFromRaw
+    this.migratedFromVersion = loaded.migratedFromVersion
     this.storageWasMissing = loaded.storageWasMissing ?? false
     if (this.pendingPersist && this.activeStorage && this.writeAuthority) {
       try {
@@ -531,6 +1538,7 @@ export class MockRepository {
         this.activeStorage = undefined
         this.pendingPersist = false
         this.migratedFromRaw = undefined
+        this.migratedFromVersion = undefined
         this.storageWasMissing = false
         this.recoveryNotice = loaded.migratedFromRaw
           ? `${loaded.notice ?? 'Demo data was upgraded in memory.'} Browser storage could not save the upgrade. ${
@@ -569,11 +1577,27 @@ export class MockRepository {
       if (isDemoState(parsed)) {
         return { state: parsed, notice: null, needsPersist: false }
       }
+      if (record(parsed) && parsed.schemaVersion === 8) {
+        try {
+          return {
+            state: migrateDemoStateV8(parsed),
+            notice: 'Demo data was upgraded safely from version 8 to version 9.',
+            needsPersist: true,
+            migratedFromRaw: raw,
+            migratedFromVersion: 8,
+          }
+        } catch {
+          return this.protectedRecovery(
+            raw,
+            'Stored version 8 demo data failed the migration safety checks.',
+          )
+        }
+      }
       if (record(parsed) && parsed.schemaVersion === 7) {
         try {
           return {
             state: migrateDemoStateV7(parsed),
-            notice: 'Demo data was upgraded safely from version 7 to version 8.',
+            notice: 'Demo data was upgraded safely from version 7 through version 8 to version 9.',
             needsPersist: true,
             migratedFromRaw: raw,
             migratedFromVersion: 7,
@@ -589,7 +1613,7 @@ export class MockRepository {
         try {
           return {
             state: migrateDemoStateV6(parsed),
-            notice: 'Demo data was upgraded safely from version 6 through version 7 to version 8.',
+            notice: 'Demo data was upgraded safely from version 6 through version 7 and version 8 to version 9.',
             needsPersist: true,
             migratedFromRaw: raw,
             migratedFromVersion: 6,
@@ -602,7 +1626,7 @@ export class MockRepository {
         try {
           return {
             state: migrateDemoStateV5(parsed),
-            notice: 'Demo data was upgraded safely from version 5 through version 6 and version 7 to version 8.',
+            notice: 'Demo data was upgraded safely from version 5 through version 6, version 7, and version 8 to version 9.',
             needsPersist: true,
             migratedFromRaw: raw,
             migratedFromVersion: 5,
@@ -728,6 +1752,7 @@ export class MockRepository {
     this.persistCandidate(this.state)
     this.pendingPersist = false
     this.migratedFromRaw = undefined
+    this.migratedFromVersion = undefined
     this.storageWasMissing = false
   }
 
@@ -753,6 +1778,7 @@ export class MockRepository {
     if (this.writeAuthority) return
     this.syncFromStorage()
     const originalMigrationRaw = this.migratedFromRaw
+    const originalMigrationVersion = this.migratedFromVersion
     try {
       this.persistPendingLoadedState()
     } catch (caught) {
@@ -761,8 +1787,8 @@ export class MockRepository {
         this.recoveryNotice =
           `Demo data was upgraded in memory, but browser storage could not save the upgrade. ${
             preserved
-              ? 'The original version 5 bytes were restored exactly.'
-              : 'The original version 5 bytes could not be verified, so this tab remains blocked.'
+              ? `The original version ${originalMigrationVersion ?? 5} bytes were restored exactly.`
+              : `The original version ${originalMigrationVersion ?? 5} bytes could not be verified, so this tab remains blocked.`
           }`
       }
       throw caught
@@ -916,6 +1942,7 @@ export class MockRepository {
     this.protectedRaw = undefined
     this.pendingPersist = false
     this.migratedFromRaw = undefined
+    this.migratedFromVersion = undefined
     this.storageWasMissing = false
     this.recoveryNotice = null
   }

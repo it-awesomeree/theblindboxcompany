@@ -25,9 +25,14 @@ import {
   validateDemoUserName,
 } from '../domain/guards'
 import {
-  shipmentClaimEligibility,
+  historicalShipmentStatusAtAudit,
+  shipmentClaimEligibilityAtAudit,
   valueFloorClaimEligibility,
 } from '../domain/claimEligibility'
+import {
+  compareAuditMoments,
+  sameInstant,
+} from '../domain/auditSequence'
 import {
   canWidenClaimEvidence,
   CLAIM_EVIDENCE_WIDENING_NOTE,
@@ -38,29 +43,53 @@ import {
   resolveOrderFulfillment,
 } from '../domain/orderFulfillment'
 import {
+  availableClaimShipmentIdsAt,
   assertFullPaymentRefundCompatible,
   assertNoRemedyScopeConflict,
+  claimHoldsRemedyEntitlementAtMoment,
   claimHoldsRemedyEntitlement,
+  claimHasPreservedLegacyUnderSettledHistory,
   expectedClaimRemedySnapshot,
   isTerminalReplacementRefundFallback,
   orderBoxSettlementAllocations,
+  matchingAcceptedProtectedPaymentEventAudit,
+  matchingAppliedUnlinkedRefundAudit,
+  matchingClaimSubmissionAudit,
+  matchingClaimWideningAuditsAt,
   terminalReplacementFallbackAmount,
 } from '../domain/remedyPolicy'
 import { isValidPrizeDefinition } from '../domain/prizeValidation'
+import {
+  acceptedDisputeResolutionShapeIsValid,
+  immediatePriorAcceptedPaymentStatus,
+} from '../domain/paymentEligibility'
+import {
+  IGNORED_PAYMENT_EVENT_ACTION,
+  LEGACY_IGNORED_EVENT_MIGRATION_ACTION,
+  matchingCurrentIgnoredPaymentEventAudit,
+  matchingLegacyIgnoredPaymentEventMigrationAudit,
+  matchingLegacyIgnoredPaymentEventSourceAudit,
+} from '../domain/paymentEventEvidence'
 import {
   claimRefundLinkedHistoryNote,
   matchingAppliedClaimRefundLinkAudit,
   matchingAppliedPaymentRefundAudit,
 } from '../domain/refundLink'
 import {
+  isGrandfatheredDirectPostDeliveryReplacement,
+  LEGACY_DIRECT_REPLACEMENT_MIGRATION_ACTION,
+  matchingLegacyDirectReplacementMigrationAudit,
+} from '../domain/migrationEvidence'
+import {
   matchingReplacementAuthorizationAudit,
   matchingReplacementDeliveryAudit,
-  matchingReplacementTransitionAudit,
+  matchingShipmentTransitionAudit,
   matchingRmaAudit,
+  matchingRmaReceivedAudit,
   RMA_CREATED_ACTION,
   RMA_INSPECTED_ACTION,
-  RMA_RECEIVED_ACTION,
 } from '../domain/remedyEvidence'
+import { lateOriginalDeliveryEligibility } from '../domain/shipmentPolicy'
 import type {
   Box,
   BoxStatus,
@@ -247,21 +276,6 @@ function everyOrderBoxRevealedAt(state: DemoState, orderId: string, at: string) 
       return Boolean(box?.revealedAt && timestamp(box.revealedAt) <= timestamp(at))
     }),
   )
-}
-
-function eligibleClaimShipmentIds(
-  state: DemoState,
-  orderId: string,
-  kind: Extract<ClaimKind, 'damage' | 'non_delivery'>,
-  at: string,
-) {
-  return state.shipments
-    .filter((shipment) =>
-      shipment.orderId === orderId &&
-      shipmentClaimEligibility(shipment, kind, at).eligible,
-    )
-    .map((shipment) => shipment.id)
-    .sort((left, right) => left.localeCompare(right))
 }
 
 function matchingLegacyTypedResolutionAudit(state: DemoState, claim: DemoState['claims'][number]) {
@@ -610,9 +624,67 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
         validIso(event.processedAt)),
       'Payment event is invalid.',
     )
-    for (const event of payment.events) {
+    for (const [eventIndex, event] of payment.events.entries()) {
       assert(timestamp(event.createdAt) >= timestamp(payment.createdAt), 'Payment event cannot precede payment creation.')
       assert(timestamp(event.processedAt) >= timestamp(event.createdAt), 'Payment processing cannot precede event creation.')
+      assert(
+        event.ignoredReason === undefined || event.refundIntent === undefined,
+        'Ignored payment events can never carry a refund intent.',
+      )
+      if (event.ignoredReason !== undefined) {
+        assert(
+          matchingCurrentIgnoredPaymentEventAudit(state, payment, event) ||
+            matchingLegacyIgnoredPaymentEventMigrationAudit(
+              state,
+              payment,
+              event,
+            ),
+          'Ignored payment events require exact immutable current or non-replayable migrated evidence.',
+        )
+      } else {
+        assert(
+          event.ignoredOutcome === undefined &&
+            event.ignoredPriorStatus === undefined &&
+            event.ignoredRelatedPaymentId === undefined &&
+            event.ignoredRoute === undefined &&
+            event.ignoredInputReason === undefined,
+          'Accepted payment events cannot carry ignored-event evidence.',
+        )
+      }
+      const priorAcceptedStatus = immediatePriorAcceptedPaymentStatus(
+        payment,
+        eventIndex,
+      )
+      if (
+        event.ignoredReason === undefined &&
+        priorAcceptedStatus === 'disputed'
+      ) {
+        assert(
+          acceptedDisputeResolutionShapeIsValid(
+            state,
+            payment,
+            eventIndex,
+          ),
+          'Accepted dispute resolution history has an invalid customer-won or merchant-won shape.',
+        )
+      }
+      if (
+        event.ignoredReason === undefined &&
+        event.source === 'admin_reconcile' &&
+        (
+          event.type === 'disputed' ||
+          priorAcceptedStatus === 'disputed'
+        )
+      ) {
+        assert(
+          matchingAcceptedProtectedPaymentEventAudit(
+            state,
+            payment,
+            event,
+          ),
+          'Accepted protected finance events require one exact immutable payment audit.',
+        )
+      }
       if (event.refundIntent !== undefined) {
         assert(record(event.refundIntent), 'Refund intent must be a structured record.')
         const hasClaimId = Object.prototype.hasOwnProperty.call(
@@ -696,12 +768,26 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
             'Linked refund event requires matching claim audit and immutable history evidence.',
           )
           refundLinkedClaimIds.push(claimId)
+        } else {
+          assert(
+            matchingAppliedUnlinkedRefundAudit(
+              state,
+              payment,
+              event,
+            ),
+            'Unlinked refund intent requires one exact generic or dispute-origin payment audit.',
+          )
         }
       }
     }
     chronological(payment.events.map((event) => event.processedAt), `Payment ${payment.id} events`)
     const recordedRefundTotal = payment.events.reduce(
-      (sum, event) => sum + (event.refundIntent?.amountSen ?? 0),
+      (sum, event) =>
+        sum + (
+          event.ignoredReason
+            ? 0
+            : (event.refundIntent?.amountSen ?? 0)
+        ),
       0,
     )
     assert(
@@ -733,6 +819,54 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
       assert(payment.refundedSen === 0, 'A non-refund payment status must have a zero refunded amount.')
     }
   }
+  const ignoredActionAudits = state.audits.filter((audit) =>
+    audit.action === IGNORED_PAYMENT_EVENT_ACTION)
+  const evidencedIgnoredActionAudits = state.payments.flatMap((payment) =>
+    payment.events.flatMap((event) => {
+      const current = matchingCurrentIgnoredPaymentEventAudit(
+        state,
+        payment,
+        event,
+      )
+      const legacy = matchingLegacyIgnoredPaymentEventSourceAudit(
+        state,
+        payment,
+        event,
+      )
+      return [
+        ...(current ? [current] : []),
+        ...(legacy ? [legacy] : []),
+      ]
+    }))
+  assert(
+    ignoredActionAudits.length === evidencedIgnoredActionAudits.length &&
+      ignoredActionAudits.every((audit) =>
+        evidencedIgnoredActionAudits.some((evidence) =>
+          evidence.id === audit.id)),
+    'Every ignored payment-event audit must bind exactly one current or migrated ignored event with no orphan audit.',
+  )
+  const legacyIgnoredMigrationAudits = state.audits.filter((audit) =>
+    audit.action === LEGACY_IGNORED_EVENT_MIGRATION_ACTION)
+  const legacyIgnoredEvents = state.payments.flatMap((payment) =>
+    payment.events.flatMap((event) =>
+      matchingLegacyIgnoredPaymentEventMigrationAudit(
+        state,
+        payment,
+        event,
+      )
+        ? [{ event, payment }]
+        : []))
+  assert(
+    legacyIgnoredMigrationAudits.length === legacyIgnoredEvents.length &&
+      legacyIgnoredMigrationAudits.every((audit) =>
+        legacyIgnoredEvents.some(({ event, payment }) =>
+          matchingLegacyIgnoredPaymentEventMigrationAudit(
+            state,
+            payment,
+            event,
+          )?.id === audit.id)),
+    'Every legacy ignored-event migration audit must bind one non-replayable ignored event with no orphan audit.',
+  )
   unique(refundLinkedClaimIds, 'Refund-linked claim')
   unique(
     state.payments.flatMap((payment) => payment.events.map((event) => event.requestId)),
@@ -916,6 +1050,58 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
             entry.actorRole === authorizationAudit.actorRole),
         'Replacement authorization requires matching immutable claim history and audit evidence.',
       )
+      const originalDelivered = original.timeline.some((entry) =>
+        entry.status === 'delivered')
+      const originalDeliveredBeforeAuthorization = original.timeline
+        .map((entry, index) => ({
+          entry,
+          audit: index > 0
+            ? matchingShipmentTransitionAudit(state, original, index)
+            : undefined,
+        }))
+        .some(({ entry, audit }) =>
+          entry.status === 'delivered' &&
+          audit &&
+          compareAuditMoments(audit, authorizationAudit!) <= 0)
+      if (originalDeliveredBeforeAuthorization) {
+        const grandfatheredDirect =
+          isGrandfatheredDirectPostDeliveryReplacement(
+            state,
+            claim,
+            original,
+            shipment,
+          )
+        assert(
+          (
+            claim.rma?.status === 'inspected' &&
+            claim.remedyState !== 'none' &&
+            original.status === 'returned' &&
+            original.timeline.some((entry) =>
+              entry.status === 'returned' &&
+              timestamp(entry.at) <= timestamp(shipment.createdAt))
+          ) ||
+            grandfatheredDirect,
+          'A post-delivery replacement authorization requires a completed RMA return and a returned original before authorization.',
+        )
+      } else if (originalDelivered) {
+        const lateDelivery = original.timeline
+          .map((entry, index) => ({
+            entry,
+            audit: index > 0
+              ? matchingShipmentTransitionAudit(state, original, index)
+              : undefined,
+          }))
+          .find(({ entry }) => entry.status === 'delivered')
+        assert(
+          lateDelivery?.audit &&
+            compareAuditMoments(
+              lateDelivery.audit,
+              authorizationAudit!,
+            ) > 0 &&
+            lateOriginalDeliveryEligibility(state, original).eligible,
+          'A late original delivery is valid only after authorization when every overlapping physical reissue is terminally lost or returned.',
+        )
+      }
       if (shipment.status === 'delivered') {
         const deliveryAudit = matchingReplacementDeliveryAudit(state, claim, shipment)
         const deliveryHistory = claim.history.at(-1)
@@ -1016,12 +1202,10 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
           `Shipment ${shipment.id} timeline has an illegal ${before} to ${after} jump.`,
         )
       }
-      if (shipment.purpose === 'replacement') {
-        assert(
-          matchingReplacementTransitionAudit(state, shipment, index),
-          'Replacement shipment progress requires matching applied transition audit evidence.',
-        )
-      }
+      assert(
+        matchingShipmentTransitionAudit(state, shipment, index),
+        'Shipment progress requires one matching applied transition audit evidence record.',
+      )
     }
     const firstNonDelivery = shipment.timeline.findIndex((entry) =>
       ['failed', 'failed_delivery', 'lost', 'returned'].includes(entry.status))
@@ -1058,6 +1242,14 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
   }
 
   unique(state.claims.map((claim) => claim.requestId), 'Claim request')
+  const wideningActionAudits = state.audits.filter((audit) =>
+    audit.action === 'claim.order_level_evidence_widened')
+  assert(
+    wideningActionAudits.every((audit) =>
+      audit.targetType === 'claim' &&
+      state.claims.some((claim) => claim.id === audit.targetId)),
+    'Every widening action audit must target one existing claim.',
+  )
   const claimLinkedRefundEventIds: string[] = []
   const refundResolutionReferences: string[] = []
   for (const claim of state.claims) {
@@ -1080,8 +1272,22 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
       !(claim.legacyTypedResolution && claim.legacyUnderSettledRefund),
       'A claim cannot use two different legacy outcome markers.',
     )
+    assert(
+      claim.legacyDirectPostDeliveryReplacement === undefined ||
+        (
+          record(claim.legacyDirectPostDeliveryReplacement) &&
+          claim.legacyTypedResolution === undefined &&
+          claim.legacyUnderSettledRefund === undefined
+        ),
+      'Legacy direct post-delivery replacement evidence is invalid or conflicts with another legacy marker.',
+    )
     const order = state.orders.find((entry) => entry.id === claim.orderId)
     assert(order?.userId === claim.userId && order.claimIds.includes(claim.id), 'Claim order reference is invalid.')
+    const submissionAudit = matchingClaimSubmissionAudit(state, claim)
+    assert(
+      submissionAudit,
+      'Claim submission requires one exact customer audit at its immutable evidence boundary.',
+    )
     assert(Array.isArray(claim.remedyBoxIds), 'Claim remedy box scope must be a collection.')
     unique(claim.remedyBoxIds, `Claim ${claim.id} remedy box`)
     const expectedRemedy = expectedClaimRemedySnapshot(state, claim)
@@ -1134,9 +1340,11 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
       assert(
         rmaOriginal &&
           rmaOriginal.kind !== 'DIGITAL' &&
-          rmaOriginal.timeline.some((entry) =>
-            entry.status === 'delivered' &&
-            timestamp(entry.at) <= timestamp(claim.createdAt)),
+          historicalShipmentStatusAtAudit(
+            state,
+            rmaOriginal,
+            submissionAudit,
+          ) === 'delivered',
         'RMA evidence requires a physical original delivered by claim creation.',
       )
       assert(
@@ -1190,26 +1398,41 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
             timestamp(claim.rma.receivedAt!) <= timestamp(claim.updatedAt),
           'RMA receipt evidence or chronology is invalid.',
         )
-        const receivedAudit = matchingRmaAudit(
+        const receivedAudit = matchingRmaReceivedAudit(
           state,
           claim,
-          RMA_RECEIVED_ACTION,
-          claim.rma.receivedAt!,
-          claim.rma.receivedReason!,
-          'rma_created',
-          'created',
-          'rma_received',
-          'received',
+          rmaOriginal,
         )
+        const originalStatusBeforeReceipt = record(receivedAudit?.before)
+          ? receivedAudit.before.originalShipmentStatus
+          : undefined
+        const returnedBeforeOrAtReceipt = rmaOriginal.timeline.some((entry) =>
+          entry.status === 'returned' &&
+          timestamp(entry.at) <= timestamp(claim.rma!.receivedAt!))
+        const atomicReceiptReturn = rmaOriginal.timeline.some((entry, index) =>
+          index > 0 &&
+          entry.status === 'returned' &&
+          entry.at === claim.rma!.receivedAt &&
+          entry.label === claim.rma!.receivedReason &&
+          rmaOriginal.timeline[index - 1].status === 'delivered')
         assert(
           receivedAudit &&
+            rmaOriginal.status === 'returned' &&
+            returnedBeforeOrAtReceipt &&
+            (
+              originalStatusBeforeReceipt === 'returned' ||
+              (
+                originalStatusBeforeReceipt === 'delivered' &&
+                atomicReceiptReturn
+              )
+            ) &&
             claim.history.some((entry) =>
               entry.status === 'approved' &&
               entry.at === claim.rma!.receivedAt &&
               entry.note === claim.rma!.receivedReason &&
               entry.actorId === receivedAudit.actorId &&
               entry.actorRole === receivedAudit.actorRole),
-          'RMA receipt requires matching immutable same-status history and audit evidence.',
+          'RMA receipt requires a returned linked original plus matching immutable timeline, history, and audit evidence.',
         )
         if (claim.rma.status === 'received') {
           assert(
@@ -1276,7 +1499,15 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
       const eventIndex = payment.events.findIndex((entry) => entry.id === event.id)
       const priorRefundedSen = payment.events
         .slice(0, eventIndex)
-        .reduce((sum, prior) => sum + (prior.refundIntent?.amountSen ?? 0), 0)
+        .reduce(
+          (sum, prior) =>
+            sum + (
+              prior.ignoredReason
+                ? 0
+                : (prior.refundIntent?.amountSen ?? 0)
+            ),
+          0,
+        )
       assert(
         payment.orderId === claim.orderId &&
           payment.userId === claim.userId &&
@@ -1304,6 +1535,10 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
             replacement === undefined &&
             claim.acceptedSettlementSen < claim.requiredSettlementSen,
           'Legacy under-settled refund evidence must remain explicitly marked, strictly under-settled, and non-replacement.',
+        )
+        assert(
+          claimHasPreservedLegacyUnderSettledHistory(state, claim),
+          'Legacy under-settled history must preserve its exact linked refund and final resolution audits.',
         )
       } else if (claim.settlementPolicy === 'exact_scope') {
         assert(
@@ -1361,10 +1596,35 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
     const hasBoxLink = claim.boxId !== undefined
     const hasExactShipmentLink = claim.shipmentId !== undefined
     const hasOrderLevelCandidates = claim.shipmentCandidateIds !== undefined
+    const claimWideningActionAudits = wideningActionAudits
+      .filter((audit) => audit.targetId === claim.id)
+      .sort(compareAuditMoments)
+    const canonicalWideningAudits = claimWideningActionAudits
+      .filter((audit) =>
+        audit.outcome === 'applied' &&
+        audit.actorId === claim.userId &&
+        audit.actorRole === 'customer' &&
+        audit.targetType === 'claim' &&
+        audit.reason === CLAIM_EVIDENCE_WIDENING_NOTE)
+    assert(
+      canonicalWideningAudits.length === claimWideningActionAudits.length,
+      'Every widening action audit must have the canonical customer actor, target, outcome, and reason.',
+    )
+    const wideningHistoryRows = claim.history
+      .map((entry, index) => ({ entry, index }))
+      .filter(({ entry }) =>
+        entry.note === CLAIM_EVIDENCE_WIDENING_NOTE)
     assert(
       Number(hasBoxLink) + Number(hasExactShipmentLink) + Number(hasOrderLevelCandidates) === 1,
       'Claim evidence must use exactly one box, exact shipment, or order-level candidate set.',
     )
+    if (!hasOrderLevelCandidates) {
+      assert(
+        canonicalWideningAudits.length === 0 &&
+          wideningHistoryRows.length === 0,
+        'Only an order-level claim can retain widening audits or history rows.',
+      )
+    }
     if (claim.kind === 'value_floor') {
       assert(hasBoxLink && !hasExactShipmentLink && !hasOrderLevelCandidates, 'Value-floor claim link is invalid.')
       assert(
@@ -1376,6 +1636,18 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
       assert(
         valueFloorClaimEligibility(box, claim.createdAt).eligible,
         'Value-floor claim requires an assigned box revealed by claim creation.',
+      )
+      assert(
+        !state.claims.some((holder) =>
+          holder.id !== claim.id &&
+          holder.orderId === claim.orderId &&
+          holder.remedyBoxIds.includes(box.id) &&
+          claimHoldsRemedyEntitlementAtMoment(
+            state,
+            holder,
+            submissionAudit,
+          )),
+        'Value-floor claim evidence was already consumed before claim creation.',
       )
     } else if (hasExactShipmentLink) {
       assert(!hasBoxLink && !hasOrderLevelCandidates, 'Exact shipment claim link is invalid.')
@@ -1393,10 +1665,25 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
         entry.purpose === 'original')
       assert(shipment, 'Claim shipment reference is invalid.')
       assert(
-        shipmentClaimEligibility(shipment, claim.kind, claim.createdAt).eligible,
+        shipmentClaimEligibilityAtAudit(
+          state,
+          shipment,
+          claim.kind,
+          submissionAudit,
+        ).eligible,
         claim.kind === 'damage'
           ? 'Damage claim requires physical delivery by claim creation.'
           : 'Non-delivery claim requires eligible evidence at claim creation.',
+      )
+      assert(
+        availableClaimShipmentIdsAt(
+          state,
+          claim.orderId,
+          claim.kind,
+          submissionAudit,
+          claim.id,
+        ).includes(shipment.id),
+        'Exact shipment claim evidence was already consumed before claim creation.',
       )
     } else {
       const deliveryKind = claim.kind as Extract<ClaimKind, 'damage' | 'non_delivery'>
@@ -1411,20 +1698,44 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
       assert(claim.shipmentCandidateIds.length > 0, 'Order-level shipment candidates cannot be empty.')
       unique(claim.shipmentCandidateIds, `Claim ${claim.id} shipment candidate`)
       const canonicalCandidates = [...claim.shipmentCandidateIds].sort((left, right) => left.localeCompare(right))
+      const priorNeutralClaimIds = state.claims
+        .filter((candidate) =>
+          candidate.id !== claim.id &&
+          candidate.orderId === claim.orderId &&
+          candidate.kind === claim.kind &&
+          candidate.shipmentCandidateIds !== undefined)
+        .filter((candidate) => {
+          const candidateSubmission = matchingClaimSubmissionAudit(
+            state,
+            candidate,
+          )
+          return Boolean(
+            candidateSubmission &&
+            compareAuditMoments(candidateSubmission, submissionAudit) < 0,
+          )
+        })
+        .map((candidate) => candidate.id)
       assert(
         JSON.stringify(claim.shipmentCandidateIds) === JSON.stringify(canonicalCandidates),
         'Order-level shipment candidates must use canonical order.',
       )
       if (claim.shipmentCandidateEvidenceAt === undefined) {
         assert(
+          canonicalWideningAudits.length === 0 &&
+            wideningHistoryRows.length === 0,
+          'Order-level evidence without widening snapshots cannot retain widening audits or history rows.',
+        )
+        assert(
           JSON.stringify(claim.shipmentCandidateIds) ===
-            JSON.stringify(eligibleClaimShipmentIds(
+            JSON.stringify(availableClaimShipmentIdsAt(
               state,
               claim.orderId,
               deliveryKind,
-              claim.createdAt,
+              submissionAudit,
+              claim.id,
+              priorNeutralClaimIds,
             )),
-          'Order-level shipment candidates must canonically include every eligible physical shipment.',
+          'Order-level shipment candidates must canonically include every available eligible original shipment.',
         )
       } else {
         assert(
@@ -1437,7 +1748,8 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
           JSON.stringify(evidenceKeys) === JSON.stringify(canonicalCandidates),
           'Order-level shipment candidate evidence must exactly match its candidates.',
         )
-        const evidenceTimes = [...new Set(canonicalCandidates.map((shipmentId) => {
+        const candidateBoundaries = new Map<string, DemoState['audits'][number]>()
+        for (const shipmentId of canonicalCandidates) {
           const evidenceAt = claim.shipmentCandidateEvidenceAt![shipmentId]
           assert(validIso(evidenceAt), 'Order-level shipment candidate evidence time is invalid.')
           assert(
@@ -1445,78 +1757,132 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
               timestamp(evidenceAt) <= timestamp(claim.updatedAt),
             'Order-level shipment candidate evidence time is outside the claim history.',
           )
-          const shipment = state.shipments.find((entry) =>
-            entry.id === shipmentId && entry.orderId === claim.orderId)
+          const submissionCandidateIds =
+            record(submissionAudit.after) &&
+            Array.isArray(submissionAudit.after.shipmentCandidateIds)
+              ? submissionAudit.after.shipmentCandidateIds
+              : []
+          const boundary = submissionCandidateIds.includes(shipmentId)
+            ? submissionAudit
+            : (() => {
+                const matches = matchingClaimWideningAuditsAt(
+                  state,
+                  claim,
+                  evidenceAt,
+                ).filter((audit) =>
+                  record(audit.before) &&
+                  record(audit.after) &&
+                  Array.isArray(audit.before.shipmentCandidateIds) &&
+                  Array.isArray(audit.after.shipmentCandidateIds) &&
+                  !audit.before.shipmentCandidateIds.includes(shipmentId) &&
+                  audit.after.shipmentCandidateIds.includes(shipmentId) &&
+                  record(audit.after.shipmentCandidateEvidenceAt) &&
+                  sameInstant(
+                    String(audit.after.shipmentCandidateEvidenceAt[shipmentId]),
+                    evidenceAt,
+                  ))
+                assert(
+                  matches.length === 1,
+                  'Each widened candidate requires one exact customer audit boundary.',
+                )
+                return matches[0]
+              })()
+          candidateBoundaries.set(shipmentId, boundary)
           assert(
-            shipment && shipmentClaimEligibility(shipment, deliveryKind, evidenceAt).eligible,
-            'Every order-level shipment candidate must belong to the order and be eligible at its evidence time.',
+            availableClaimShipmentIdsAt(
+              state,
+              claim.orderId,
+              deliveryKind,
+              boundary,
+              claim.id,
+              priorNeutralClaimIds,
+            ).includes(shipmentId),
+            'Every order-level shipment candidate must belong to the order, be eligible, and remain unconsumed at its evidence time.',
           )
-          return evidenceAt
-        }))].sort((left, right) => left.localeCompare(right))
+        }
         const initialCandidates = canonicalCandidates.filter((shipmentId) =>
-          claim.shipmentCandidateEvidenceAt![shipmentId] === claim.createdAt)
+          candidateBoundaries.get(shipmentId)?.id === submissionAudit.id)
         assert(
           initialCandidates.length > 0 &&
             JSON.stringify(initialCandidates) ===
-              JSON.stringify(eligibleClaimShipmentIds(
+              JSON.stringify(availableClaimShipmentIdsAt(
                 state,
                 claim.orderId,
                 deliveryKind,
-                claim.createdAt,
+                submissionAudit,
+                claim.id,
+                priorNeutralClaimIds,
               )),
           'Mapped order-level evidence must preserve the exact nonempty candidate set from claim creation.',
         )
-        const accumulatedCandidates = new Set<string>()
-        for (const evidenceAt of evidenceTimes) {
-          eligibleClaimShipmentIds(state, claim.orderId, deliveryKind, evidenceAt)
-            .forEach((shipmentId) => accumulatedCandidates.add(shipmentId))
-          if (evidenceAt === claim.createdAt) continue
-          const beforeCandidateIds = canonicalCandidates.filter((shipmentId) =>
-            timestamp(claim.shipmentCandidateEvidenceAt![shipmentId]) < timestamp(evidenceAt))
-          const afterCandidateIds = canonicalCandidates.filter((shipmentId) =>
-            timestamp(claim.shipmentCandidateEvidenceAt![shipmentId]) <= timestamp(evidenceAt))
-          const widenedAt = state.audits.some((audit) => {
-            const before = audit.before
-            const after = audit.after
-            if (
-              audit.action !== 'claim.order_level_evidence_widened' ||
-              audit.targetType !== 'claim' ||
-              audit.targetId !== claim.id ||
-              audit.actorId !== claim.userId ||
-              audit.actorRole !== 'customer' ||
-              audit.at !== evidenceAt ||
-              audit.reason !== CLAIM_EVIDENCE_WIDENING_NOTE ||
-              !record(before) ||
-              !record(after) ||
-              !Array.isArray(before.shipmentCandidateIds) ||
-              !Array.isArray(after.shipmentCandidateIds)
-            ) return false
-            return (
-              JSON.stringify(before.shipmentCandidateIds) ===
-                JSON.stringify(beforeCandidateIds) &&
-              JSON.stringify(after.shipmentCandidateIds) ===
-                JSON.stringify(afterCandidateIds)
-            )
-          })
+        let accumulatedCandidates = [...initialCandidates]
+        const wideningAudits = [...new Map(
+          [...candidateBoundaries.values()]
+            .filter((audit) => audit.id !== submissionAudit.id)
+            .map((audit) => [audit.id, audit]),
+        ).values()].sort(compareAuditMoments)
+        assert(
+          JSON.stringify(canonicalWideningAudits.map((audit) => audit.id)) ===
+            JSON.stringify(wideningAudits.map((audit) => audit.id)) &&
+            wideningHistoryRows.length === wideningAudits.length,
+          'Canonical widening audits and unchanged-status customer history rows must form one exact pair per candidate boundary.',
+        )
+        for (const [index, audit] of wideningAudits.entries()) {
+          const history = wideningHistoryRows[index]
           assert(
-            widenedAt,
-            'Widened order-level shipment candidate evidence requires a matching customer audit.',
-          )
-          const wideningHistoryIndex = claim.history.findIndex((entry, index) =>
-            index > 0 &&
-            entry.at === evidenceAt &&
-            entry.actorId === claim.userId &&
-            entry.actorRole === 'customer' &&
-            entry.note === CLAIM_EVIDENCE_WIDENING_NOTE &&
-            canWidenClaimEvidence(entry.status) &&
-            claim.history[index - 1].status === entry.status)
-          assert(
-            wideningHistoryIndex > 0,
-            'Widened order-level shipment candidate evidence requires matching unchanged-status customer history.',
+            history &&
+              history.index > 0 &&
+              history.entry.actorId === audit.actorId &&
+              history.entry.actorRole === audit.actorRole &&
+              sameInstant(history.entry.at, audit.at) &&
+              canWidenClaimEvidence(history.entry.status) &&
+              claim.history[history.index - 1].status ===
+                history.entry.status,
+            'Each widening audit requires one distinct same-actor, same-time unchanged-status customer history row.',
           )
         }
+        for (const audit of wideningAudits) {
+          const before = audit.before
+          const after = audit.after
+          assert(
+            record(before) &&
+              record(after) &&
+              Array.isArray(before.shipmentCandidateIds) &&
+              Array.isArray(after.shipmentCandidateIds),
+            'Widened order-level evidence audit must contain structured before and after candidate sets.',
+          )
+          const availableAtBoundary = availableClaimShipmentIdsAt(
+            state,
+            claim.orderId,
+            deliveryKind,
+            audit,
+            claim.id,
+            priorNeutralClaimIds,
+          )
+          const expectedAfter = [...new Set([
+            ...accumulatedCandidates,
+            ...availableAtBoundary,
+          ])].sort((left, right) => left.localeCompare(right))
+          const expectedEvidenceAt = Object.fromEntries(expectedAfter.map(
+            (shipmentId) => [
+              shipmentId,
+              claim.shipmentCandidateEvidenceAt![shipmentId],
+            ],
+          ))
+          assert(
+            JSON.stringify(before.shipmentCandidateIds) ===
+              JSON.stringify(accumulatedCandidates) &&
+              JSON.stringify(after) === JSON.stringify({
+                refundCreated: false,
+                shipmentCandidateEvidenceAt: expectedEvidenceAt,
+                shipmentCandidateIds: expectedAfter,
+              }),
+            'Widened evidence audit must exactly add every newly available candidate at its audit sequence.',
+          )
+          accumulatedCandidates = expectedAfter
+        }
         assert(
-          JSON.stringify([...accumulatedCandidates].sort((left, right) => left.localeCompare(right))) ===
+          JSON.stringify(accumulatedCandidates) ===
             JSON.stringify(canonicalCandidates),
           'Order-level shipment candidates must preserve the canonical union of eligible evidence snapshots.',
         )
@@ -1552,6 +1918,22 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
         !claim.rma || claim.rma.status === 'inspected',
         'A selected RMA path must be inspected before replacement authorization.',
       )
+      if (claim.legacyDirectPostDeliveryReplacement !== undefined) {
+        const original = state.shipments.find((shipment) =>
+          shipment.id === replacements[0].replacementForShipmentId &&
+          shipment.purpose === 'original')
+        assert(
+          original &&
+            claim.rma === undefined &&
+            matchingLegacyDirectReplacementMigrationAudit(
+              state,
+              claim,
+              original,
+              replacements[0],
+            ),
+          'Legacy direct post-delivery replacement marker requires its exact immutable migration evidence.',
+        )
+      }
       if (['refund_linked', 'refund_completed'].includes(claim.remedyState)) {
         assert(
           claim.linkedRefundEventId !== undefined &&
@@ -1571,6 +1953,7 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
     } else {
       assert(
         claim.replacementAuthorization === undefined &&
+          claim.legacyDirectPostDeliveryReplacement === undefined &&
           !['replacement_authorized', 'replacement_delivered'].includes(claim.remedyState),
         'Replacement remedy state and authorization require the exact reverse shipment link.',
       )
@@ -1706,8 +2089,8 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
     }
   }
   for (const claim of state.claims) {
-    if (claimHoldsRemedyEntitlement(claim)) {
-      assertNoRemedyScopeConflict(state.claims, claim)
+    if (claimHoldsRemedyEntitlement(state, claim)) {
+      assertNoRemedyScopeConflict(state, claim)
     }
   }
   unique(
@@ -1716,16 +2099,40 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
   )
   unique(claimLinkedRefundEventIds, 'Claim-linked refund event')
   unique(refundResolutionReferences, 'Refund resolution reference')
+  const directMigrationAudits = state.audits.filter((audit) =>
+    audit.action === LEGACY_DIRECT_REPLACEMENT_MIGRATION_ACTION)
+  const markedDirectClaims = state.claims.filter((claim) =>
+    claim.legacyDirectPostDeliveryReplacement !== undefined)
+  assert(
+    directMigrationAudits.length === markedDirectClaims.length &&
+      directMigrationAudits.every((audit) =>
+        markedDirectClaims.some((claim) => {
+          const replacement = state.shipments.find((shipment) =>
+            shipment.id === claim.replacementShipmentId &&
+            shipment.purpose === 'replacement')
+          const original = replacement
+            ? state.shipments.find((shipment) =>
+                shipment.id === replacement.replacementForShipmentId &&
+                shipment.purpose === 'original')
+            : undefined
+          return Boolean(
+            original &&
+              replacement &&
+              matchingLegacyDirectReplacementMigrationAudit(
+                state,
+                claim,
+                original,
+                replacement,
+              )?.id === audit.id,
+          )
+        })),
+    'Every legacy direct replacement migration audit must bind one marked claim and no orphan marker or audit may remain.',
+  )
   const openClaims = state.claims.filter((claim) => isOpenClaimStatus(claim.status))
   unique(
-    openClaims.map((claim) => {
-      const scope = claim.kind === 'value_floor'
-        ? `box:${claim.boxId}`
-        : claim.shipmentCandidateIds
-          ? 'order-level'
-          : `shipment:${claim.shipmentId}`
-      return `${claim.orderId}:${claim.kind}:${scope}`
-    }),
+    openClaims
+      .filter((claim) => claim.kind === 'value_floor')
+      .map((claim) => `${claim.orderId}:${claim.kind}:box:${claim.boxId}`),
     'Open claim',
   )
   for (let leftIndex = 0; leftIndex < openClaims.length; leftIndex += 1) {

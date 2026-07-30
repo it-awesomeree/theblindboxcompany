@@ -6,6 +6,8 @@ import type {
   Shipment,
   ShipmentStatus,
 } from './types'
+import { sameInstant } from './auditSequence'
+import { makeId } from './guards'
 
 export const RMA_CREATED_ACTION = 'claim.rma_created'
 export const RMA_RECEIVED_ACTION = 'claim.rma_received'
@@ -41,17 +43,18 @@ function matchingClaimAudit(
   after: Record<string, unknown>,
   roles: string[],
 ) {
-  return state.audits.find((audit) =>
+  const matches = state.audits.filter((audit) =>
     audit.outcome === 'applied' &&
     roles.includes(audit.actorRole) &&
     audit.action === action &&
     audit.targetType === 'claim' &&
     audit.targetId === claim.id &&
     audit.reason === reason &&
-    audit.at === at &&
+    sameInstant(audit.at, at) &&
     exactRecord(audit.before, before) &&
     exactRecord(audit.after, after),
   )
+  return matches.length === 1 ? matches[0] : undefined
 }
 
 export function matchingRmaAudit(
@@ -79,6 +82,49 @@ export function matchingRmaAudit(
     },
     ['support', 'admin', 'super_admin'],
   )
+}
+
+export function matchingRmaReceivedAudit(
+  state: DemoState,
+  claim: Claim,
+  original: Shipment,
+) {
+  const receivedAt = claim.rma?.receivedAt
+  const receivedReason = claim.rma?.receivedReason
+  if (!receivedAt || !receivedReason) return undefined
+  const matches = state.audits.filter((audit) => {
+    if (
+      audit.outcome !== 'applied' ||
+      !['support', 'admin', 'super_admin'].includes(audit.actorRole) ||
+      audit.action !== RMA_RECEIVED_ACTION ||
+      audit.targetType !== 'claim' ||
+      audit.targetId !== claim.id ||
+      audit.reason !== receivedReason ||
+      !sameInstant(audit.at, receivedAt) ||
+      !record(audit.before)
+    ) {
+      return false
+    }
+    const originalShipmentStatus = audit.before.originalShipmentStatus
+    return (
+      (originalShipmentStatus === 'delivered' ||
+        originalShipmentStatus === 'returned') &&
+      exactRecord(audit.before, {
+        originalShipmentId: original.id,
+        originalShipmentStatus,
+        remedyState: 'rma_created',
+        rmaStatus: 'created',
+      }) &&
+      exactRecord(audit.after, {
+        originalShipmentId: original.id,
+        originalShipmentStatus: 'returned',
+        remedyState: 'rma_received',
+        rmaReference: claim.rma?.reference,
+        rmaStatus: 'received',
+      })
+    )
+  })
+  return matches.length === 1 ? matches[0] : undefined
 }
 
 export function matchingReplacementAuthorizationAudit(
@@ -136,7 +182,94 @@ export function matchingReplacementDeliveryAudit(
   )
 }
 
-export function matchingReplacementTransitionAudit(
+function matchingFinancialStopShipmentIds(
+  state: DemoState,
+  audit: AuditEntry,
+  financialHold: NonNullable<Shipment['timeline'][number]['financialHold']>,
+  label: string,
+  at: string,
+) {
+  if (
+    !record(audit.before) ||
+    !Array.isArray(audit.before.shipments)
+  ) {
+    return []
+  }
+  const beforeShipments = audit.before.shipments
+  return state.shipments
+    .filter((candidate) => {
+      if (candidate.orderId !== audit.targetId) return false
+      const beforeShipment = beforeShipments.find((value) =>
+        record(value) && value.id === candidate.id)
+      if (!record(beforeShipment) || typeof beforeShipment.status !== 'string') {
+        return false
+      }
+      return candidate.timeline.some((candidateEntry, candidateIndex) =>
+        candidateIndex > 0 &&
+        candidateEntry.id === makeId(
+          'stl',
+          `${candidate.id}:financial-stop:${audit.requestId}`,
+        ) &&
+        candidateEntry.status === 'cancelled' &&
+        candidateEntry.financialHold === financialHold &&
+        candidateEntry.label === label &&
+        sameInstant(candidateEntry.at, at) &&
+        candidate.timeline[candidateIndex - 1]?.status === beforeShipment.status)
+    })
+    .map((candidate) => candidate.id)
+    .sort((left, right) => left.localeCompare(right))
+}
+
+function matchingDisputeResumeShipmentIds(
+  state: DemoState,
+  audit: AuditEntry,
+  label: string,
+  at: string,
+) {
+  return state.shipments
+    .filter((candidate) =>
+      candidate.orderId === audit.targetId &&
+      candidate.timeline.some((candidateEntry, candidateIndex) =>
+        candidateIndex > 0 &&
+        candidateEntry.id === makeId(
+          'stl',
+          `${candidate.id}:dispute-resolved:${audit.requestId}`,
+        ) &&
+        candidateEntry.status === 'unfulfilled' &&
+        candidateEntry.label === label &&
+        sameInstant(candidateEntry.at, at) &&
+        candidate.timeline[candidateIndex - 1]?.status === 'cancelled' &&
+        candidate.timeline[candidateIndex - 1]?.financialHold === 'disputed'))
+    .map((candidate) => candidate.id)
+    .sort((left, right) => left.localeCompare(right))
+}
+
+function matchingTransitionOccurrenceAudit(
+  shipment: Shipment,
+  index: number,
+  matches: AuditEntry[],
+  sameOccurrence: (
+    entry: Shipment['timeline'][number],
+    previous: Shipment['timeline'][number],
+  ) => boolean,
+) {
+  const occurrenceIndexes = shipment.timeline.flatMap((candidate, candidateIndex) =>
+    candidateIndex > 0 &&
+    sameOccurrence(candidate, shipment.timeline[candidateIndex - 1])
+      ? [candidateIndex]
+      : [])
+  const ordinal = occurrenceIndexes.indexOf(index)
+  const orderedMatches = [...matches].sort((left, right) =>
+    left.sequence - right.sequence)
+  return (
+    ordinal >= 0 &&
+    orderedMatches.length === occurrenceIndexes.length
+  )
+    ? orderedMatches[ordinal]
+    : undefined
+}
+
+export function matchingShipmentTransitionAudit(
   state: DemoState,
   shipment: Shipment,
   index: number,
@@ -145,14 +278,18 @@ export function matchingReplacementTransitionAudit(
   const previous = shipment.timeline[index - 1]
   if (!entry || !previous) return undefined
   if (entry.status === 'cancelled' && entry.financialHold) {
-    return state.audits.find((audit) =>
+    const matches = state.audits.filter((audit) =>
       audit.outcome === 'applied' &&
       ['finance', 'admin', 'super_admin'].includes(audit.actorRole) &&
       audit.action === `order.financial_hold_${entry.financialHold}` &&
       audit.targetType === 'order' &&
       audit.targetId === shipment.orderId &&
       audit.reason === entry.label &&
-      audit.at === entry.at &&
+      sameInstant(audit.at, entry.at) &&
+      entry.id === makeId(
+        'stl',
+        `${shipment.id}:financial-stop:${audit.requestId}`,
+      ) &&
       record(audit.before) &&
       Array.isArray(audit.before.shipments) &&
       audit.before.shipments.some((value) =>
@@ -161,36 +298,73 @@ export function matchingReplacementTransitionAudit(
         value.status === previous.status) &&
       record(audit.after) &&
       Array.isArray(audit.after.stoppedShipmentIds) &&
-      audit.after.stoppedShipmentIds.includes(shipment.id),
+      JSON.stringify(audit.after.stoppedShipmentIds) ===
+        JSON.stringify(matchingFinancialStopShipmentIds(
+          state,
+          audit,
+          entry.financialHold!,
+          entry.label,
+          entry.at,
+        )),
     )
+    return matches.length === 1 ? matches[0] : undefined
   }
   if (
     previous.status === 'cancelled' &&
     previous.financialHold === 'disputed' &&
     entry.status === 'unfulfilled'
   ) {
-    return state.audits.find((audit) =>
+    const matches = state.audits.filter((audit) =>
       audit.outcome === 'applied' &&
       ['finance', 'admin', 'super_admin'].includes(audit.actorRole) &&
       audit.action === 'order.dispute_resolved' &&
       audit.targetType === 'order' &&
       audit.targetId === shipment.orderId &&
       audit.reason === entry.label &&
-      audit.at === entry.at &&
+      sameInstant(audit.at, entry.at) &&
+      entry.id === makeId(
+        'stl',
+        `${shipment.id}:dispute-resolved:${audit.requestId}`,
+      ) &&
       exactRecord(audit.before, { status: 'disputed' }) &&
       record(audit.after) &&
       typeof audit.after.status === 'string' &&
-      exactRecord(audit.after, { status: audit.after.status }),
+      Array.isArray(audit.after.resumedShipmentIds) &&
+      exactRecord(audit.after, {
+        resumedShipmentIds: matchingDisputeResumeShipmentIds(
+          state,
+          audit,
+          entry.label,
+          entry.at,
+        ),
+        status: audit.after.status,
+      }),
     )
+    return matches.length === 1 ? matches[0] : undefined
   }
-  return state.audits.find((audit) =>
+  if (
+    shipment.purpose === 'original' &&
+    previous.status === 'delivered' &&
+    entry.status === 'returned'
+  ) {
+    const matches = state.claims
+      .map((claim) => matchingRmaReceivedAudit(state, claim, shipment))
+      .filter((audit): audit is AuditEntry =>
+        Boolean(
+          audit &&
+          audit.reason === entry.label &&
+          sameInstant(audit.at, entry.at),
+        ))
+    if (matches.length === 1) return matches[0]
+  }
+  const matches = state.audits.filter((audit) =>
     audit.outcome === 'applied' &&
     ['fulfilment', 'admin', 'super_admin'].includes(audit.actorRole) &&
     audit.action === 'shipment.transitioned' &&
     audit.targetType === 'shipment' &&
     audit.targetId === shipment.id &&
     audit.reason === entry.label &&
-    audit.at === entry.at &&
+    sameInstant(audit.at, entry.at) &&
     exactRecord(audit.before, { status: previous.status }) &&
     record(audit.after) &&
     typeof audit.after.orderStatus === 'string' &&
@@ -211,6 +385,24 @@ export function matchingReplacementTransitionAudit(
       status: entry.status,
     }),
   )
+  return matchingTransitionOccurrenceAudit(
+    shipment,
+    index,
+    matches,
+    (candidate, candidatePrevious) =>
+      candidate.status === entry.status &&
+      candidate.label === entry.label &&
+      sameInstant(candidate.at, entry.at) &&
+      candidatePrevious.status === previous.status,
+  )
+}
+
+export function matchingReplacementTransitionAudit(
+  state: DemoState,
+  shipment: Shipment,
+  index: number,
+) {
+  return matchingShipmentTransitionAudit(state, shipment, index)
 }
 
 export function replacementTerminalStatus(status: ShipmentStatus) {

@@ -10,19 +10,30 @@ import {
 } from '../domain/guards'
 import {
   ACTIVE_PAYMENT_STATUSES,
+  immediatePriorAcceptedPaymentStatus,
   paymentAttemptCreationEligibility,
   paymentRetryEligibility,
   paymentWasCaptured,
 } from '../domain/paymentEligibility'
 import {
+  ignoredPaymentEventMessage,
+  ignoredPaymentEventRequestId,
+  matchingCurrentIgnoredPaymentEventAudit,
+} from '../domain/paymentEventEvidence'
+import {
   CLAIM_REFUND_LINK_ACTION,
   claimRefundLinkedHistoryNote,
+  matchingAppliedClaimRefundLinkAudit,
+  matchingAppliedPaymentRefundAudit,
 } from '../domain/refundLink'
 import { refreshOrderFulfillment } from '../domain/orderFulfillment'
 import {
   assertFullPaymentRefundCompatible,
   assertNoRemedyScopeConflict,
   isTerminalReplacementRefundFallback,
+  matchingAcceptedProtectedPaymentEventAudit,
+  matchingAppliedUnlinkedRefundAudit,
+  preservedCompletedClaimIdsForUnlinkedRefund,
   remainingPaymentBalance,
   terminalReplacementFallbackAmount,
 } from '../domain/remedyPolicy'
@@ -34,7 +45,9 @@ import type {
   Payment,
   PaymentEvent,
   PaymentMethod,
+  PaymentEventRoute,
   PaymentStatus,
+  IgnoredPaymentEventOutcome,
   Role,
 } from '../domain/types'
 import type { MockRepository } from '../data/MockRepository'
@@ -47,8 +60,17 @@ import { FinancialSafetyService } from './FinancialSafetyService'
 export type MockPaymentAction = 'approve' | 'decline' | 'cancel' | 'expire' | 'delayed'
 
 class DuplicatePaymentEvent extends Error {
-  constructor(readonly payment: Payment) {
+  constructor(
+    readonly payment: Payment,
+    readonly message: string,
+  ) {
     super('Duplicate payment event')
+  }
+}
+
+class DuplicateRefundRequest extends Error {
+  constructor(readonly payment: Payment) {
+    super('Duplicate refund request')
   }
 }
 
@@ -61,16 +83,168 @@ function storedPaymentEvent(state: DemoState, eventId: string) {
 }
 
 function assertExactEventReplay(
+  state: DemoState,
   stored: { payment: Payment; event: PaymentEvent },
   paymentId: string,
   next: PaymentStatus,
   source: 'mock_webhook' | 'admin_reconcile',
+  reason: string,
+  route: PaymentEventRoute,
+  requiredPriorStatus?: PaymentStatus,
 ) {
+  const eventIndex = stored.payment.events.findIndex((event) =>
+    event.id === stored.event.id)
+  const priorAcceptedStatus = immediatePriorAcceptedPaymentStatus(
+    stored.payment,
+    eventIndex,
+  )
+  if (stored.event.ignoredReason !== undefined) {
+    const audit = matchingCurrentIgnoredPaymentEventAudit(
+      state,
+      stored.payment,
+      stored.event,
+    )
+    assert(
+      stored.payment.id === paymentId &&
+        stored.event.type === next &&
+        stored.event.source === source &&
+        stored.event.requestId === ignoredPaymentEventRequestId(stored.event.id) &&
+        stored.event.ignoredInputReason === reason &&
+        stored.event.ignoredRoute === route &&
+        stored.event.ignoredPriorStatus === priorAcceptedStatus &&
+        (
+          requiredPriorStatus === undefined ||
+          priorAcceptedStatus === requiredPriorStatus
+        ) &&
+        audit,
+      'Payment event identity was already used for a different payment, type, source, route, reason, ignored outcome, or accepted history.',
+      'IDEMPOTENCY_CONFLICT',
+    )
+    return ignoredPaymentEventMessage(stored.event.ignoredOutcome!)
+  }
+  const acceptedRoute: PaymentEventRoute =
+    stored.event.type === 'disputed'
+      ? 'dispute'
+      : priorAcceptedStatus === 'disputed'
+        ? 'dispute_resolution'
+        : 'generic'
   assert(
     stored.payment.id === paymentId &&
       stored.event.type === next &&
-      stored.event.source === source,
-    'Payment event identity was already used for a different payment, type, or source.',
+      stored.event.source === source &&
+      route === acceptedRoute &&
+      (
+        requiredPriorStatus === undefined ||
+        priorAcceptedStatus === requiredPriorStatus
+      ),
+    'Payment event identity was already used for a different payment, type, source, route, or accepted history.',
+    'IDEMPOTENCY_CONFLICT',
+  )
+  const protectedAcceptedEvent =
+    stored.event.source === 'admin_reconcile' &&
+    (
+      stored.event.type === 'disputed' ||
+      priorAcceptedStatus === 'disputed'
+    )
+  if (protectedAcceptedEvent) {
+    const audit = matchingAcceptedProtectedPaymentEventAudit(
+      state,
+      stored.payment,
+      stored.event,
+    )
+    assert(
+      audit &&
+        audit.reason === reason &&
+        (
+          stored.event.refundIntent === undefined ||
+          stored.event.refundIntent.reason === reason
+        ),
+      'Payment event identity was already used with a different protected finance reason.',
+      'IDEMPOTENCY_CONFLICT',
+    )
+  }
+  return 'Duplicate event ignored safely.'
+}
+
+function canonicalPaymentEventReason(
+  rawReason: string,
+  protectedFinanceEvent: boolean,
+) {
+  const reason = sanitizeText(rawReason, 240)
+  assert(
+    reason === rawReason && reason.length > 0,
+    'Payment event reason must already be safe normalized text of at most 240 characters.',
+    'PAYMENT_EVENT_REASON_INVALID',
+  )
+  if (protectedFinanceEvent) {
+    assert(
+      reason.length >= 8,
+      'A dispute or protected finance resolution reason is required.',
+      'REASON_REQUIRED',
+    )
+  }
+  return reason
+}
+
+function assertExactRefundReplay(
+  state: DemoState,
+  stored: { payment: Payment; event: PaymentEvent },
+  paymentId: string,
+  amountSen: number,
+  reason: string,
+  claimId: string | undefined,
+) {
+  const intent = stored.event.refundIntent
+  const eventIndex = stored.payment.events.findIndex((event) =>
+    event.id === stored.event.id)
+  const priorAcceptedStatus = immediatePriorAcceptedPaymentStatus(
+    stored.payment,
+    eventIndex,
+  )
+  const exactIntent =
+    stored.payment.id === paymentId &&
+    stored.event.ignoredReason === undefined &&
+    stored.event.source === 'admin_reconcile' &&
+    (
+      priorAcceptedStatus === 'succeeded' ||
+      priorAcceptedStatus === 'partially_refunded'
+    ) &&
+    ['partially_refunded', 'refunded'].includes(stored.event.type) &&
+    intent?.paymentId === paymentId &&
+    intent.amountSen === amountSen &&
+    intent.reason === reason &&
+    intent.claimId === claimId
+  assert(
+    exactIntent,
+    'Refund request identity was already used for different payment, amount, reason, or claim.',
+    'IDEMPOTENCY_CONFLICT',
+  )
+  const linkedClaim = claimId === undefined
+    ? undefined
+    : state.claims.find((claim) => claim.id === claimId)
+  const exactAudit = linkedClaim
+    ? (
+        matchingAppliedPaymentRefundAudit(
+          state,
+          stored.payment,
+          stored.event,
+          linkedClaim,
+        ) &&
+        matchingAppliedClaimRefundLinkAudit(
+          state,
+          stored.payment,
+          stored.event,
+          linkedClaim,
+        )
+      )
+    : matchingAppliedUnlinkedRefundAudit(
+        state,
+        stored.payment,
+        stored.event,
+      )
+  assert(
+    exactAudit,
+    'Refund request identity is not bound to its exact immutable audit evidence.',
     'IDEMPOTENCY_CONFLICT',
   )
 }
@@ -120,19 +294,29 @@ export class MockPaymentGateway {
     return caller
   }
 
-  private appendIgnoredAdminAudit(
+  private appendIgnoredPaymentAudit(
     state: DemoState,
     payment: Payment,
     actor: { id: string; role: Role },
+    source: 'mock_webhook' | 'admin_reconcile',
     attemptedStatus: PaymentStatus,
     ignoredReason: string,
+    ignoredOutcome: IgnoredPaymentEventOutcome,
+    ignoredPriorStatus: PaymentStatus,
+    ignoredRoute: PaymentEventRoute,
+    ignoredInputReason: string,
+    ignoredRelatedPaymentId: string | undefined,
     at: string,
     requestId: string,
     eventId: string,
   ) {
     this.audit.append(state, {
-      actorId: actor.id,
-      actorRole: actor.role,
+      actorId: source === 'mock_webhook'
+        ? 'mock-hitpay'
+        : actor.id,
+      actorRole: source === 'mock_webhook'
+        ? 'finance'
+        : actor.role,
       action: 'payment.event_ignored',
       targetType: 'payment',
       targetId: payment.id,
@@ -141,8 +325,18 @@ export class MockPaymentGateway {
       requestId,
       eventId,
       outcome: 'ignored',
-      before: { status: payment.status },
-      after: { status: payment.status, attemptedStatus, ignoredReason },
+      before: { status: ignoredPriorStatus },
+      after: {
+        attemptedStatus,
+        ignoredInputReason,
+        ignoredOutcome,
+        ignoredReason,
+        ...(ignoredRelatedPaymentId
+          ? { ignoredRelatedPaymentId }
+          : {}),
+        ignoredRoute,
+        status: ignoredPriorStatus,
+      },
     })
   }
 
@@ -170,16 +364,22 @@ export class MockPaymentGateway {
         )
       }
       const previous = this.assertAttemptAllowed(state, order, retryPayment)
+      const attempt = Math.max(
+        0,
+        ...previous.map((entry) => entry.attempt),
+      ) + 1
       if (!this.reservations.isActive(state, order)) {
         this.reservations.renew(
           state,
           order,
           now,
-          makeId('req', `${order.id}:customer-renew:${now}`),
+          makeId(
+            'req',
+            `${order.id}:customer-renew:${attempt}:${now}`,
+          ),
           { id: user.id, role: user.role },
         )
       }
-      const attempt = Math.max(0, ...previous.map((entry) => entry.attempt)) + 1
       const id = makeId('pay', `${order.id}:${attempt}:${now}`)
       const payment: Payment = {
         id,
@@ -225,15 +425,59 @@ export class MockPaymentGateway {
     next: PaymentStatus,
     source: 'mock_webhook' | 'admin_reconcile' = 'mock_webhook',
     rawReason = 'Processed one idempotent demo payment event',
+    requiredReplayPriorStatus?: PaymentStatus,
+    route: PaymentEventRoute = 'generic',
   ) {
     const snapshot = this.repository.getSnapshot()
     const existingPayment = snapshot.payments.find((entry) => entry.id === paymentId)
     assert(existingPayment, 'Payment attempt was not found.', 'PAYMENT_MISSING')
     this.authorizeEventCaller(snapshot, existingPayment, source)
     const existingEvent = storedPaymentEvent(snapshot, eventId)
+    const existingEventIndex = existingEvent?.payment.events.findIndex((event) =>
+      event.id === existingEvent.event.id)
+    const existingPriorStatus =
+      existingEvent && existingEventIndex !== undefined
+        ? immediatePriorAcceptedPaymentStatus(
+            existingEvent.payment,
+            existingEventIndex,
+          )
+        : undefined
+    const storedEventIsProtected = Boolean(
+      existingEvent &&
+      (
+        existingEvent.event.ignoredReason !== undefined &&
+        existingEvent.event.ignoredRoute !== undefined
+          ? existingEvent.event.ignoredRoute !== 'generic'
+          : (
+              existingEvent.event.type === 'disputed' ||
+              existingPriorStatus === 'disputed'
+            )
+      ),
+    )
+    const reason = canonicalPaymentEventReason(
+      rawReason,
+      source === 'admin_reconcile' &&
+        (
+          existingEvent
+            ? storedEventIsProtected
+            : (
+                next === 'disputed' ||
+                existingPayment.status === 'disputed'
+              )
+        ),
+    )
     if (existingEvent) {
-      assertExactEventReplay(existingEvent, paymentId, next, source)
-      return { payment: existingPayment, changed: false, message: 'Duplicate event ignored safely.' }
+      const message = assertExactEventReplay(
+        snapshot,
+        existingEvent,
+        paymentId,
+        next,
+        source,
+        reason,
+        route,
+        requiredReplayPriorStatus,
+      )
+      return { payment: existingPayment, changed: false, message }
     }
 
     try {
@@ -243,15 +487,51 @@ export class MockPaymentGateway {
         const caller = this.authorizeEventCaller(state, payment, source)
         const concurrentEvent = storedPaymentEvent(state, eventId)
         if (concurrentEvent) {
-          assertExactEventReplay(concurrentEvent, paymentId, next, source)
-          throw new DuplicatePaymentEvent(payment)
+          const message = assertExactEventReplay(
+            state,
+            concurrentEvent,
+            paymentId,
+            next,
+            source,
+            reason,
+            route,
+            requiredReplayPriorStatus,
+          )
+          throw new DuplicatePaymentEvent(payment, message)
+        }
+        assert(
+          source === 'admin_reconcile' ||
+            (next !== 'disputed' && payment.status !== 'disputed'),
+          'Dispute changes require protected finance review.',
+          'FORBIDDEN',
+        )
+        assert(
+          (
+            route === 'generic' &&
+            next !== 'disputed' &&
+            payment.status !== 'disputed'
+          ) ||
+            (route === 'dispute' && next === 'disputed') ||
+            (
+              route === 'dispute_resolution' &&
+              requiredReplayPriorStatus === 'disputed' &&
+              payment.status === 'disputed'
+            ),
+          'Use the dedicated dispute or dispute-resolution route for protected finance events.',
+          'PAYMENT_EVENT_ROUTE_INVALID',
+        )
+        if (requiredReplayPriorStatus !== undefined) {
+          assert(
+            payment.status === requiredReplayPriorStatus,
+            'This dispute is no longer active, so a fresh resolution identity cannot be used.',
+            'DISPUTE_NOT_ACTIVE',
+          )
         }
         const now = this.now()
         this.reservations.expireDue(state, now)
         const requestId = makeId('req', eventId)
         const order = state.orders.find((entry) => entry.id === payment.orderId)
         assert(order, 'Payment order is missing.', 'ORDER_MISSING')
-        const reason = sanitizeText(rawReason, 240)
         const sensitive = next === 'disputed' || payment.status === 'disputed'
         if (sensitive) {
           assert(source === 'admin_reconcile', 'Dispute changes require protected finance review.', 'FORBIDDEN')
@@ -275,6 +555,10 @@ export class MockPaymentGateway {
             const ignoredReason = otherCaptured
               ? `Order already captured by ${otherCaptured.id}`
               : `Order has active payment ${otherActive!.id}`
+            const ignoredOutcome: IgnoredPaymentEventOutcome = otherCaptured
+              ? 'other_payment_captured'
+              : 'other_payment_active'
+            const ignoredRelatedPaymentId = (otherCaptured ?? otherActive)!.id
             payment.updatedAt = now
             payment.events.push({
               id: eventId,
@@ -284,24 +568,39 @@ export class MockPaymentGateway {
               createdAt: now,
               processedAt: now,
               ignoredReason,
+              ignoredOutcome,
+              ignoredPriorStatus: payment.status,
+              ignoredRelatedPaymentId,
+              ignoredRoute: route,
+              ignoredInputReason: reason,
             })
-            if (source === 'admin_reconcile') {
-              this.appendIgnoredAdminAudit(
-                state,
-                payment,
-                caller,
-                next,
-                ignoredReason,
-                now,
-                requestId,
-                eventId,
-              )
+            this.appendIgnoredPaymentAudit(
+              state,
+              payment,
+              caller,
+              source,
+              next,
+              ignoredReason,
+              ignoredOutcome,
+              payment.status,
+              route,
+              reason,
+              ignoredRelatedPaymentId,
+              now,
+              requestId,
+              eventId,
+            )
+            return {
+              payment,
+              changed: false,
+              message: ignoredPaymentEventMessage(ignoredOutcome),
             }
-            return { payment, changed: false, message: 'Conflicting success event was recorded and ignored safely.' }
           }
         }
         if (!canTransitionPayment(payment.status, next)) {
           const ignoredReason = `Out-of-order: ${payment.status} cannot become ${next}`
+          const ignoredPriorStatus = payment.status
+          const ignoredOutcome: IgnoredPaymentEventOutcome = 'out_of_order'
           payment.updatedAt = now
           payment.events.push({
             id: eventId,
@@ -311,29 +610,42 @@ export class MockPaymentGateway {
             createdAt: now,
             processedAt: now,
             ignoredReason,
+            ignoredOutcome,
+            ignoredPriorStatus,
+            ignoredRoute: route,
+            ignoredInputReason: reason,
           })
-          if (source === 'admin_reconcile') {
-            this.appendIgnoredAdminAudit(
-              state,
-              payment,
-              caller,
-              next,
-              ignoredReason,
-              now,
-              requestId,
-              eventId,
-            )
-          }
+          this.appendIgnoredPaymentAudit(
+            state,
+            payment,
+            caller,
+            source,
+            next,
+            ignoredReason,
+            ignoredOutcome,
+            ignoredPriorStatus,
+            route,
+            reason,
+            undefined,
+            now,
+            requestId,
+            eventId,
+          )
           return {
             payment,
             changed: false,
-            message: 'Out-of-order event was recorded without changing payment status.',
+            message: ignoredPaymentEventMessage(ignoredOutcome),
           }
         }
         if (next === 'succeeded') {
           assert(payment.amountSen === order.snapshot.totals.totalSen, 'Payment amount failed the server-like total check.', 'AMOUNT_MISMATCH')
         }
         const before = payment.status
+        const beforeRefundedSen = payment.refundedSen
+        const preservedCompletedClaimIds =
+          before === 'disputed' && next === 'refunded'
+            ? preservedCompletedClaimIdsForUnlinkedRefund(state, payment)
+            : []
         if (before === 'disputed' && next === 'refunded') {
           assertFullPaymentRefundCompatible(state, payment)
         }
@@ -438,14 +750,34 @@ export class MockPaymentGateway {
           at: now,
           requestId,
           eventId,
-          before: { status: before },
-          after: { status: next, orderStatus: order.status },
+          before: disputeRefundAmount > 0
+            ? { refundedSen: beforeRefundedSen, status: before }
+            : { status: before },
+          after: disputeRefundAmount > 0
+            ? {
+                allocationsReturned: 0,
+                amountSen: disputeRefundAmount,
+                orderStatus: order.status,
+                ...(preservedCompletedClaimIds.length > 0
+                  ? { preservedCompletedClaimIds }
+                  : {}),
+                refundedSen: payment.refundedSen,
+                status: next,
+              }
+            : {
+                orderStatus: order.status,
+                status: next,
+              },
         })
         return { payment, changed: before !== next, message: `Payment is now ${next}.` }
       })
     } catch (caught) {
       if (caught instanceof DuplicatePaymentEvent) {
-        return { payment: caught.payment, changed: false, message: 'Duplicate event ignored safely.' }
+        return {
+          payment: caught.payment,
+          changed: false,
+          message: caught.message,
+        }
       }
       throw caught
     }
@@ -464,16 +796,22 @@ export class MockPaymentGateway {
       const order = state.orders.find((entry) => entry.id === previous.orderId)
       assert(order, 'Payment order was not found.', 'ORDER_MISSING')
       const attempts = this.assertAttemptAllowed(state, order, previous)
+      const attempt = Math.max(
+        0,
+        ...attempts.map((entry) => entry.attempt),
+      ) + 1
       if (!this.reservations.isActive(state, order)) {
         this.reservations.renew(
           state,
           order,
           now,
-          makeId('req', `${order.id}:admin-renew:${now}`),
+          makeId(
+            'req',
+            `${order.id}:admin-renew:${attempt}:${now}`,
+          ),
           { id: actor.id, role: actor.role },
         )
       }
-      const attempt = Math.max(0, ...attempts.map((entry) => entry.attempt)) + 1
       const id = makeId('pay', `${order.id}:admin-retry:${attempt}:${now}`)
       const retry: Payment = {
         id,
@@ -514,19 +852,44 @@ export class MockPaymentGateway {
   }
 
   dispute(paymentId: string, reason: string, eventId: string) {
-    return this.processEvent(paymentId, eventId, 'disputed', 'admin_reconcile', reason)
+    return this.processEvent(
+      paymentId,
+      eventId,
+      'disputed',
+      'admin_reconcile',
+      reason,
+      undefined,
+      'dispute',
+    )
   }
 
   resolveDispute(paymentId: string, outcome: 'merchant_won' | 'refund', reason: string, eventId: string) {
-    const payment = this.repository.getSnapshot().payments.find((entry) => entry.id === paymentId)
+    const snapshot = this.repository.getSnapshot()
+    const payment = snapshot.payments.find((entry) => entry.id === paymentId)
     assert(payment, 'Payment attempt was not found.', 'PAYMENT_MISSING')
-    const wonStatus: PaymentStatus = payment.refundedSen > 0 ? 'partially_refunded' : 'succeeded'
+    const stored = storedPaymentEvent(snapshot, eventId)
+    if (!stored) {
+      assert(
+        payment.status === 'disputed',
+        'This dispute is no longer active, so a fresh resolution identity cannot be used.',
+        'DISPUTE_NOT_ACTIVE',
+      )
+    }
+    const storedMerchantWonStatus =
+      stored &&
+      ['succeeded', 'partially_refunded'].includes(stored.event.type)
+        ? stored.event.type
+        : undefined
+    const wonStatus: PaymentStatus = storedMerchantWonStatus ??
+      (payment.refundedSen > 0 ? 'partially_refunded' : 'succeeded')
     return this.processEvent(
       paymentId,
       eventId,
       outcome === 'merchant_won' ? wonStatus : 'refunded',
       'admin_reconcile',
       reason,
+      'disputed',
+      'dispute_resolution',
     )
   }
 
@@ -574,15 +937,13 @@ export class MockPaymentGateway {
     )
     if (replayOwner) {
       const replayEvent = replayOwner.events.find((event) => event.requestId === cleanRequestId)!
-      const exactReplay =
-        replayEvent.refundIntent?.paymentId === paymentId &&
-        replayEvent.refundIntent.amountSen === amountSen &&
-        replayEvent.refundIntent.reason === cleanReason &&
-        replayEvent.refundIntent.claimId === cleanClaimId
-      assert(
-        exactReplay,
-        'Refund request identity was already used for different payment, amount, reason, or claim.',
-        'IDEMPOTENCY_CONFLICT',
+      assertExactRefundReplay(
+        snapshot,
+        { payment: replayOwner, event: replayEvent },
+        paymentId,
+        amountSen,
+        cleanReason,
+        cleanClaimId,
       )
       return {
         payment: replayOwner,
@@ -591,213 +952,247 @@ export class MockPaymentGateway {
       }
     }
 
-    return this.repository.update((state) => {
-      const actor = getSessionUser(state)
-      assertRole(actor, ['finance', 'admin', 'super_admin'], 'refund demo payments')
-      const payment = state.payments.find((entry) => entry.id === paymentId)
-      assert(payment, 'Payment was not found.', 'PAYMENT_MISSING')
-      assert(
-        !state.payments.some((entry) =>
-          entry.events.some((event) => event.requestId === cleanRequestId),
-        ),
-        'Refund request identity changed before it could be saved.',
-        'IDEMPOTENCY_CONFLICT',
-      )
-      if (cleanClaimId !== undefined) {
-        const existingClaim = state.claims.find((claim) => claim.id === cleanClaimId)
-        assert(existingClaim, 'The refund claim was not found.', 'CLAIM_MISSING')
-        assert(
-          existingClaim.linkedRefundEventId === undefined &&
-            !state.payments.some((entry) =>
-              entry.events.some((event) =>
-                event.refundIntent?.claimId === existingClaim.id)),
-          'This claim is already linked to a refund event.',
-          'CLAIM_REFUND_ALREADY_LINKED',
-        )
-      }
-      assert(['succeeded', 'partially_refunded'].includes(payment.status), 'Only succeeded demo payments can be refunded.', 'NOT_REFUNDABLE')
-      assert(payment.refundedSen + amountSen <= payment.amountSen, 'Refund exceeds the paid demo amount.', 'REFUND_TOO_HIGH')
-      const order = state.orders.find((entry) => entry.id === payment.orderId)
-      assert(order, 'Payment order is missing.', 'ORDER_MISSING')
-      const now = this.now()
-      const eventId = makeId('evt', cleanRequestId)
-      const linkedClaim = cleanClaimId === undefined
-        ? undefined
-        : state.claims.find((claim) => claim.id === cleanClaimId)
-      let settlementPolicy: ClaimSettlementPolicy | undefined
-      if (cleanClaimId !== undefined) {
-        assert(linkedClaim, 'The refund claim was not found.', 'CLAIM_MISSING')
-        assert(
-          linkedClaim.orderId === payment.orderId &&
-            linkedClaim.userId === payment.userId &&
-            order.userId === linkedClaim.userId,
-          'The refund claim must belong to the same order and customer as the payment.',
-          'CLAIM_PAYMENT_MISMATCH',
-        )
-        assert(
-          linkedClaim.status === 'approved',
-          'A claim must be approved before its refund can be linked.',
-          'CLAIM_NOT_APPROVED',
-        )
-        assertNoRemedyScopeConflict(state.claims, linkedClaim)
-        const replacement = linkedClaim.replacementShipmentId
-          ? state.shipments.find((shipment) =>
-              shipment.id === linkedClaim.replacementShipmentId &&
-              shipment.sourceClaimId === linkedClaim.id &&
-              shipment.purpose === 'replacement')
-          : undefined
-        const terminalFallback = isTerminalReplacementRefundFallback(replacement)
-        const ordinaryRefundPath =
-          linkedClaim.replacementShipmentId === undefined &&
-          (
-            (
-              linkedClaim.remedyState === 'none' &&
-              linkedClaim.rma === undefined
-            ) ||
-            (
-              linkedClaim.remedyState === 'rma_inspected' &&
-              linkedClaim.rma?.status === 'inspected'
-            )
+    try {
+      return this.repository.update((state) => {
+        const actor = getSessionUser(state)
+        assertRole(actor, ['finance', 'admin', 'super_admin'], 'refund demo payments')
+        const payment = state.payments.find((entry) => entry.id === paymentId)
+        assert(payment, 'Payment was not found.', 'PAYMENT_MISSING')
+        const concurrentReplay = state.payments
+          .flatMap((entry) => entry.events.map((event) => ({
+            event,
+            payment: entry,
+          })))
+          .find(({ event }) => event.requestId === cleanRequestId)
+        if (concurrentReplay) {
+          assertExactRefundReplay(
+            state,
+            concurrentReplay,
+            paymentId,
+            amountSen,
+            cleanReason,
+            cleanClaimId,
           )
-        assert(
-          ordinaryRefundPath || terminalFallback,
-          'A replacement refund fallback requires terminal digital failure or terminal physical loss or return.',
-          'REMEDY_CONFLICT',
-        )
-        settlementPolicy = terminalFallback
-          ? 'terminal_replacement_fallback'
-          : 'exact_scope'
-        if (terminalFallback) {
-          const expectedAmountSen = terminalReplacementFallbackAmount(
-            linkedClaim.requiredSettlementSen,
-            remainingPaymentBalance(payment),
-          )
+          throw new DuplicateRefundRequest(concurrentReplay.payment)
+        }
+        if (cleanClaimId !== undefined) {
+          const existingClaim = state.claims.find((claim) => claim.id === cleanClaimId)
+          assert(existingClaim, 'The refund claim was not found.', 'CLAIM_MISSING')
           assert(
-            amountSen === expectedAmountSen,
-            'A terminal replacement refund fallback must equal the smaller of the claim requirement and the selected payment’s remaining balance.',
-            'CLAIM_SETTLEMENT_MISMATCH',
-          )
-        } else {
-          assert(
-            amountSen === linkedClaim.requiredSettlementSen,
-            'A claim-linked refund must exactly equal the claim’s snapshotted required settlement.',
-            'CLAIM_SETTLEMENT_MISMATCH',
+            existingClaim.linkedRefundEventId === undefined &&
+              !state.payments.some((entry) =>
+                entry.events.some((event) =>
+                  event.refundIntent?.claimId === existingClaim.id)),
+            'This claim is already linked to a refund event.',
+            'CLAIM_REFUND_ALREADY_LINKED',
           )
         }
-        assert(
-          !state.claims.some((claim) =>
-            claim.id !== linkedClaim.id &&
+        assert(['succeeded', 'partially_refunded'].includes(payment.status), 'Only succeeded demo payments can be refunded.', 'NOT_REFUNDABLE')
+        assert(payment.refundedSen + amountSen <= payment.amountSen, 'Refund exceeds the paid demo amount.', 'REFUND_TOO_HIGH')
+        const order = state.orders.find((entry) => entry.id === payment.orderId)
+        assert(order, 'Payment order is missing.', 'ORDER_MISSING')
+        const now = this.now()
+        const eventId = makeId('evt', cleanRequestId)
+        const linkedClaim = cleanClaimId === undefined
+          ? undefined
+          : state.claims.find((claim) => claim.id === cleanClaimId)
+        let settlementPolicy: ClaimSettlementPolicy | undefined
+        if (cleanClaimId !== undefined) {
+          assert(linkedClaim, 'The refund claim was not found.', 'CLAIM_MISSING')
+          assert(
+            linkedClaim.orderId === payment.orderId &&
+              linkedClaim.userId === payment.userId &&
+              order.userId === linkedClaim.userId,
+            'The refund claim must belong to the same order and customer as the payment.',
+            'CLAIM_PAYMENT_MISMATCH',
+          )
+          assert(
+            linkedClaim.status === 'approved',
+            'A claim must be approved before its refund can be linked.',
+            'CLAIM_NOT_APPROVED',
+          )
+          assertNoRemedyScopeConflict(state, linkedClaim)
+          const replacement = linkedClaim.replacementShipmentId
+            ? state.shipments.find((shipment) =>
+                shipment.id === linkedClaim.replacementShipmentId &&
+                shipment.sourceClaimId === linkedClaim.id &&
+                shipment.purpose === 'replacement')
+            : undefined
+          const terminalFallback = isTerminalReplacementRefundFallback(replacement)
+          const ordinaryRefundPath =
+            linkedClaim.replacementShipmentId === undefined &&
             (
-              claim.linkedRefundEventId === eventId ||
-              claim.resolutionReference === eventId
+              (
+                linkedClaim.remedyState === 'none' &&
+                linkedClaim.rma === undefined
+              ) ||
+              (
+                linkedClaim.remedyState === 'rma_inspected' &&
+                linkedClaim.rma?.status === 'inspected'
+              )
+            )
+          assert(
+            ordinaryRefundPath || terminalFallback,
+            'A replacement refund fallback requires terminal digital failure or terminal physical loss or return.',
+            'REMEDY_CONFLICT',
+          )
+          settlementPolicy = terminalFallback
+            ? 'terminal_replacement_fallback'
+            : 'exact_scope'
+          if (terminalFallback) {
+            const expectedAmountSen = terminalReplacementFallbackAmount(
+              linkedClaim.requiredSettlementSen,
+              remainingPaymentBalance(payment),
+            )
+            assert(
+              amountSen === expectedAmountSen,
+              'A terminal replacement refund fallback must equal the smaller of the claim requirement and the selected payment’s remaining balance.',
+              'CLAIM_SETTLEMENT_MISMATCH',
+            )
+          } else {
+            assert(
+              amountSen === linkedClaim.requiredSettlementSen,
+              'A claim-linked refund must exactly equal the claim’s snapshotted required settlement.',
+              'CLAIM_SETTLEMENT_MISMATCH',
+            )
+          }
+          assert(
+            !state.claims.some((claim) =>
+              claim.id !== linkedClaim.id &&
+              (
+                claim.linkedRefundEventId === eventId ||
+                claim.resolutionReference === eventId
+              ),
             ),
-          ),
-          'This refund event identity is already linked to another claim.',
-          'REFUND_EVENT_ALREADY_LINKED',
-        )
-        assert(
-          Date.parse(now) >= Date.parse(linkedClaim.createdAt) &&
-            Date.parse(now) >= Date.parse(linkedClaim.updatedAt),
-          'A linked refund event cannot be recorded before the approved claim history.',
-          'REFUND_BEFORE_CLAIM',
-        )
-      }
-      const full = payment.refundedSen + amountSen === payment.amountSen
-      if (full) {
-        assertFullPaymentRefundCompatible(
-          state,
-          payment,
-          cleanClaimId,
-        )
-      }
-      const before = { status: payment.status, refundedSen: payment.refundedSen }
-      payment.refundedSen += amountSen
-      payment.status = transitionPayment(payment.status, full ? 'refunded' : 'partially_refunded')
-      payment.updatedAt = now
-      payment.events.push({
-        id: eventId,
-        requestId: cleanRequestId,
-        type: payment.status,
-        source: 'admin_reconcile',
-        createdAt: now,
-        processedAt: now,
-        refundIntent: {
-          paymentId: payment.id,
-          amountSen,
-          reason: cleanReason,
-          ...(cleanClaimId !== undefined ? { claimId: cleanClaimId } : {}),
-        },
-      })
-      if (full && order.status !== 'refunded') {
-        const financialReason = sanitizeText(`${cleanReason}; prize allocation retained`, 240)
-        this.financialSafety.stop(
-          state,
-          order,
-          'refunded',
-          now,
-          financialReason,
-          cleanRequestId,
-          { id: actor.id, role: actor.role },
-        )
-      }
-      this.audit.append(state, {
-        actorId: actor.id,
-        actorRole: actor.role,
-        action: full ? 'payment.refunded' : 'payment.partially_refunded',
-        targetType: 'payment',
-        targetId: payment.id,
-        reason: cleanReason,
-        at: now,
-        requestId: cleanRequestId,
-        eventId,
-        before,
-        after: {
-          allocationsReturned: 0,
-          ...(cleanClaimId !== undefined ? { claimId: cleanClaimId } : {}),
-          refundedSen: payment.refundedSen,
-          status: payment.status,
-        },
-      })
-      if (linkedClaim) {
-        linkedClaim.linkedRefundEventId = eventId
-        linkedClaim.remedyState = 'refund_linked'
-        linkedClaim.acceptedSettlementSen = amountSen
-        linkedClaim.settlementPolicy = settlementPolicy
-        linkedClaim.updatedAt = now
-        linkedClaim.history.push({
-          id: `${linkedClaim.id}-h-${String(linkedClaim.history.length + 1).padStart(2, '0')}`,
-          status: linkedClaim.status,
-          note: claimRefundLinkedHistoryNote(eventId),
-          actorId: actor.id,
-          actorRole: actor.role,
-          at: now,
+            'This refund event identity is already linked to another claim.',
+            'REFUND_EVENT_ALREADY_LINKED',
+          )
+          assert(
+            Date.parse(now) >= Date.parse(linkedClaim.createdAt) &&
+              Date.parse(now) >= Date.parse(linkedClaim.updatedAt),
+            'A linked refund event cannot be recorded before the approved claim history.',
+            'REFUND_BEFORE_CLAIM',
+          )
+        }
+        const full = payment.refundedSen + amountSen === payment.amountSen
+        if (full) {
+          assertFullPaymentRefundCompatible(
+            state,
+            payment,
+            cleanClaimId,
+          )
+        }
+        const before = { status: payment.status, refundedSen: payment.refundedSen }
+        const preservedCompletedClaimIds = cleanClaimId === undefined
+          ? preservedCompletedClaimIdsForUnlinkedRefund(state, payment)
+          : []
+        payment.refundedSen += amountSen
+        payment.status = transitionPayment(payment.status, full ? 'refunded' : 'partially_refunded')
+        payment.updatedAt = now
+        payment.events.push({
+          id: eventId,
+          requestId: cleanRequestId,
+          type: payment.status,
+          source: 'admin_reconcile',
+          createdAt: now,
+          processedAt: now,
+          refundIntent: {
+            paymentId: payment.id,
+            amountSen,
+            reason: cleanReason,
+            ...(cleanClaimId !== undefined ? { claimId: cleanClaimId } : {}),
+          },
         })
+        if (full && order.status !== 'refunded') {
+          const financialReason = sanitizeText(`${cleanReason}; prize allocation retained`, 240)
+          this.financialSafety.stop(
+            state,
+            order,
+            'refunded',
+            now,
+            financialReason,
+            cleanRequestId,
+            { id: actor.id, role: actor.role },
+          )
+        }
         this.audit.append(state, {
           actorId: actor.id,
           actorRole: actor.role,
-          action: CLAIM_REFUND_LINK_ACTION,
-          targetType: 'claim',
-          targetId: linkedClaim.id,
+          action: full ? 'payment.refunded' : 'payment.partially_refunded',
+          targetType: 'payment',
+          targetId: payment.id,
           reason: cleanReason,
           at: now,
           requestId: cleanRequestId,
           eventId,
-          before: { linkedRefundEventId: null, status: 'approved' },
+          before,
           after: {
-            linkedRefundEventId: eventId,
-            paymentId: payment.id,
-            status: 'approved',
+            allocationsReturned: 0,
+            ...(cleanClaimId === undefined ? { amountSen } : {}),
+            ...(cleanClaimId !== undefined ? { claimId: cleanClaimId } : {}),
+            ...(preservedCompletedClaimIds.length > 0
+              ? { preservedCompletedClaimIds }
+              : {}),
+            refundedSen: payment.refundedSen,
+            status: payment.status,
           },
         })
-        refreshOrderFulfillment(
-          state,
-          order,
-          now,
-          claimRefundLinkedHistoryNote(eventId),
-        )
+        if (linkedClaim) {
+          linkedClaim.linkedRefundEventId = eventId
+          linkedClaim.remedyState = 'refund_linked'
+          linkedClaim.acceptedSettlementSen = amountSen
+          linkedClaim.settlementPolicy = settlementPolicy
+          linkedClaim.updatedAt = now
+          linkedClaim.history.push({
+            id: `${linkedClaim.id}-h-${String(linkedClaim.history.length + 1).padStart(2, '0')}`,
+            status: linkedClaim.status,
+            note: claimRefundLinkedHistoryNote(eventId),
+            actorId: actor.id,
+            actorRole: actor.role,
+            at: now,
+          })
+          this.audit.append(state, {
+            actorId: actor.id,
+            actorRole: actor.role,
+            action: CLAIM_REFUND_LINK_ACTION,
+            targetType: 'claim',
+            targetId: linkedClaim.id,
+            reason: cleanReason,
+            at: now,
+            requestId: cleanRequestId,
+            eventId,
+            before: { linkedRefundEventId: null, status: 'approved' },
+            after: {
+              linkedRefundEventId: eventId,
+              paymentId: payment.id,
+              status: 'approved',
+            },
+          })
+          refreshOrderFulfillment(
+            state,
+            order,
+            now,
+            claimRefundLinkedHistoryNote(eventId),
+          )
+        }
+        return {
+          payment,
+          changed: true,
+          message: full
+            ? 'Full demo refund recorded.'
+            : 'Partial demo refund recorded.',
+        }
+      })
+    } catch (caught) {
+      if (caught instanceof DuplicateRefundRequest) {
+        return {
+          payment: caught.payment,
+          changed: false,
+          message: 'Exact refund replay returned the original result.',
+        }
       }
-      return { payment, changed: true, message: full ? 'Full demo refund recorded.' : 'Partial demo refund recorded.' }
-    })
+      throw caught
+    }
   }
 
   prizeSummary(paymentId: string) {

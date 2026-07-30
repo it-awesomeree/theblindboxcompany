@@ -16,6 +16,9 @@ function settlementAmountLabel(claim: Claim) {
 }
 
 function settlementPolicyLabel(claim: Claim) {
+  if (claim.legacyUnderSettledRefund) {
+    return 'Preserved legacy record · no modern settlement policy'
+  }
   return claim.settlementPolicy
     ? `Settlement policy: ${titleCase(claim.settlementPolicy)}`
     : 'No valid completion settlement policy'
@@ -131,10 +134,9 @@ export function RemedyProgress({
               {legacyUnderSettledRefund && (
                 <p>
                   <b>Immutable legacy under-settled refund evidence</b>
-                  <span className="breakable-id">{legacyUnderSettledRefund.id} · {legacyUnderSettledRefund.linkedRefundEventId}</span>
                   <span>{settlementAmountLabel(legacyUnderSettledRefund)}</span>
                   <span>{settlementPolicyLabel(legacyUnderSettledRefund)}</span>
-                  <span>This immutable record does not complete this delivery/remedy scope.</span>
+                  <span>Its exact final audit permanently owns this claim scope; the under-settled amount alone does not mark delivery fulfilled.</span>
                 </p>
               )}
               {replacement && (

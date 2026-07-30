@@ -8,19 +8,23 @@ import {
   validateDemoClaimNote,
 } from '../domain/guards'
 import {
-  shipmentClaimEligibility,
+  shipmentClaimEligibilityAtAudit,
   valueFloorClaimEligibility,
 } from '../domain/claimEligibility'
+import type { AuditMoment } from '../domain/auditSequence'
 import {
   canWidenClaimEvidence,
   CLAIM_EVIDENCE_WIDENING_NOTE,
-  isOpenClaimStatus,
 } from '../domain/claimStatus'
 import { matchingAppliedPaymentRefundAudit } from '../domain/refundLink'
 import { refreshOrderFulfillment } from '../domain/orderFulfillment'
 import {
+  availableClaimShipmentIdsAt,
   assertClaimOrderAllowsTypedRemedy,
   assertNoRemedyScopeConflict,
+  CLAIM_REMEDY_SCOPE_UNAVAILABLE_CODE,
+  claimHoldsRemedyEntitlementAt,
+  POST_DELIVERY_REPLACEMENT_REQUIRES_RETURN_CODE,
   remedyBoxIdsForEvidence,
   requiredSettlementForBoxScope,
 } from '../domain/remedyPolicy'
@@ -60,6 +64,12 @@ export interface ClaimResolutionInput {
   reference: string
 }
 
+class ExactClaimReplay extends Error {
+  constructor(readonly claim: Claim) {
+    super('Exact claim replay')
+  }
+}
+
 function nextClaimIdentity(state: DemoState, seed: string) {
   const sequence = state.nextSequence
   state.nextSequence += 1
@@ -82,40 +92,38 @@ function everyOrderBoxRevealedAt(state: DemoState, orderId: string, at: string) 
   )
 }
 
-function eligibleShipmentIds(
+function rawEligibleShipmentIds(
   state: DemoState,
   orderId: string,
   kind: Extract<ClaimKind, 'damage' | 'non_delivery'>,
-  at: string,
+  boundary: AuditMoment,
 ) {
   return state.shipments
     .filter((shipment) =>
       shipment.orderId === orderId &&
-      shipmentClaimEligibility(shipment, kind, at).eligible,
+      shipment.purpose === 'original' &&
+      shipmentClaimEligibilityAtAudit(
+        state,
+        shipment,
+        kind,
+        boundary,
+      ).eligible,
     )
     .map((shipment) => shipment.id)
     .sort((left, right) => left.localeCompare(right))
 }
 
-function openClaimMatches(
+function claimUsesSubmittedEvidence(
   claim: Claim,
   kind: ClaimKind,
   shipmentId: string | undefined,
   boxId: string | undefined,
-  shipmentCandidateIds: string[] | undefined,
+  orderLevelDelivery: boolean,
 ) {
-  if (claim.kind !== kind || !isOpenClaimStatus(claim.status)) return false
+  if (claim.kind !== kind) return false
   if (kind === 'value_floor') return claim.boxId === boxId
-  if (shipmentCandidateIds) {
-    return Boolean(
-      claim.shipmentCandidateIds ||
-      (claim.shipmentId && shipmentCandidateIds.includes(claim.shipmentId)),
-    )
-  }
-  return Boolean(
-    claim.shipmentId === shipmentId ||
-    (shipmentId && claim.shipmentCandidateIds?.includes(shipmentId)),
-  )
+  if (orderLevelDelivery) return claim.shipmentCandidateIds !== undefined
+  return claim.shipmentId === shipmentId
 }
 
 function customerClaimReceipt(claim: Claim) {
@@ -182,7 +190,68 @@ export class ClaimService {
       Number(Boolean(input.boxId)) +
       Number(orderLevelDelivery)
     assert(selectedLinkCount === 1, 'Choose exactly one valid claim evidence scope.', 'CLAIM_LINK_REQUIRED')
+    const evidenceMatches = state.claims.filter((claim) =>
+      claim.orderId === order.id &&
+      claimUsesSubmittedEvidence(
+        claim,
+        input.kind,
+        selectedShipment?.id,
+        selectedBox?.id,
+        orderLevelDelivery,
+      ))
+    const sameNoteMatches = orderLevelDelivery
+      ? evidenceMatches.filter((claim) => claim.note === note)
+      : evidenceMatches
+    const mutableSameNoteMatches = sameNoteMatches.filter((claim) =>
+      canWidenClaimEvidence(claim.status))
+    assert(
+      orderLevelDelivery
+        ? mutableSameNoteMatches.length <= 1
+        : evidenceMatches.length <= 1,
+      orderLevelDelivery
+        ? 'This same-note neutral claim has more than one mutable candidate.'
+        : 'This claim evidence is already recorded more than once.',
+      'IDEMPOTENCY_CONFLICT',
+    )
+    const sameNoteRemedyBoxIds = sameNoteMatches.flatMap((claim) =>
+      claim.remedyBoxIds)
+    assert(
+      !orderLevelDelivery ||
+        new Set(sameNoteRemedyBoxIds).size === sameNoteRemedyBoxIds.length,
+      'Same-note neutral claim records contain overlapping remedy scope.',
+      'IDEMPOTENCY_CONFLICT',
+    )
+    const replay: Claim | undefined = orderLevelDelivery
+      ? mutableSameNoteMatches[0]
+      : evidenceMatches[0]
+    const terminalReplay = orderLevelDelivery && !replay
+      ? sameNoteMatches.at(-1)
+      : undefined
+    const changedNeutralReplays = orderLevelDelivery
+      ? evidenceMatches.filter((claim) => claim.note !== note)
+      : []
+    if (replay && !orderLevelDelivery) {
+      assert(
+        replay.note === note,
+        'This claim evidence was already submitted with a different note.',
+        'IDEMPOTENCY_CONFLICT',
+      )
+      return {
+        user,
+        order,
+        note,
+        selectedShipment,
+        selectedBox,
+        shipmentCandidateIds: undefined,
+        duplicate: replay,
+        exactReplay: replay,
+      }
+    }
     const everyBoxRevealed = everyOrderBoxRevealedAt(state, order.id, now)
+    const boundary = {
+      at: now,
+      sequence: state.auditCount + 1,
+    }
     let shipmentCandidateIds: string[] | undefined
 
     if (input.kind === 'damage' || input.kind === 'non_delivery') {
@@ -199,7 +268,12 @@ export class ClaimService {
             : 'Choose the shipment that did not arrive.',
           'CLAIM_LINK_REQUIRED',
         )
-        const eligibility = shipmentClaimEligibility(selectedShipment, input.kind, now)
+        const eligibility = shipmentClaimEligibilityAtAudit(
+          state,
+          selectedShipment,
+          input.kind,
+          boundary,
+        )
         assert(
           eligibility.eligible,
           eligibility.reason,
@@ -207,19 +281,95 @@ export class ClaimService {
             ? 'CLAIM_NOT_OVERDUE'
             : 'CLAIM_INELIGIBLE',
         )
+        assert(
+          availableClaimShipmentIdsAt(
+            state,
+            order.id,
+            input.kind,
+            boundary,
+          ).includes(selectedShipment.id),
+          'This delivery evidence is already reserved by an earlier claim remedy.',
+          CLAIM_REMEDY_SCOPE_UNAVAILABLE_CODE,
+        )
       } else {
         assert(
           orderLevelDelivery && !input.shipmentId,
           'While any box is sealed, use the neutral order-level delivery evidence.',
           'CLAIM_ORDER_LEVEL_REQUIRED',
         )
-        shipmentCandidateIds = eligibleShipmentIds(state, order.id, input.kind, now)
+        const rawEligibleIds = rawEligibleShipmentIds(
+          state,
+          order.id,
+          input.kind,
+          boundary,
+        )
+        const availableCandidateIds = availableClaimShipmentIdsAt(
+          state,
+          order.id,
+          input.kind,
+          boundary,
+          replay?.id,
+          evidenceMatches
+            .filter((claim) => claim.id !== replay?.id)
+            .map((claim) => claim.id),
+        )
+        shipmentCandidateIds = availableCandidateIds
+        const existingCandidateIds = replay?.shipmentCandidateIds ?? []
+        const additions = shipmentCandidateIds.filter((shipmentId) =>
+          !existingCandidateIds.includes(shipmentId))
+        if (
+          (replay || terminalReplay) &&
+          additions.length === 0
+        ) {
+          const exactReplay = replay ?? terminalReplay!
+          return {
+            user,
+            order,
+            note,
+            selectedShipment,
+            selectedBox,
+            shipmentCandidateIds,
+            duplicate: replay,
+            exactReplay,
+          }
+        }
         assert(
-          shipmentCandidateIds.length > 0,
+          rawEligibleIds.length > 0,
           input.kind === 'damage'
             ? 'No delivered physical order evidence is eligible for damage.'
-            : 'No physical order evidence is currently eligible for non-delivery.',
+            : 'No physical or digital order evidence is currently eligible for non-delivery.',
           'CLAIM_INELIGIBLE',
+        )
+        assert(
+          !changedNeutralReplays.some((claim) =>
+            canWidenClaimEvidence(claim.status)),
+          'This neutral claim evidence was already submitted with a different note.',
+          'IDEMPOTENCY_CONFLICT',
+        )
+        if (changedNeutralReplays.length > 0) {
+          const overlapsPriorNeutralScope = changedNeutralReplays.some(
+            (priorClaim) => shipmentCandidateIds!.some((shipmentId) => {
+              const shipment = state.shipments.find((entry) =>
+                entry.id === shipmentId)
+              return Boolean(shipment?.boxIds.some((boxId) =>
+                priorClaim.remedyBoxIds.includes(boxId)))
+            }),
+          )
+          assert(
+            shipmentCandidateIds.length > 0,
+            'This neutral claim evidence was already submitted with a different note.',
+            'IDEMPOTENCY_CONFLICT',
+          )
+          assert(
+            !overlapsPriorNeutralScope,
+            'A later neutral claim cannot overlap the earlier claim evidence scope.',
+            CLAIM_REMEDY_SCOPE_UNAVAILABLE_CODE,
+          )
+        }
+        assert(
+          shipmentCandidateIds.length > 0,
+          'Eligible delivery evidence exists, but every whole shipment scope is already reserved or remediated by an earlier claim.',
+          CLAIM_REMEDY_SCOPE_UNAVAILABLE_CODE,
         )
       }
     } else {
@@ -230,18 +380,24 @@ export class ClaimService {
       )
       const eligibility = valueFloorClaimEligibility(selectedBox, now)
       assert(eligibility.eligible, eligibility.reason, 'CLAIM_INELIGIBLE')
+      assert(
+        !state.claims.some((claim) =>
+          claim.orderId === order.id &&
+          claim.remedyBoxIds.includes(selectedBox.id) &&
+          claim.id !== replay?.id &&
+          claimHoldsRemedyEntitlementAt(state, claim, now)),
+        'This box evidence is already reserved or remediated by an earlier claim.',
+        CLAIM_REMEDY_SCOPE_UNAVAILABLE_CODE,
+      )
     }
 
-    const duplicate = state.claims.find((claim) =>
-      claim.orderId === order.id &&
-      openClaimMatches(
-        claim,
-        input.kind,
-        selectedShipment?.id,
-        selectedBox?.id,
-        shipmentCandidateIds,
-      ),
-    )
+    const duplicate = replay
+    const existingCandidateIds = duplicate?.shipmentCandidateIds ?? []
+    const additions = shipmentCandidateIds?.filter((shipmentId) =>
+      !existingCandidateIds.includes(shipmentId)) ?? []
+    const exactReplay = duplicate && additions.length === 0
+      ? duplicate
+      : undefined
     return {
       user,
       order,
@@ -250,12 +406,20 @@ export class ClaimService {
       selectedBox,
       shipmentCandidateIds,
       duplicate,
+      exactReplay,
     }
   }
 
   submit(input: SubmitClaimInput) {
     const now = this.now()
     const prepared = this.prepareSubmission(this.repository.getSnapshot(), input, now)
+    if (prepared.exactReplay) {
+      return {
+        data: customerClaimReceipt(prepared.exactReplay),
+        changed: false,
+        message: 'Exact claim replay returned the original result.',
+      }
+    }
     const newCandidateIds = prepared.shipmentCandidateIds ?? []
     const existingCandidateIds = prepared.duplicate?.shipmentCandidateIds ?? []
     const shouldWidenOrderLevelClaim = Boolean(
@@ -264,26 +428,29 @@ export class ClaimService {
       canWidenClaimEvidence(prepared.duplicate.status) &&
       newCandidateIds.some((shipmentId) => !existingCandidateIds.includes(shipmentId)),
     )
-    if (prepared.duplicate && !shouldWidenOrderLevelClaim) {
-      return {
-        data: customerClaimReceipt(prepared.duplicate),
-        changed: false,
-        message: 'The existing open claim was returned safely.',
-      }
-    }
+    assert(
+      !prepared.duplicate || shouldWidenOrderLevelClaim,
+      'The claim request changed before it could be saved.',
+      'IDEMPOTENCY_CONFLICT',
+    )
 
-    return this.repository.update((state) => {
-      const {
-        user,
-        order,
-        note,
-        selectedShipment,
-        selectedBox,
-        shipmentCandidateIds,
-        duplicate,
-      } = this.prepareSubmission(state, input, now)
-      if (duplicate) {
-        assert(
+    try {
+      return this.repository.update((state) => {
+        const preparedInWrite = this.prepareSubmission(state, input, now)
+        if (preparedInWrite.exactReplay) {
+          throw new ExactClaimReplay(preparedInWrite.exactReplay)
+        }
+        const {
+          user,
+          order,
+          note,
+          selectedShipment,
+          selectedBox,
+          shipmentCandidateIds,
+          duplicate,
+        } = preparedInWrite
+        if (duplicate) {
+          assert(
           duplicate.shipmentCandidateIds &&
             shipmentCandidateIds &&
             canWidenClaimEvidence(duplicate.status),
@@ -429,7 +596,17 @@ export class ClaimService {
           ? `Suspected ${formatMYR(order.snapshot.valueFloorSen)} value-floor issue submitted for review; this is only a review threshold and eligibility does not establish a breach.`
           : 'Demo claim submitted for review.',
       }
-    })
+      })
+    } catch (caught) {
+      if (caught instanceof ExactClaimReplay) {
+        return {
+          data: customerClaimReceipt(caught.claim),
+          changed: false,
+          message: 'Exact claim replay returned the original result.',
+        }
+      }
+      throw caught
+    }
   }
 
   listMine() {
@@ -448,12 +625,26 @@ export class ClaimService {
     const order = state.orders.find((entry) => entry.id === orderId && entry.userId === user.id)
     assert(order, 'Order not found for this fictional account.', 'ORDER_MISSING')
     const now = this.now()
+    const boundary = {
+      at: now,
+      sequence: state.auditCount + 1,
+    }
     if (kind === 'value_floor') {
       return {
         boxes: state.boxes.filter((box) =>
           box.orderId === order.id &&
           box.ownerId === user.id &&
-          valueFloorClaimEligibility(box, now).eligible,
+          valueFloorClaimEligibility(box, now).eligible &&
+          (
+            state.claims.some((claim) =>
+              claim.orderId === order.id &&
+              claim.kind === kind &&
+              claim.boxId === box.id) ||
+            !state.claims.some((claim) =>
+              claim.orderId === order.id &&
+              claim.remedyBoxIds.includes(box.id) &&
+              claimHoldsRemedyEntitlementAt(state, claim, now))
+          ),
         ),
         shipments: [],
         orderLevelEligible: false,
@@ -461,18 +652,41 @@ export class ClaimService {
     }
     const everyBoxRevealed = everyOrderBoxRevealedAt(state, order.id, now)
     if (!everyBoxRevealed) {
+      const neutralReplay = state.claims.filter((claim) =>
+        claim.orderId === order.id &&
+        claim.kind === kind &&
+        claim.shipmentCandidateIds !== undefined)
       return {
         boxes: [],
         shipments: [],
-        orderLevelEligible: eligibleShipmentIds(state, order.id, kind, now).length > 0,
+        orderLevelEligible:
+          neutralReplay.length > 0 ||
+          availableClaimShipmentIdsAt(
+            state,
+            order.id,
+            kind,
+            boundary,
+          ).length > 0,
       }
     }
+    const availableShipmentIds = new Set(availableClaimShipmentIdsAt(
+      state,
+      order.id,
+      kind,
+      boundary,
+    ))
+    state.claims
+      .filter((claim) =>
+        claim.orderId === order.id &&
+        claim.kind === kind &&
+        claim.shipmentId !== undefined)
+      .forEach((claim) => availableShipmentIds.add(claim.shipmentId!))
     return {
       boxes: [],
       shipments: state.shipments.filter((shipment) =>
         shipment.orderId === order.id &&
-        shipmentClaimEligibility(shipment, kind, now).eligible,
-      ),
+        shipment.purpose === 'original' &&
+        availableShipmentIds.has(shipment.id)),
       orderLevelEligible: false,
     }
   }
@@ -714,6 +928,9 @@ export class ClaimService {
       let beforeState: ClaimRemedyState
       let beforeStatus: RmaStatus | null
       let afterState: ClaimRemedyState
+      let receivedOriginal:
+        | { id: string; beforeStatus: Shipment['status'] }
+        | undefined
       if (step === 'created') {
         const original = originalForClaim(state, claim)
         assert(
@@ -735,7 +952,7 @@ export class ClaimService {
           'That RMA reference is already in use.',
           'RMA_REFERENCE_REUSED',
         )
-        assertNoRemedyScopeConflict(state.claims, claim)
+        assertNoRemedyScopeConflict(state, claim)
         claim.rma = {
           reference,
           status: 'created',
@@ -754,6 +971,34 @@ export class ClaimService {
             'RMA receipt must follow RMA creation.',
             'RMA_ORDER_INVALID',
           )
+          const original = originalForClaim(state, claim)
+          assert(
+            original &&
+              original.kind !== 'DIGITAL' &&
+              ['delivered', 'returned'].includes(original.status),
+            'RMA receipt requires the linked physical original to be delivered or already returned.',
+            'RMA_RETURN_STATE_INVALID',
+          )
+          assert(
+            Date.parse(now) >= Date.parse(original.timeline.at(-1)!.at),
+            'RMA receipt cannot precede the latest original shipment evidence.',
+            'RMA_CHRONOLOGY_INVALID',
+          )
+          receivedOriginal = {
+            id: original.id,
+            beforeStatus: original.status,
+          }
+          if (original.status === 'delivered') {
+            const sequence = state.nextSequence
+            state.nextSequence += 1
+            original.status = 'returned'
+            original.timeline.push({
+              id: makeId('stl', `${original.id}:rma-returned:${now}:${sequence}`),
+              status: 'returned',
+              label: reason,
+              at: now,
+            })
+          }
           claim.rma.receivedAt = now
           claim.rma.receivedReason = reason
           claim.rma.status = 'received'
@@ -796,8 +1041,21 @@ export class ClaimService {
         reason,
         at: now,
         requestId: makeId('req', `${claim.id}:rma:${step}:${now}`),
-        before: { remedyState: beforeState, rmaStatus: beforeStatus },
+        before: receivedOriginal
+          ? {
+              originalShipmentId: receivedOriginal.id,
+              originalShipmentStatus: receivedOriginal.beforeStatus,
+              remedyState: beforeState,
+              rmaStatus: beforeStatus,
+            }
+          : { remedyState: beforeState, rmaStatus: beforeStatus },
         after: {
+          ...(receivedOriginal
+            ? {
+                originalShipmentId: receivedOriginal.id,
+                originalShipmentStatus: 'returned',
+              }
+            : {}),
           remedyState: afterState,
           rmaReference: reference,
           rmaStatus: step,
@@ -864,10 +1122,21 @@ export class ClaimService {
         'Replacement authorization requires one exact original shipment scope.',
         'REPLACEMENT_SCOPE_AMBIGUOUS',
       )
-      assertNoRemedyScopeConflict(state.claims, claim)
+      assertNoRemedyScopeConflict(state, claim)
       assertClaimOrderAllowsTypedRemedy(order)
       const original = originalForClaim(state, claim)
       assert(original, 'Replacement original shipment scope was not found.', 'REPLACEMENT_ORIGINAL_MISSING')
+      const originalWasDelivered = original.timeline.some((entry) =>
+        entry.status === 'delivered')
+      if (originalWasDelivered) {
+        assert(
+          claim.remedyState === 'rma_inspected' &&
+            claim.rma?.status === 'inspected' &&
+            original.status === 'returned',
+          'Record the completed return/RMA path and ensure the delivered original is returned before authorizing its replacement.',
+          POST_DELIVERY_REPLACEMENT_REQUIRES_RETURN_CODE,
+        )
+      }
       assert(
         !state.shipments.some((shipment) =>
           shipment.purpose === 'replacement' &&

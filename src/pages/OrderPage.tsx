@@ -121,13 +121,17 @@ export function OrderPage() {
                   <p>{claim.note}</p>
                   {everyBoxRevealed && claim.legacyUnderSettledRefund && (
                     <div className="notice notice-info">
-                      <b>Legacy refund record is read-only and incomplete</b>
-                      <p>Immutable under-settled evidence accepted <b>{formatMYR(claim.acceptedSettlementSen ?? 0)}</b> against required <b>{formatMYR(claim.requiredSettlementSen)}</b>. It does not complete the remedy scope, and no final audit is available.</p>
+                      <b>Preserved legacy refund history is read-only</b>
+                      <p>The final audited legacy resolution accepted <b>{formatMYR(claim.acceptedSettlementSen ?? 0)}</b> against required <b>{formatMYR(claim.requiredSettlementSen)}</b>. It permanently owns this claim scope; the under-settled amount alone does not mark delivery fulfilled.</p>
                     </div>
                   )}
                   {everyBoxRevealed && (
-                    <small className="breakable-id">
-                      Linked record: {claim.shipmentCandidateIds?.join(', ') ?? claim.shipmentId ?? claim.boxId ?? order.id}
+                    <small>
+                      Claim evidence: {claim.kind === 'value_floor'
+                        ? 'revealed box review'
+                        : claim.shipmentId
+                          ? 'selected delivery record'
+                          : 'private order-level delivery record'}
                     </small>
                   )}
                   {everyBoxRevealed && claim.status === 'resolved' && (

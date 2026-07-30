@@ -1,4 +1,4 @@
-import { AdminGate } from './components/AdminGate'
+import { lazy, Suspense } from 'react'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { Layout } from './components/Layout'
 import { HashRouter, ParamsProvider } from './lib/router'
@@ -14,17 +14,11 @@ import { OpenBoxPage } from './pages/OpenBoxPage'
 import { OrderPage } from './pages/OrderPage'
 import { PaymentReturnPage } from './pages/PaymentReturnPage'
 import { NotFoundPage, UnauthorizedPage } from './pages/SystemPages'
-import {
-  AdminAuditPage,
-  AdminClaimsPage,
-  AdminDashboardPage,
-  AdminFulfilmentPage,
-  AdminInventoryPage,
-  AdminLayout,
-  AdminOrdersPage,
-  AdminPaymentsPage,
-  AdminUsersPage,
-} from './pages/admin/AdminPages'
+
+const AdminRoutes = lazy(async () => {
+  const module = await import('./pages/admin/AdminRoutes')
+  return { default: module.AdminRoutes }
+})
 
 function match(pathname: string, pattern: RegExp, keys: string[]) {
   const result = pathname.match(pattern)
@@ -72,24 +66,20 @@ function CustomerRoutes({ pathname }: { pathname: string }) {
   return <ParamsProvider params={params}>{page}</ParamsProvider>
 }
 
-function AdminRoutes({ pathname }: { pathname: string }) {
-  let page: React.ReactNode
-  if (pathname === '/admin') page = <AdminDashboardPage />
-  else if (pathname === '/admin/users') page = <AdminUsersPage />
-  else if (pathname === '/admin/orders') page = <AdminOrdersPage />
-  else if (pathname === '/admin/payments') page = <AdminPaymentsPage />
-  else if (pathname === '/admin/inventory') page = <AdminInventoryPage />
-  else if (pathname === '/admin/fulfilment') page = <AdminFulfilmentPage />
-  else if (pathname === '/admin/claims') page = <AdminClaimsPage />
-  else if (pathname === '/admin/audit') page = <AdminAuditPage />
-  else page = <NotFoundPage />
-  return <AdminGate><AdminLayout>{page}</AdminLayout></AdminGate>
-}
-
 function AppRoutes() {
   const { pathname, search } = useLocation()
   const page = pathname === '/admin' || pathname.startsWith('/admin/')
-    ? <AdminRoutes pathname={pathname} />
+    ? (
+        <Suspense
+          fallback={(
+            <section className="panel" role="status" aria-live="polite">
+              Opening the admin demo…
+            </section>
+          )}
+        >
+          <AdminRoutes pathname={pathname} />
+        </Suspense>
+      )
     : <CustomerRoutes key={`${pathname}${search}`} pathname={pathname} />
   return <Layout>{page}</Layout>
 }

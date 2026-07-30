@@ -5,6 +5,7 @@ import type {
   Payment,
   PaymentEvent,
 } from './types'
+import { sameInstant } from './auditSequence'
 
 export const CLAIM_REFUND_LINK_ACTION = 'claim.refund_linked'
 
@@ -42,11 +43,12 @@ export function matchingAppliedPaymentRefundAudit(
   const priorEvents = payment.events.slice(0, eventIndex)
   const priorAccepted = priorEvents.filter((entry) => !entry.ignoredReason)
   const priorRefundedSen = priorEvents.reduce(
-    (sum, entry) => sum + (entry.refundIntent?.amountSen ?? 0),
+    (sum, entry) =>
+      sum + (entry.ignoredReason ? 0 : (entry.refundIntent?.amountSen ?? 0)),
     0,
   )
   const priorStatus = priorAccepted.at(-1)?.type
-  return state.audits.find((audit) => {
+  const matches = state.audits.filter((audit) => {
     const before = audit.before
     const after = audit.after
     return (
@@ -61,7 +63,8 @@ export function matchingAppliedPaymentRefundAudit(
       audit.targetType === 'payment' &&
       audit.targetId === payment.id &&
       audit.reason === intent.reason &&
-      audit.at === event.processedAt &&
+      sameInstant(event.createdAt, event.processedAt) &&
+      sameInstant(audit.at, event.processedAt) &&
       audit.requestId === event.requestId &&
       audit.eventId === event.id &&
       record(before) &&
@@ -76,6 +79,7 @@ export function matchingAppliedPaymentRefundAudit(
       after.claimId === claim.id
     )
   })
+  return matches.length === 1 ? matches[0] : undefined
 }
 
 export function matchingAppliedClaimRefundLinkAudit(
@@ -86,7 +90,7 @@ export function matchingAppliedClaimRefundLinkAudit(
 ): AuditEntry | undefined {
   const intent = event.refundIntent
   if (!intent) return undefined
-  return state.audits.find((audit) => {
+  const matches = state.audits.filter((audit) => {
     const before = audit.before
     const after = audit.after
     return (
@@ -96,7 +100,8 @@ export function matchingAppliedClaimRefundLinkAudit(
       audit.targetType === 'claim' &&
       audit.targetId === claim.id &&
       audit.reason === intent.reason &&
-      audit.at === event.processedAt &&
+      sameInstant(event.createdAt, event.processedAt) &&
+      sameInstant(audit.at, event.processedAt) &&
       audit.requestId === event.requestId &&
       audit.eventId === event.id &&
       record(before) &&
@@ -110,4 +115,5 @@ export function matchingAppliedClaimRefundLinkAudit(
       after.status === 'approved'
     )
   })
+  return matches.length === 1 ? matches[0] : undefined
 }

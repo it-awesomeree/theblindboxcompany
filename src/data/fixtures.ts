@@ -283,9 +283,8 @@ const series: PrizeSeries[] = [{
   publishedAt: at(10),
 }]
 
-const audits: AuditEntry[] = [{
+const seedAuditInputs: Array<Omit<AuditEntry, 'sequence' | 'previousId'>> = [{
   id: 'audit-seed-001',
-  sequence: 1,
   outcome: 'applied',
   actorId: 'system',
   actorRole: 'super_admin',
@@ -297,6 +296,60 @@ const audits: AuditEntry[] = [{
   requestId: 'req-seed-001',
   after: { boxes: boxes.length, orders: orders.length },
 }]
+
+for (const entry of shipments) {
+  entry.timeline.slice(1).forEach((timeline, index) => {
+    const previous = entry.timeline[index]
+    const orderStatus = orders.find((order) => order.id === entry.orderId)!.status
+    seedAuditInputs.push({
+      id: `audit-seed-${entry.id}-${index + 1}`,
+      outcome: 'applied',
+      actorId: 'system',
+      actorRole: 'super_admin',
+      action: 'shipment.transitioned',
+      targetType: 'shipment',
+      targetId: entry.id,
+      reason: timeline.label,
+      at: timeline.at,
+      before: { status: previous.status },
+      after: {
+        financialHoldPreserved: ['cancelled', 'refunded', 'disputed']
+          .includes(orderStatus),
+        orderStatus,
+        status: timeline.status,
+      },
+      requestId: `req-seed-${entry.id}-${index + 1}`,
+    })
+  })
+}
+
+const refundedOrder = orders.find((entry) => entry.id === 'ord-refunded')!
+seedAuditInputs.push({
+  id: 'audit-seed-payment-refunded',
+  outcome: 'applied',
+  actorId: 'system',
+  actorRole: 'super_admin',
+  action: 'payment.refunded',
+  targetType: 'payment',
+  targetId: refundedOrder.paymentIds[0],
+  reason: 'Seeded fictional full refund record',
+  at: refundedOrder.updatedAt,
+  before: { refundedSen: 0, status: 'succeeded' },
+  after: {
+    allocationsReturned: 0,
+    amountSen: refundedOrder.snapshot.totals.totalSen,
+    refundedSen: refundedOrder.snapshot.totals.totalSen,
+    status: 'refunded',
+  },
+  requestId: `req-${refundedOrder.id}-refund`,
+  eventId: `evt-${refundedOrder.id}-refund`,
+})
+
+const audits: AuditEntry[] = seedAuditInputs.map((audit, index) => ({
+  ...audit,
+  sequence: index + 1,
+  ...(index > 0 ? { previousId: seedAuditInputs[index - 1].id } : {}),
+}))
 
 export function createDemoState(): DemoState {
   return structuredClone({

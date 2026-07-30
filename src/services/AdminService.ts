@@ -154,7 +154,14 @@ export class AdminService {
       assert(!openClaims, 'Resolve or reject open claims before closing.', 'CLAIM_OPEN')
       order.status = transitionOrder(order.status, status)
       order.updatedAt = now
-      order.timeline.push({ id: makeId('tl', `${order.id}:${status}:${now}`), status, label: cleanReason, at: now })
+      const transitionSeed =
+        `${order.id}:${status}:${now}:${order.timeline.length}`
+      order.timeline.push({
+        id: makeId('tl', transitionSeed),
+        status,
+        label: cleanReason,
+        at: now,
+      })
       this.audit.append(state, {
         actorId: actor.id,
         actorRole: actor.role,
@@ -163,7 +170,7 @@ export class AdminService {
         targetId: order.id,
         reason: cleanReason,
         at: now,
-        requestId: makeId('req', `${order.id}:${status}:${now}`),
+        requestId: makeId('req', transitionSeed),
         before: { status: before },
         after: { status },
       })

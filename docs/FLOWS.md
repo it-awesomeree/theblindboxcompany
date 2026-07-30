@@ -7,9 +7,12 @@ bank login, CVV, real phone, or real street address. Nothing is sent to HitPay,
 Google, a courier, or an employee. A GitHub Pages screen is never treated as a
 trusted backend.
 
-The demo is also single-tab and local. Its `localStorage` repository cannot
-coordinate two tabs, browsers, devices or staff members. One-click roles and
-browser-visible prize definitions exist only to make review easy.
+The demo is browser-local and permits only one active tab at a time. Two tabs
+are coordinated through an exclusive Web Lock: the second tab has no shop or
+admin actions while it waits, then takes authority automatically after the
+active tab closes. This handoff does not coordinate different browsers,
+devices or real staff members. One-click roles and browser-visible prize
+definitions exist only to make review easy.
 
 ## Customer purchase
 
@@ -51,6 +54,25 @@ Only one new idempotent mock webhook/event may move the order to paid.
 Duplicates are ignored. A second distinct success event on an old or different
 attempt is recorded as ignored and cannot change payment, inventory, boxes,
 allocations, audit or fulfilment twice.
+
+Protected finance events validate their reason before checking for a duplicate.
+The reason must already be safe normalized text no longer than 240 characters;
+unsafe markup, extra normalization or truncation is rejected. An accepted
+dispute or dispute resolution/refund keeps its canonical reason in the exact
+immutable audit (and in the refund intent when money moves). A current ignored
+event also stores its canonical submitted reason, route, effective prior status,
+ignored outcome/reason and related payment when applicable, all bound to one
+immutable ignored audit. An exact accepted or fully evidenced ignored replay is
+a write-free read with the original stored result. Changing its payment, type,
+source, route, request ID or reason is an idempotency conflict, including when
+another transaction stored the event first. A generic ignored event cannot
+masquerade as a dispute or dispute resolution/refund. A dispute-resolution ID
+is valid only when its immutable immediate prior accepted status is `disputed`;
+a generic or claim-refund request is valid only after `succeeded` or
+`partially_refunded`. A fresh dispute-resolution ID still requires a currently
+disputed payment. Exact migrated v8 ignored events retain explicit immutable
+non-replayable migration evidence when the old writer did not preserve their
+submitted reason and route; the demo never guesses those missing inputs.
 
 On the first accepted success only:
 
@@ -97,22 +119,44 @@ A partial goodwill refund is a separate, unlinked finance adjustment and is
 permitted while the payment is safely refundable. It does not consume a box
 remedy entitlement, satisfy a claim settlement or finalize any claim. A generic
 full-payment refund, including a refund that ends a dispute, must coordinate
-with every open claim and every claim that still holds a remedy entitlement.
-The demo blocks the full refund if it would orphan an RMA or replacement,
-duplicate a refund remedy, or bypass a required claim link and audit. A full
-refund moves the order to `refunded` only when those checks allow it.
+with every claim on the order. Open claims, RMA work, linked-but-unfinalized
+refunds, undelivered replacements and malformed terminal evidence block it. An
+exact audited completed modern claim refund or delivered replacement
+permanently keeps its remedy entitlement and evidence, but no longer blocks a
+later unlinked payment-level refund of the remaining balance. The same narrow
+exception applies to an exactly preserved migrated legacy under-settled refund:
+it must be resolved as `refund_completed`/`refund_recorded`, reference its one
+accepted same-order refund event, retain its legacy marker with no settlement
+policy, accept a positive amount below the requirement, and match the exact
+payment-refund, claim-link and final resolution audits/history. Malformed legacy
+history fails closed. The admin record and confirmation warn that a later
+refund may compensate the customer again. The later event never links to, edits
+or removes the completed claim, legacy history or replacement. A full refund
+moves the order to `refunded` only when those checks allow it.
+
+Every accepted refund intent binds to exactly one matching audit. Generic and
+dispute-origin refunds record the exact action, payment, prior status and
+refunded total, resulting status and refunded total, amount, zero returned
+allocations, reason, request/event IDs and event time. Dispute refunds also bind
+the refunded order status. When earlier completed modern or exact preserved
+legacy claims exist on that order, the audit includes their exact sorted,
+unique IDs; the field is omitted when the set is empty. Ignored events may
+never carry a refund intent, and only accepted intents contribute to
+`refundedSen`.
 
 An assigned prize is never rerolled or returned to the series. A revealed box
 keeps its immutable result. An unopened refunded box is held, not reallocated.
 The same financial-stop helper cancels only unshipped fulfilment records and
 keeps shipped/delivered history intact. A refunded or disputed order remains
 financially stopped and unopened boxes stay on hold, but an already-shipped
-record may still receive legal real-world carrier outcomes such as delivered,
-failed delivery, lost or returned. This does not reopen fulfilment, and tracking
-details remain locked. A disputed order can resume eligible held work only
-through an explicit protected resolution. That resolution restarts only
-shipments stopped by that dispute, preserves any earlier partial refund, and
-restores the prior coherent order state (including `closed`).
+**original physical carrier record** may still receive legal real-world
+carrier outcomes such as delivered, failed delivery, lost or returned. This
+exception does not apply to digital delivery, replacement work or an unshipped
+original. It does not reopen fulfilment, and tracking details remain locked. A
+disputed order can resume eligible held work only through an explicit protected
+resolution. That resolution restarts only shipments stopped by that dispute,
+preserves any earlier partial refund, and restores the prior coherent order
+state (including `closed`).
 
 ## Fulfilment and tracking
 
@@ -139,6 +183,22 @@ may enter a clearly fictional carrier and `DEMO-` tracking code. The service
 validates uniqueness and demo-only format, locks the fields after shipping, and
 records confirmed before/after values in audit.
 
+Account’s in-transit number uses the actionable-shipment policy. A sent/shipped
+original stops counting when an exact authorized overlapping reissue is active
+or delivered. The authorized sent/shipped reissue counts instead. If that
+reissue is physical and becomes terminal lost or returned, the still
+sent/shipped physical original is actionable again. Failed or cancelled
+reissues do not reactivate an original, and a digital original never reactivates
+after any exact authorized reissue.
+
+A late delivery on an original physical shipment is allowed after replacement
+authorization only when every authorized replacement overlapping that box
+scope is physical and currently terminal `lost` or `returned`. Any active,
+delivered or digital reissue blocks it. The late carrier fact never changes the
+claim, remedy or payment, and a cancelled/refunded/disputed financial hold
+stays held. The validator still permits only one effective delivered shipment
+per box and requires the exact late transition audit.
+
 ## Claims
 
 Customers can create fake damage, non-delivery or value-floor claims. Notes are
@@ -154,13 +214,37 @@ be entered.
 - Value-floor review must link that exact already revealed box.
 - Delivery claims do not require every prize to be revealed. Before all boxes
   are revealed, the customer sees exactly one generic order-delivery option.
-  Submission stores the complete sorted set of eligible physical shipment IDs
-  at that moment, with no arbitrary exact shipment link. The customer never
-  sees that set, split count, IDs, carrier, kind, flags, prize or per-split
-  status; authorized claim staff may inspect the internal evidence. Exact
-  shipment selection becomes available only after every box is revealed.
+  Submission stores the complete sorted set of available eligible original
+  shipment IDs at that moment: delivered physical evidence for damage, or
+  eligible failed/overdue physical or digital evidence for non-delivery. It
+  never chooses an arbitrary exact shipment link. A whole delivery shipment is
+  unavailable if any box in it was already covered by a remedy entitlement at
+  that evidence time; this model never partly settles one shipment. The
+  customer never sees that set, split count, IDs, carrier, kind, flags, prize
+  or per-split status; authorized claim staff may inspect the internal evidence.
+  Exact shipment selection becomes available only after every box is revealed.
 - Repeating the same open claim returns the existing claim with no repository
-  revision, storage write, listener, audit or timestamp change.
+  revision, storage write, listener, audit or timestamp change. This exact
+  replay check happens before current remedy availability for an exact
+  shipment, value-floor box, or the sole neutral order-level claim, so it still
+  works after that claim starts or resolves a remedy. The kind, scope, note and
+  evidence must be identical; changing the note/evidence is an idempotency
+  conflict. Submitted or reviewing neutral claims may widen when new available
+  evidence appears. Evidence already reserved or remediated by an earlier claim
+  is excluded, so a later disjoint failed shipment can create a second claim
+  instead of being trapped in the first scope. Eligibility UI keeps only the
+  replay option and never exposes neutral candidate IDs.
+
+Shipment history is ordered by parsed UTC instant and then immutable audit
+sequence when instants are equal. Every ordinary shipment transition,
+financial stop/resume transition, and the original return atomically recorded
+by RMA receipt must map to its exact audit. Claim submission and each neutral
+widening use the sequence of the audit that established that evidence set.
+Canonical widening audits and same-status customer history rows are paired
+one-to-one in deterministic order, including when two widenings share the same
+timestamp; extra, missing or retimed rows fail validation. Equivalent ISO
+precision (for example `.000Z` and `Z`) compares as the same instant, while a
+later audit at that instant cannot rewrite an earlier claim.
 
 Support/admin review requires a note for acknowledge, approve, reject and
 the final claim audit. Approval opens a typed remedy path; it does not itself
@@ -171,12 +255,20 @@ different kinds.
 The guarded remedy paths are:
 
 - RMA created → received → inspected remains approved/open throughout and keeps
-  the box entitlement. Inspection is evidence for the next decision, not a
-  resolution.
+  the box entitlement. Recording RMA received atomically marks a still-delivered
+  linked original as returned, with shipment timeline and claim audit evidence;
+  an already-returned original is a safe replay path. Inspection is evidence
+  for the next decision, not a resolution.
 - Replacement authorization creates linked fulfilment work but remains
   approved/open and keeps the entitlement until that exact replacement is
-  delivered. Delivery records the final resolution. A terminal digital failure
-  or terminal physical loss/return can instead open a linked refund fallback.
+  delivered. A physical damage or post-delivery value-floor replacement cannot
+  be authorized until its return/RMA is received, inspected and the original is
+  returned. Direct replacement remains available for genuine non-delivery,
+  digital failure and other originals that were not already delivered.
+  Delivery records the final resolution, and one box can still have only one
+  effective delivered original/replacement shipment. A terminal digital
+  failure or terminal physical loss/return can instead open a linked refund
+  fallback.
 - An ordinary linked refund must equal the snapshotted required settlement. A
   terminal replacement fallback is exactly the smaller of the required claim
   settlement and the selected payment’s remaining refundable balance; it never
@@ -189,8 +281,11 @@ The guarded remedy paths are:
 
 Every step appends customer-visible history and protected audit evidence. A
 claim never creates a refund implicitly; refund remains a separate finance
-action. Legacy under-settled refund evidence is immutable and incomplete. It
-cannot be changed, upgraded or used to finalize the claim’s box scope.
+action. Exact preserved legacy under-settled history is immutable, permanently
+owns its remedy scope and remains ineligible to mark delivery fulfilled. It
+cannot be changed or upgraded. Its exact final history permits only the
+payment’s remaining balance to be refunded later through a separate unlinked
+refund or customer-won dispute.
 
 ## Admin
 
@@ -272,4 +367,18 @@ order/payment/box/shipment/claim links before a write is accepted. The stronger
 order checks also enforce the fixed RM100 unit price, fixed shipping schedule,
 integer quantity from 1–10, exact published odds and policy versions, matching
 box count, and coherent assignment/reveal time and reveal-state combinations.
-Malformed current-schema storage is replaced by these deterministic fixtures.
+Malformed current-schema storage enters protected recovery without overwriting
+its original bytes. The current schema is version 9. The v5/v6/v7 path first
+produces version 8. Before the explicit v8-to-v9 migration changes a cloned
+candidate, read-only preflights reject malformed disputed-resolution, RMA
+receipt, direct post-delivery replacement and ignored-payment history and
+collision-check every synthetic identity. An exact old RMA receipt preserves
+the v8 audit prefix and gains a deterministic returned-original timeline plus
+rich receipt evidence. An exact old direct post-delivery replacement gains an
+explicit migration-only marker and audit without inventing an RMA. The frozen
+version 8 rule that one box cannot be effectively delivered twice is rechecked;
+impossible original-plus-replacement dual delivery fails closed rather than
+gaining a migration exception. Exact old ignored events that lack submitted
+reason/route evidence remain non-replayable. Only after these checks may the
+clone receive deterministic migration and missing transition/refund evidence.
+Failed recovery leaves the source object and exact raw older bytes untouched.

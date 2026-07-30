@@ -56,6 +56,11 @@ export type FulfilmentKind = 'PARCEL' | 'BULKY' | 'DIGITAL' | 'SELF_COLLECT'
 export type ShipmentPurpose = 'original' | 'replacement'
 export type ShippingMethod = 'standard' | 'priority' | 'self_collect'
 export type PaymentMethod = 'FPX' | 'DUITNOW' | 'CARD' | 'GRABPAY' | 'TNG'
+export type PaymentEventRoute = 'generic' | 'dispute' | 'dispute_resolution'
+export type IgnoredPaymentEventOutcome =
+  | 'other_payment_captured'
+  | 'other_payment_active'
+  | 'out_of_order'
 
 export interface User {
   id: string
@@ -167,6 +172,11 @@ export interface PaymentEvent {
   createdAt: string
   processedAt: string
   ignoredReason?: string
+  ignoredOutcome?: IgnoredPaymentEventOutcome
+  ignoredPriorStatus?: PaymentStatus
+  ignoredRelatedPaymentId?: string
+  ignoredRoute?: PaymentEventRoute
+  ignoredInputReason?: string
   refundIntent?: {
     paymentId: string
     amountSen: number
@@ -267,6 +277,13 @@ export interface ReplacementAuthorizationEvidence {
   reason: string
 }
 
+export interface LegacyDirectPostDeliveryReplacementEvidence {
+  originalShipmentId: string
+  originalStatusAtMigration: Extract<ShipmentStatus, 'delivered' | 'returned'>
+  replacementShipmentId: string
+  replacementStatusAtMigration: ShipmentStatus
+}
+
 export interface ClaimHistoryEntry {
   id: string
   status: ClaimStatus
@@ -296,6 +313,7 @@ export interface Claim {
   rma?: ClaimRmaEvidence
   replacementShipmentId?: string
   replacementAuthorization?: ReplacementAuthorizationEvidence
+  legacyDirectPostDeliveryReplacement?: LegacyDirectPostDeliveryReplacementEvidence
   legacyTypedResolution?: true
   createdAt: string
   updatedAt: string
@@ -326,7 +344,7 @@ export interface AuditEntry {
 }
 
 export interface DemoState {
-  schemaVersion: 8
+  schemaVersion: 9
   revision: number
   nextSequence: number
   auditCount: number

@@ -9,6 +9,7 @@ import { AppStateProvider } from '../src/state/AppState'
 import {
   MemoryStorage,
   FIXED_NOW,
+  incrementingClock,
   makeProcessingOrderSingleGroupedPhysicalShipment,
   makeProcessingOrderTwoPhysicalShipments,
 } from './helpers'
@@ -158,7 +159,7 @@ describe('app components', () => {
     window.history.replaceState({}, '', `#${route}?user=usr-admin&email=admin%40demo.local`)
     render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
 
-    const heading = screen.getByRole('heading', { level: 1 })
+    const heading = await screen.findByRole('heading', { level: 1 })
     expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1)
     expect(heading).toBeVisible()
     await waitFor(() => {
@@ -1065,6 +1066,143 @@ describe('app components', () => {
     expect(within(revealedRecord).getByText(/tng reload/i)).toBeVisible()
   })
 
+  it('removes a superseded shipped original from Account transit after its authorized reissue arrives', () => {
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    services.auth.oneClick('customer')
+    const claim = services.claims.submit({
+      orderId: 'ord-shipped',
+      kind: 'non_delivery',
+      shipmentId: 'shp-shipped',
+      note: 'DEMO Account superseded original transit evidence',
+    }).data
+    services.auth.oneClick('admin')
+    services.claims.review(
+      claim.id,
+      'acknowledge',
+      'Confirmed Account superseded transit acknowledgement',
+    )
+    services.claims.review(
+      claim.id,
+      'approve',
+      'Confirmed Account superseded transit approval',
+    )
+    const replacement = services.claims.authorizeReplacement(
+      claim.id,
+      'Confirmed Account superseded transit replacement',
+    ).data
+    for (const status of [
+      'picking',
+      'packed',
+      'label_created',
+      'shipped',
+      'delivered',
+    ] as const) {
+      services.fulfilment.advance(
+        replacement.id,
+        status,
+        `Confirmed Account replacement ${status}`,
+      )
+    }
+    services.auth.oneClick('customer')
+    window.history.replaceState({}, '', '#/account')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+
+    const transitMetric = screen.getByText('IN TRANSIT').closest('article')!
+    expect(within(transitMetric).getByText('0')).toBeVisible()
+  })
+
+  it('does not count or offer delivery for a sent digital original after its authorized digital reissue fails', () => {
+    let now = FIXED_NOW
+    const services = new AppServices(new MemoryStorage(), () => now)
+    services.auth.oneClick('customer')
+    services.openBox('box-processing-02')
+    services.auth.oneClick('admin')
+    services.fulfilment.advance(
+      'shp-digital',
+      'issued',
+      'Confirmed UI digital original issued',
+    )
+    services.fulfilment.advance(
+      'shp-digital',
+      'sent',
+      'Confirmed UI digital original sent',
+    )
+    now = '2026-08-01T04:00:00.000Z'
+    services.auth.oneClick('customer')
+    const claim = services.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'non_delivery',
+      shipmentId: 'shp-digital',
+      note: 'DEMO UI failed digital reissue entitlement',
+    }).data
+    services.auth.oneClick('admin')
+    services.claims.review(
+      claim.id,
+      'acknowledge',
+      'Confirmed UI digital reissue acknowledgement',
+    )
+    services.claims.review(
+      claim.id,
+      'approve',
+      'Confirmed UI digital reissue approval',
+    )
+    const replacement = services.claims.authorizeReplacement(
+      claim.id,
+      'Confirmed UI digital reissue authorization',
+    ).data
+    for (const status of ['issued', 'sent', 'failed'] as const) {
+      services.fulfilment.advance(
+        replacement.id,
+        status,
+        `Confirmed UI digital reissue ${status}`,
+      )
+    }
+
+    services.auth.oneClick('customer')
+    window.history.replaceState({}, '', '#/account')
+    const accountView = render(
+      <AppStateProvider providedServices={services}><App /></AppStateProvider>,
+    )
+    const transitMetric = screen.getByText('IN TRANSIT').closest('article')!
+    expect(within(transitMetric).getByText('1')).toBeVisible()
+
+    accountView.unmount()
+    services.auth.oneClick('admin')
+    window.history.replaceState({}, '', '#/admin/fulfilment')
+    render(
+      <AppStateProvider providedServices={services}><App /></AppStateProvider>,
+    )
+    const originalCard = screen.getByText('DIGITAL / shp-digital')
+      .closest('article')!
+    expect(within(originalCard).queryByRole('button', {
+      name: 'Mark delivered',
+    })).not.toBeInTheDocument()
+  })
+
+  it('shows a failed digital shipment in the Admin priority queue counted by the dashboard', () => {
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    services.auth.oneClick('admin')
+    for (const status of ['issued', 'sent', 'failed'] as const) {
+      services.fulfilment.advance(
+        'shp-digital',
+        status,
+        `Confirmed Admin failed digital queue ${status}`,
+      )
+    }
+    window.history.replaceState({}, '', '#/admin')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+
+    const queueLink = screen.getByText('DEMO-DIGITAL').closest('a')!
+    expect(queueLink).toBeVisible()
+    expect(within(queueLink).getByText('Failed')).toBeVisible()
+    const metrics = services.admin.dashboard()
+    expect(metrics.fulfilmentExceptions).toBe(2)
+    const exceptions = screen.getByText('EXCEPTIONS').closest('article')!
+    expect(within(exceptions).getByText(
+      String(metrics.paymentExceptions + metrics.fulfilmentExceptions),
+    )).toBeVisible()
+  })
+
   it('separates a captured dispute from pending payment on the return page', () => {
     const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
     services.auth.oneClick('admin')
@@ -1311,7 +1449,7 @@ describe('app components', () => {
 
   it('limits an approved cross-kind conflict to no-remedy while its entitlement holder keeps progressing', async () => {
     const user = userEvent.setup()
-    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    const services = new AppServices(new MemoryStorage(), incrementingClock())
     const { conflicting, holder } = makeApprovedCrossKindRemedyConflict(services)
     window.history.replaceState({}, '', '#/admin/claims')
     render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
@@ -1535,6 +1673,137 @@ describe('app components', () => {
       )).not.toBeInTheDocument()
     },
   )
+
+  it('warns in the payment record and confirmation before an additional refund after completed remedy evidence', async () => {
+    const user = userEvent.setup()
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    makeProcessingOrderSingleGroupedPhysicalShipment(services)
+    services.auth.oneClick('customer')
+    services.openBox('box-processing-02')
+    const claim = services.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'value_floor',
+      boxId: 'box-processing-01',
+      note: 'DEMO completed remedy warning before additional payment refund',
+    }).data
+    services.auth.oneClick('admin')
+    services.claims.review(
+      claim.id,
+      'acknowledge',
+      'Confirmed completed remedy warning acknowledgement',
+    )
+    services.claims.review(
+      claim.id,
+      'approve',
+      'Confirmed completed remedy warning approval',
+    )
+    services.payments.refund(
+      'pay-processing',
+      claim.requiredSettlementSen,
+      'Confirmed linked remedy before additional payment refund warning',
+      'req-linked-remedy-before-warning',
+      claim.id,
+    )
+    const eventId = services.repository.getSnapshot().claims
+      .find((entry) => entry.id === claim.id)!.linkedRefundEventId!
+    services.claims.review(
+      claim.id,
+      'resolve',
+      'Confirmed completed remedy before additional payment refund warning',
+      { outcome: 'refund_recorded', reference: eventId },
+    )
+
+    window.history.replaceState({}, '', '#/admin/payments?order=ord-processing')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+    const paymentRecord = screen
+      .getByText('pay-processing', { selector: 'summary b' })
+      .closest('details')!
+    await user.click(paymentRecord.querySelector('summary')!)
+    const warning = within(paymentRecord)
+      .getByText('Completed claim remedy evidence remains')
+      .closest('.notice')!
+    expect(warning).toHaveTextContent(claim.id)
+    expect(warning).toHaveTextContent(
+      /additional unlinked payment-level refund may compensate this customer again/i,
+    )
+
+    await user.click(within(paymentRecord).getByRole('button', {
+      name: /unlinked refund remaining rm\s*106\.00/i,
+    }))
+    const confirmation = screen.getByRole('dialog', {
+      name: /confirm remaining refund/i,
+    })
+    expect(confirmation).toHaveTextContent(claim.id)
+    expect(confirmation).toHaveTextContent(
+      /completed remedy evidence.+stays byte-for-byte preserved/i,
+    )
+    expect(confirmation).toHaveTextContent(
+      /warning: this may compensate the customer again/i,
+    )
+    await user.click(within(confirmation).getByRole('button', { name: /go back/i }))
+  })
+
+  it('does not show a preservation warning for forged completed-remedy history', async () => {
+    const user = userEvent.setup()
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    makeProcessingOrderSingleGroupedPhysicalShipment(services)
+    services.auth.oneClick('customer')
+    services.openBox('box-processing-02')
+    const claim = services.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'value_floor',
+      boxId: 'box-processing-01',
+      note: 'DEMO forged completed-remedy warning evidence',
+    }).data
+    services.auth.oneClick('admin')
+    services.claims.review(
+      claim.id,
+      'acknowledge',
+      'Confirmed forged warning acknowledgement',
+    )
+    services.claims.review(
+      claim.id,
+      'approve',
+      'Confirmed forged warning approval',
+    )
+    services.payments.refund(
+      'pay-processing',
+      claim.requiredSettlementSen,
+      'Confirmed linked refund before forged warning',
+      'req-linked-refund-before-forged-warning',
+      claim.id,
+    )
+    const eventId = services.repository.getSnapshot().claims
+      .find((entry) => entry.id === claim.id)!.linkedRefundEventId!
+    services.claims.review(
+      claim.id,
+      'resolve',
+      'Confirmed resolution before forged warning',
+      { outcome: 'refund_recorded', reference: eventId },
+    )
+    const forged = services.repository.exportForTest()
+    forged.audits = forged.audits.filter((audit) =>
+      !(
+        audit.action === 'claim.resolve' &&
+        audit.targetId === claim.id
+      ))
+    vi.spyOn(services.repository, 'getSnapshot').mockReturnValue(forged)
+    vi.spyOn(services.repository, 'getServerSnapshot').mockReturnValue(forged)
+
+    window.history.replaceState({}, '', '#/admin/payments?order=ord-processing')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+    const paymentRecord = screen
+      .getByText('pay-processing', { selector: 'summary b' })
+      .closest('details')!
+    await user.click(paymentRecord.querySelector('summary')!)
+
+    expect(within(paymentRecord).queryByText(
+      'Completed claim remedy evidence remains',
+    )).not.toBeInTheDocument()
+    expect(within(paymentRecord).queryByText(
+      new RegExp(`Review preserved claim ${claim.id}`, 'i'),
+    )).not.toBeInTheDocument()
+  })
 
   it('records an exact full claim-linked refund, then finalizes the exact event separately', async () => {
     const user = userEvent.setup()
@@ -2106,7 +2375,7 @@ describe('app components', () => {
     expect(within(paymentRecord).getByRole('button', { name: /mark disputed/i })).toBeVisible()
   })
 
-  it('renders migrated legacy under-settled evidence without claiming remedy completion', async () => {
+  it('renders exact preserved legacy history as a scope owner without claiming fulfilment completion', async () => {
     const user = userEvent.setup()
     const sourceServices = new AppServices(new MemoryStorage(), () => FIXED_NOW)
     makeProcessingOrderSingleGroupedPhysicalShipment(sourceServices)
@@ -2130,6 +2399,12 @@ describe('app components', () => {
     )
     const linkedEventId = sourceServices.repository.getSnapshot().claims
       .find((entry) => entry.id === claim.id)!.linkedRefundEventId!
+    sourceServices.claims.review(
+      claim.id,
+      'resolve',
+      'Confirmed exact legacy UI refund resolution evidence',
+      { outcome: 'refund_recorded', reference: linkedEventId },
+    )
 
     const legacy = structuredClone(sourceServices.repository.exportForTest()) as unknown as Omit<
       DemoState,
@@ -2171,18 +2446,19 @@ describe('app components', () => {
       'Immutable legacy under-settled refund evidence',
     ).closest('p')!
     expect(legacyEvidence).toHaveTextContent(/accepted rm\s*10\.00.+required rm\s*106\.00/i)
-    expect(legacyEvidence).toHaveTextContent(/does not complete this delivery\/remedy scope/i)
-    expect(legacyEvidence).toHaveTextContent(/no valid completion settlement policy/i)
+    expect(legacyEvidence).toHaveTextContent(/permanently owns this claim scope/i)
+    expect(legacyEvidence).toHaveTextContent(/does not mark delivery fulfilled/i)
+    expect(legacyEvidence).toHaveTextContent(/preserved legacy record.+no modern settlement policy/i)
     expect(screen.queryByText(/audited refund complete/i)).not.toBeInTheDocument()
     expect(screen.queryByText('Refund Linked', { exact: true })).not.toBeInTheDocument()
     expect(screen.queryByText(/waiting for final claim audit|final claim audit pending/i))
       .not.toBeInTheDocument()
     const orderTruth = screen.getByText(
-      'Legacy refund record is read-only and incomplete',
+      'Preserved legacy refund history is read-only',
     ).closest('.notice')!
-    expect(orderTruth).toHaveTextContent(/immutable under-settled evidence/i)
-    expect(orderTruth).toHaveTextContent(/does not complete the remedy scope/i)
-    expect(orderTruth).toHaveTextContent(/no final audit is available/i)
+    expect(orderTruth).toHaveTextContent(/final audited legacy resolution/i)
+    expect(orderTruth).toHaveTextContent(/permanently owns this claim scope/i)
+    expect(orderTruth).toHaveTextContent(/does not mark delivery fulfilled/i)
     expect(screen.getByText(/0 of 2 box fulfilment scopes complete/i)).toBeVisible()
 
     cleanup()
@@ -2198,12 +2474,12 @@ describe('app components', () => {
       /waiting for final claim audit|final claim audit pending/i,
     )).not.toBeInTheDocument()
     const accountTruth = within(accountOrder).getByText(
-      'Legacy refund record is read-only and incomplete',
+      'Preserved legacy refund history is read-only',
     ).closest('.notice')!
-    expect(accountTruth).toHaveTextContent(/immutable under-settled evidence/i)
+    expect(accountTruth).toHaveTextContent(/final audited legacy resolution/i)
     expect(accountTruth).toHaveTextContent(/accepted rm\s*10\.00.+required rm\s*106\.00/i)
-    expect(accountTruth).toHaveTextContent(/does not complete the remedy scope/i)
-    expect(accountTruth).toHaveTextContent(/no final audit is available/i)
+    expect(accountTruth).toHaveTextContent(/permanently owns this claim scope/i)
+    expect(accountTruth).toHaveTextContent(/does not mark delivery fulfilled/i)
 
     cleanup()
     services.auth.oneClick('admin')
@@ -2213,12 +2489,54 @@ describe('app components', () => {
       .getByText('pay-processing', { selector: 'summary b' })
       .closest('details')!
     await user.click(paymentRecord.querySelector('summary')!)
+    const preservedWarning = within(paymentRecord)
+      .getByText('Completed claim remedy evidence remains')
+      .closest('.notice')!
+    expect(preservedWarning).toHaveTextContent(
+      `Review preserved claim ${claim.id}`,
+    )
     expect(within(paymentRecord).getByRole('button', {
-      name: /unlinked refund remaining rm\s*202\.00/i,
+      name: /unlinked refund remaining/i,
     })).toBeVisible()
-    expect(within(paymentRecord).queryByText(
-      'Full payment refund is coordinated through claim remedies',
-    )).not.toBeInTheDocument()
+    await user.click(within(paymentRecord).getByRole('button', {
+      name: /unlinked refund remaining/i,
+    }))
+    const remainingConfirmation = screen.getByRole('dialog', {
+      name: /confirm remaining refund/i,
+    })
+    expect(remainingConfirmation).toHaveTextContent(claim.id)
+    expect(remainingConfirmation).toHaveTextContent(
+      /warning: this may compensate the customer again/i,
+    )
+    await user.click(within(remainingConfirmation).getByRole('button', {
+      name: /go back/i,
+    }))
+
+    await user.click(within(paymentRecord).getByRole('button', {
+      name: /mark disputed/i,
+    }))
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', {
+      name: /confirm and audit/i,
+    }))
+    await user.click(within(paymentRecord).getByRole('button', {
+      name: /resolve: full refund/i,
+    }))
+    const disputeConfirmation = screen.getByRole('dialog', {
+      name: /confirm dispute_refund payment action/i,
+    })
+    expect(disputeConfirmation).toHaveTextContent(claim.id)
+    expect(disputeConfirmation).toHaveTextContent(
+      /customer-won dispute refund will preserve completed remedy evidence/i,
+    )
+    await user.click(within(disputeConfirmation).getByRole('button', {
+      name: /go back/i,
+    }))
+    services.payments.resolveDispute(
+      'pay-processing',
+      'merchant_won',
+      'Confirmed merchant win after legacy warning review',
+      'evt-legacy-warning-review-merchant-win',
+    )
 
     cleanup()
     window.history.replaceState({}, '', '#/admin/orders')
@@ -2228,26 +2546,41 @@ describe('app components', () => {
       .closest('details')!
     await user.click(adminOrder.querySelector('summary')!)
     expect(within(adminOrder).getByText(
-      'Legacy under-settled · scope incomplete',
+      'Legacy under-settled · preserved scope owner',
     )).toBeVisible()
     expect(within(adminOrder).queryByText('Refund Linked', { exact: true }))
       .not.toBeInTheDocument()
 
     cleanup()
     services.auth.oneClick('admin')
-    services.payments.refund(
+    const beforeRefund = structuredClone(services.repository.getSnapshot())
+    const legacyClaimBefore = structuredClone(
+      beforeRefund.claims.find((entry) => entry.id === claim.id),
+    )
+    expect(services.payments.refund(
       'pay-processing',
       20_200,
-      'Confirmed later full refund without rewriting immutable legacy evidence',
+      'Confirmed later remaining refund with immutable legacy evidence',
       'req-legacy-ui-later-full-refund',
-    )
+    )).toMatchObject({
+      changed: true,
+      payment: { refundedSen: 21_200, status: 'refunded' },
+    })
+    const afterRefund = services.repository.getSnapshot()
+    expect(afterRefund.claims.find((entry) => entry.id === claim.id))
+      .toEqual(legacyClaimBefore)
+    expect(afterRefund.audits.at(-1)?.after).toMatchObject({
+      amountSen: 20_200,
+      preservedCompletedClaimIds: [claim.id],
+      refundedSen: 21_200,
+    })
     expect(services.repository.getSnapshot().orders
       .find((entry) => entry.id === claim.orderId)?.status).toBe('refunded')
     window.history.replaceState({}, '', `#/admin/claims?claim=${encodeURIComponent(claim.id)}`)
     render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
     const legacyRecord = screen.getByText(claim.id, { selector: 'summary b' }).closest('details')!
-    expect(legacyRecord).toHaveTextContent(/approved legacy claim · immutable evidence cannot finalize/i)
-    expect(legacyRecord).toHaveTextContent(/no final audit is available/i)
+    expect(legacyRecord).toHaveTextContent(/immutable legacy resolution record · not remedy completion/i)
+    expect(legacyRecord).toHaveTextContent(/exact final history permanently owns the remedy scope/i)
     expect(within(legacyRecord).queryByText(
       'Financial hold limits typed remedy work',
     )).not.toBeInTheDocument()
@@ -2339,7 +2672,7 @@ describe('app components', () => {
 
   it('records created, received and inspected RMA evidence while the claim stays approved', async () => {
     const user = userEvent.setup()
-    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    const services = new AppServices(new MemoryStorage(), incrementingClock())
     services.auth.oneClick('customer')
     const claim = services.claims.submit({
       orderId: 'ord-delivered',
@@ -2354,6 +2687,18 @@ describe('app components', () => {
     render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
 
     const record = screen.getByText(claim.id).closest('details')!
+    const returnGuidance = within(record)
+      .getByText('Return / RMA required before replacement')
+      .closest<HTMLElement>('.notice')!
+    expect(returnGuidance).toHaveTextContent(
+      /record rma received and inspected.+marks a still-delivered linked original as returned/i,
+    )
+    expect(within(returnGuidance).getByRole('link', {
+      name: /open linked original return record/i,
+    })).toHaveAttribute(
+      'href',
+      expect.stringContaining('shipment=shp-delivered'),
+    )
     for (const [choice, expectedState] of [
       [/create physical return \/ rma/i, 'rma_created'],
       [/record rma received/i, 'rma_received'],
@@ -2368,6 +2713,19 @@ describe('app components', () => {
       expect(current.status).toBe('approved')
       expect(current.remedyState).toBe(expectedState)
     }
+
+    await user.click(within(record).getByRole('button', {
+      name: /record typed remedy/i,
+    }))
+    const replacementDialog = screen.getByRole('dialog', {
+      name: new RegExp(claim.id),
+    })
+    expect(within(replacementDialog).getByRole('radio', {
+      name: /authorize replacement shipment/i,
+    })).toBeVisible()
+    await user.click(within(replacementDialog).getByRole('button', {
+      name: /go back/i,
+    }))
 
     const inspected = services.repository.getSnapshot().claims.find((entry) => entry.id === claim.id)!
     expect(inspected.rma?.status).toBe('inspected')
@@ -2683,7 +3041,6 @@ describe('app components', () => {
       'shp-processing',
       'shp-digital',
       'BULKY',
-      'DIGITAL',
       'Demo Bulky Freight',
       'Digital Vault',
       'DEMO-P-PROCESSING',
@@ -2808,6 +3165,14 @@ describe('app components', () => {
       (sum, payment) => sum + payment.refundedSen,
       0,
     )).toBe(refundedBefore)
+
+    cleanup()
+    window.history.replaceState({}, '', '#/order/ord-processing')
+    render(<AppStateProvider providedServices={services}><App /></AppStateProvider>)
+    const customerOrder = screen.getByRole('main')
+    expect(customerOrder).toHaveTextContent(/claim status & history/i)
+    expect(customerOrder).not.toHaveTextContent(/shipmentcandidateids/i)
+    expect(customerOrder).not.toHaveTextContent(/shp-processing|shp-digital/i)
 
     cleanup()
     services.auth.oneClick('admin')

@@ -3,6 +3,7 @@ import { RemedyProgress } from '../components/RemedyProgress'
 import { StatusBadge } from '../components/StatusBadge'
 import { neutralOrderDeliveryCode, neutralOrderDeliveryStatus } from '../domain/orderStatus'
 import { boxRevealEligibility, prizeForBox } from '../domain/selectors'
+import { isActionableInTransitShipment } from '../domain/shipmentPolicy'
 import { formatDateTime, formatMYR } from '../lib/format'
 import { useAppState } from '../state/AppStateContext'
 
@@ -16,7 +17,9 @@ export function AccountPage() {
   const unopened = boxes.filter((box) => box.prizeId && !box.revealedAt && boxRevealEligibility(state, box).eligible)
   const held = boxes.filter((box) => box.prizeId && !box.revealedAt && !boxRevealEligibility(state, box).eligible)
   const ordersInTransit = orders.filter((order) =>
-    state.shipments.some((shipment) => shipment.orderId === order.id && shipment.status === 'shipped'),
+    state.shipments.some((shipment) =>
+      shipment.orderId === order.id &&
+      isActionableInTransitShipment(state, shipment)),
   )
 
   return (
@@ -100,8 +103,8 @@ export function AccountPage() {
                   )}
                   {everyBoxRevealed && legacyUnderSettledClaims.map((claim) => (
                     <div className="notice notice-info" key={claim.id}>
-                      <b>Legacy refund record is read-only and incomplete</b>
-                      <p>Immutable under-settled evidence accepted <b>{formatMYR(claim.acceptedSettlementSen ?? 0)}</b> against required <b>{formatMYR(claim.requiredSettlementSen)}</b>. It does not complete the remedy scope, and no final audit is available.</p>
+                      <b>Preserved legacy refund history is read-only</b>
+                      <p>The final audited legacy resolution accepted <b>{formatMYR(claim.acceptedSettlementSen ?? 0)}</b> against required <b>{formatMYR(claim.requiredSettlementSen)}</b>. It permanently owns this claim scope; the under-settled amount alone does not mark delivery fulfilled.</p>
                     </div>
                   ))}
                   <Link className="button button-ghost" to={`/order/${order.id}`}>View full record</Link>

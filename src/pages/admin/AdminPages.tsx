@@ -13,10 +13,12 @@ import {
 } from '../../domain/fulfillmentEligibility'
 import { paymentRetryEligibility } from '../../domain/paymentEligibility'
 import { resolveOrderFulfillment } from '../../domain/orderFulfillment'
+import { shipmentDeliveryActionEligibility } from '../../domain/shipmentPolicy'
 import {
   claimBlocksFullPaymentRefund,
   findRemedyScopeConflict,
   isTerminalReplacementRefundFallback,
+  preservedCompletedClaimIdsForUnlinkedRefund,
   remainingPaymentBalance,
   terminalReplacementFallbackAmount,
 } from '../../domain/remedyPolicy'
@@ -124,7 +126,7 @@ function deriveClaimRefundUiPolicy(
       remainingSen,
     }
   }
-  const conflict = findRemedyScopeConflict(state.claims, claim)
+  const conflict = findRemedyScopeConflict(state, claim)
   if (conflict) {
     return {
       amountSen: 0,
@@ -271,7 +273,8 @@ export function AdminDashboardPage() {
 function AdminDashboardContent() {
   const { services, state } = useAppState()
   const metrics = services.admin.dashboard()
-  const exceptions = state.shipments.filter((entry) => ['failed_delivery', 'lost', 'returned'].includes(entry.status))
+  const exceptions = state.shipments.filter((entry) =>
+    ['failed', 'failed_delivery', 'lost', 'returned'].includes(entry.status))
   const openClaims = state.claims.filter((entry) => isOpenClaimStatus(entry.status))
   return (
     <>
@@ -525,7 +528,7 @@ export function AdminOrdersPage() {
                           : refund?.remedyState === 'refund_linked'
                             ? `waiting final audit · ${refund.id}`
                             : 'not used'}</small>
-                        {legacyRefund && <small>Legacy refund evidence: immutable under-settled record · not complete · {legacyRefund.id}</small>}
+                        {legacyRefund && <small>Legacy refund evidence: exact preserved final history · scope owner · {legacyRefund.id}</small>}
                         <small className={openClaims.length ? 'scope-blocker' : ''}>Blocker: {blocker}</small>
                       </article>
                     )
@@ -535,7 +538,7 @@ export function AdminOrdersPage() {
                   <p key={claim.id}>
                     <b>{titleCase(claim.kind)} claim · {claim.id}</b><br />
                     <StatusBadge value={claim.status} /> · {claim.legacyUnderSettledRefund
-                      ? <span className="table-readonly">Legacy under-settled · scope incomplete</span>
+                      ? <span className="table-readonly">Legacy under-settled · preserved scope owner</span>
                       : <StatusBadge value={claim.remedyState} />}
                   </p>
                 ))}
@@ -594,7 +597,7 @@ export function AdminPaymentsPage() {
     ? state.orders.find((order) => order.id === selectedClaim.orderId)
     : undefined
   const selectedClaimConflict = selectedClaim
-    ? findRemedyScopeConflict(state.claims, selectedClaim)
+    ? findRemedyScopeConflict(state, selectedClaim)
     : undefined
   const claimSelectionError = claimWorkflowActive
     ? !claimFilter
@@ -627,6 +630,9 @@ export function AdminPaymentsPage() {
   const pendingClaimRefundPolicy = pending?.kind === 'claim_refund'
     ? deriveClaimRefundUiPolicy(state, pendingClaim, pendingPayment)
     : undefined
+  const pendingPreservedClaimIds = pendingPayment
+    ? preservedCompletedClaimIdsForUnlinkedRefund(state, pendingPayment)
+    : []
   const pendingAmountSen = pending?.kind === 'partial'
     ? 1000
     : pending?.kind === 'full'
@@ -808,7 +814,9 @@ export function AdminPaymentsPage() {
           : undefined
         const fullRefundBlocker = state.claims.find((claim) =>
           claim.orderId === payment.orderId &&
-          claimBlocksFullPaymentRefund(claim))
+          claimBlocksFullPaymentRefund(state, claim))
+        const preservedClaimIds =
+          preservedCompletedClaimIdsForUnlinkedRefund(state, payment)
         const linkedClaimIds = [...new Set(payment.events
           .map((event) => event.refundIntent?.claimId)
           .filter((claimId) => claimId !== undefined))]
@@ -836,6 +844,15 @@ export function AdminPaymentsPage() {
                 <Link className="table-action table-link breakable-id" to={`/admin/claims?claim=${encodeURIComponent(fullRefundBlocker.id)}`}>Claim {fullRefundBlocker.id}</Link>
                 {' '}blocks a generic full refund for this payment. Use the claim remedy workflow for any full settlement. Eligible RM10 partial goodwill and dispute marking remain separate.
               </p>
+            </div>
+          )}
+          {preservedClaimIds.length > 0 && (
+            <div className="notice notice-danger">
+              <b>Completed claim remedy evidence remains</b>
+              <p>An additional unlinked payment-level refund may compensate this customer again. It will not change, remove, or relink the completed claim or replacement evidence.</p>
+              {preservedClaimIds.map((claimId) => (
+                <Link className="table-action table-link breakable-id" key={claimId} to={`/admin/claims?claim=${encodeURIComponent(claimId)}`}>Review preserved claim {claimId}</Link>
+              ))}
             </div>
           )}
           <div className="record-actions">
@@ -896,7 +913,24 @@ export function AdminPaymentsPage() {
             )
           : <p>This linked refund is no longer available. {pendingClaimRefundPolicy?.reason}</p>
         : pending?.kind === 'partial' || pending?.kind === 'full'
-          ? <>This records exactly <b>{formatMYR(pendingAmountSen)}</b> as an unlinked local demo refund. It does not finalize a claim.</>
+          ? (
+              <>
+                <p>This records exactly <b>{formatMYR(pendingAmountSen)}</b> as an unlinked local demo refund. It does not finalize a claim.</p>
+                {pending?.kind === 'full' && pendingPreservedClaimIds.length > 0 && (
+                  <div className="notice notice-danger">
+                    <b>Warning: this may compensate the customer again</b>
+                    <p>Completed remedy evidence for {pendingPreservedClaimIds.join(', ')} stays byte-for-byte preserved. This additional payment-level refund is unlinked.</p>
+                  </div>
+                )}
+              </>
+            )
+        : pending?.kind === 'dispute_refund' && pendingPreservedClaimIds.length > 0
+          ? (
+              <div className="notice notice-danger">
+                <b>Warning: this may compensate the customer again</b>
+                <p>Customer-won dispute refund will preserve completed remedy evidence for {pendingPreservedClaimIds.join(', ')} and add an unlinked refund for the remaining payment balance.</p>
+              </div>
+            )
         : 'This is local demo money only. Full refunds and disputes stop eligible unshipped fulfilment. Claims never trigger this action automatically.'}
     </ConfirmDialog>
   </></Allowed>
@@ -1066,7 +1100,16 @@ export function AdminFulfilmentPage() {
       {state.shipments.map((shipment) => {
         const order = state.orders.find((entry) => entry.id === shipment.orderId)
         const canMoveTo = (status: ShipmentStatus) => Boolean(
-          order && shipmentStatusActionEligibility(order.status, shipment, status).eligible,
+          order &&
+          (
+            status === 'delivered'
+              ? shipmentDeliveryActionEligibility(state, shipment).eligible
+              : shipmentStatusActionEligibility(
+                  order.status,
+                  shipment,
+                  status,
+                ).eligible
+          ),
         )
         const canEditTracking = Boolean(
           order && shipmentTrackingActionEligibility(order.status, shipment).eligible,
@@ -1278,13 +1321,15 @@ function AdminClaimsContent() {
         : []
     }
     if (!['none', 'rma_inspected'].includes(claim.remedyState)) return []
-    const conflict = findRemedyScopeConflict(state.claims, claim)
+    const conflict = findRemedyScopeConflict(state, claim)
     if (conflict) {
       return claim.remedyState === 'none'
         ? [{ value: 'no_remedy', label: 'Close explicitly with no remedy' }]
         : []
     }
     const options: Array<{ value: ClaimRemedyAction; label: string }> = []
+    const originalWasDelivered = original?.timeline.some((entry) =>
+      entry.status === 'delivered')
     const deliveredBeforeClaim = original?.kind !== 'DIGITAL' &&
       original?.timeline.some((entry) =>
         entry.status === 'delivered' &&
@@ -1293,7 +1338,19 @@ function AdminClaimsContent() {
       options.push({ value: 'rma_create', label: 'Create physical return / RMA' })
     }
     if (canOpenPayments) options.push({ value: 'refund', label: 'Open exact claim-scope settlement in Payments' })
-    if (canAuthorizeReplacement && original && (!claim.shipmentCandidateIds || claim.shipmentCandidateIds.length === 1)) {
+    const replacementReturnReady =
+      !originalWasDelivered ||
+      (
+        claim.remedyState === 'rma_inspected' &&
+        claim.rma?.status === 'inspected' &&
+        original?.status === 'returned'
+      )
+    if (
+      canAuthorizeReplacement &&
+      original &&
+      replacementReturnReady &&
+      (!claim.shipmentCandidateIds || claim.shipmentCandidateIds.length === 1)
+    ) {
       options.push({
         value: 'replacement',
         label: original.kind === 'DIGITAL' ? 'Authorize digital reissue' : 'Authorize replacement shipment',
@@ -1384,9 +1441,16 @@ function AdminClaimsContent() {
         const focused = claim.id === focusedClaimId
         const original = originalForClaim(claim)
         const replacement = replacementForClaim(claim)
+        const postDeliveryReturnRequired = Boolean(
+          original?.timeline.some((entry) => entry.status === 'delivered') &&
+          (
+            claim.rma?.status !== 'inspected' ||
+            original.status !== 'returned'
+          ),
+        )
         const terminalFallbackEligible =
           isTerminalReplacementRefundFallback(replacement)
-        const entitlementConflict = findRemedyScopeConflict(state.claims, claim)
+        const entitlementConflict = findRemedyScopeConflict(state, claim)
         const claimOrder = state.orders.find((entry) => entry.id === claim.orderId)
         const orderFinancialHold = claimOrderOnFinancialHold(claim)
         const options = remedyOptions(claim)
@@ -1406,7 +1470,7 @@ function AdminClaimsContent() {
             <span className="breakable-id">{claimScopeLabel(claim)}</span>
             <span className="status-pair">
               {claim.legacyUnderSettledRefund
-                ? <span className="table-readonly">Legacy under-settled · scope incomplete</span>
+                ? <span className="table-readonly">Legacy under-settled · preserved scope owner</span>
                 : <><StatusBadge value={claim.status} />{claim.remedyState !== 'none' && <StatusBadge value={claim.remedyState} />}</>}
             </span>
           </summary>
@@ -1420,7 +1484,7 @@ function AdminClaimsContent() {
               <dd>{claim.settlementPolicy
                 ? titleCase(claim.settlementPolicy)
                 : claim.legacyUnderSettledRefund
-                  ? 'Legacy under-settled evidence · no completion policy'
+                  ? 'Legacy under-settled evidence · exact preserved history'
                   : 'Not recorded'}</dd>
             </div>
             <div>
@@ -1449,6 +1513,19 @@ function AdminClaimsContent() {
               <p>Overlapping remedy boxes: <span className="breakable-id">{entitlementConflict.remedyBoxIds.join(', ')}</span>. This claim cannot start a second RMA, refund, or replacement; only explicit no-remedy closure remains. The holder claim can continue its own remedy.</p>
             </div>
           )}
+          {claim.status === 'approved' && postDeliveryReturnRequired && original?.kind !== 'DIGITAL' && !entitlementConflict && (
+            <div className="notice notice-info">
+              <b>Return / RMA required before replacement</b>
+              <p>Start the physical return/RMA here, then record RMA received and inspected. Recording receipt safely marks a still-delivered linked original as returned. Replacement authorization stays unavailable until that completed return evidence exists.</p>
+              {original && <Link className="table-action table-link" to={`/admin/fulfilment?shipment=${encodeURIComponent(original.id)}&claim=${encodeURIComponent(claim.id)}`}>Open linked original return record</Link>}
+            </div>
+          )}
+          {claim.status === 'approved' && postDeliveryReturnRequired && original?.kind === 'DIGITAL' && !entitlementConflict && (
+            <div className="notice notice-info">
+              <b>Delivered digital record cannot be reissued directly</b>
+              <p>A delivered digital original has no physical return/RMA path, so replacement authorization is unavailable. Use an eligible exact refund or explicit no-remedy decision.</p>
+            </div>
+          )}
           {claim.status === 'approved' && orderFinancialHold && !claim.legacyUnderSettledRefund && (
             <div className="notice notice-info">
               <b>Financial hold limits typed remedy work</b>
@@ -1465,7 +1542,7 @@ function AdminClaimsContent() {
           {claim.status === 'approved' && (
             <div className="notice notice-info">
               <b>{claim.legacyUnderSettledRefund
-                ? 'Approved legacy claim · immutable evidence cannot finalize'
+                ? 'Approved legacy claim · immutable history is read-only'
                 : entitlementConflict && claim.remedyState === 'none'
                   ? 'Approved claim · only explicit no-remedy closure remains'
                   : orderFinancialHold
@@ -1474,7 +1551,7 @@ function AdminClaimsContent() {
                       : 'Approved claim · financial hold limits typed remedies'
                     : 'Approved claim · typed remedy remains open'}</b>
               <p>Exact scope: <span className="breakable-id">{claimScopeLabel(claim)}</span>. {claim.legacyUnderSettledRefund
-                ? 'The under-settled refund record is evidence only. It cannot complete this scope, and no final audit is available.'
+                ? 'The exact final legacy audit permanently owns this claim scope. Its under-settled amount alone does not mark delivery fulfilled.'
                 : entitlementConflict && claim.remedyState === 'none'
                   ? 'Another claim already owns the overlapping remedy entitlement. Approval does not create a second remedy.'
                   : orderFinancialHold
@@ -1501,7 +1578,7 @@ function AdminClaimsContent() {
                   : 'Refund linked · final Claims audit still required'}</b>
               <p className="breakable-id">{claim.linkedRefundEventId}</p>
               <p>Accepted <b>{formatMYR(claim.acceptedSettlementSen ?? 0)}</b> · required <b>{formatMYR(claim.requiredSettlementSen)}</b>.</p>
-              {claim.legacyUnderSettledRefund && <p>This immutable record does not complete the delivery/remedy scope.</p>}
+              {claim.legacyUnderSettledRefund && <p>This immutable final history owns the remedy scope; the under-settled amount alone does not mark delivery fulfilled.</p>}
               {canOpenPayments && <Link className="table-action table-link" to={`/admin/payments?order=${encodeURIComponent(claim.orderId)}&claim=${encodeURIComponent(claim.id)}`}>Open linked payment record</Link>}
             </div>
           )}
@@ -1527,7 +1604,7 @@ function AdminClaimsContent() {
                 ? 'Immutable legacy resolution record · not remedy completion'
                 : 'Final read-only evidence · structured resolution recorded'}</b>
               <p>{titleCase(claim.resolutionOutcome ?? claim.status)} · <span className="breakable-id">{claim.resolutionReference ?? claim.id}</span></p>
-              <small>{claim.resolutionNote ?? claim.history.at(-1)?.note}{claim.legacyUnderSettledRefund ? ' This does not complete the delivery/remedy scope.' : ''}</small>
+              <small>{claim.resolutionNote ?? claim.history.at(-1)?.note}{claim.legacyUnderSettledRefund ? ' This exact final history permanently owns the remedy scope.' : ''}</small>
             </div>
           )}
           <ol className="mini-timeline">{claim.history.map((entry) => <li key={entry.id}><b>{entry.note}</b><small>{formatDateTime(entry.at)} · {entry.actorRole} · {entry.status}</small></li>)}</ol>

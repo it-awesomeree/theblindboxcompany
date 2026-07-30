@@ -95,7 +95,7 @@ export function ClaimPage() {
           </label>
           {!everyBoxRevealed && kind !== 'value_floor' && (
             <Notice>
-              Sealed prizes stay private. This single order-level option records the eligible physical delivery evidence internally without exposing split details.
+              Sealed prizes stay private. This single order-level option records eligible physical delivery or failed/overdue digital evidence internally without exposing separate delivery details.
             </Notice>
           )}
           <label>Fictional note (must include DEMO; no email or phone)

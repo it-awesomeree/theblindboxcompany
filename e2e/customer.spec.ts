@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import type { DemoState, ShipmentStatus } from '../src/domain/types'
 
 async function clearAndOpen(page: Page) {
   await page.goto('')
@@ -224,19 +225,49 @@ test.describe('desktop customer journeys', () => {
     await page.getByRole('button', { name: /one-click aina demo/i }).click()
     await page.evaluate(() => {
       const key = 'tbbc:demo:repository:v5'
-      const state = JSON.parse(localStorage.getItem(key)!)
-      const shipment = state.shipments.find((entry: { id: string }) => entry.id === 'shp-processing')
-      for (const [index, status] of ['packed', 'label_created', 'shipped', 'delivered'].entries()) {
+      const state = JSON.parse(localStorage.getItem(key)!) as DemoState
+      const shipment = state.shipments.find((entry) => entry.id === 'shp-processing')!
+      const appendShipmentTransition = (status: ShipmentStatus, index: number) => {
+        const previousStatus = shipment.status
+        const reason = `Digital and bulky split clue ${status}`
+        const at = `2026-07-22T0${index + 4}:00:00.000Z`
         shipment.timeline.push({
           id: `privacy-partial-${index}`,
           status,
-          label: `Digital and bulky split clue ${status}`,
-          at: `2026-07-22T0${index + 4}:00:00.000Z`,
+          label: reason,
+          at,
         })
+        shipment.status = status
+        const sequence = state.auditCount + 1
+        const auditId = `audit-privacy-partial-${index}`
+        state.audits.push({
+          id: auditId,
+          sequence,
+          previousId: state.auditHeadId,
+          outcome: 'applied',
+          actorId: 'system',
+          actorRole: 'super_admin',
+          action: 'shipment.transitioned',
+          targetType: 'shipment',
+          targetId: shipment.id,
+          reason,
+          at,
+          before: { status: previousStatus },
+          after: {
+            financialHoldPreserved: false,
+            orderStatus: 'partially_fulfilled',
+            status,
+          },
+          requestId: `req-privacy-partial-${index}`,
+        })
+        state.auditCount = sequence
+        state.auditHeadId = auditId
       }
-      shipment.status = 'delivered'
-      state.boxes.find((entry: { id: string }) => entry.id === 'box-processing-01').status = 'fulfilled'
-      const order = state.orders.find((entry: { id: string }) => entry.id === 'ord-processing')
+      for (const [index, status] of (['packed', 'label_created', 'shipped', 'delivered'] as const).entries()) {
+        appendShipmentTransition(status, index)
+      }
+      state.boxes.find((entry) => entry.id === 'box-processing-01')!.status = 'fulfilled'
+      const order = state.orders.find((entry) => entry.id === 'ord-processing')!
       order.status = 'partially_fulfilled'
       order.updatedAt = '2026-07-22T07:00:00.000Z'
       order.timeline.push({

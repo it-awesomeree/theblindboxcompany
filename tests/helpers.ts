@@ -20,6 +20,18 @@ export class CountingStorage extends MemoryStorage {
 
 export const FIXED_NOW = '2026-07-28T04:00:00.000Z'
 
+export function incrementingClock(
+  start = FIXED_NOW,
+  stepMilliseconds = 1_000,
+) {
+  let current = Date.parse(start)
+  return () => {
+    const value = new Date(current).toISOString()
+    current += stepMilliseconds
+    return value
+  }
+}
+
 export function makeProcessingOrderTwoPhysicalShipments(services: AppServices) {
   services.repository.update((state) => {
     const box = state.boxes.find((entry) => entry.id === 'box-processing-02')!

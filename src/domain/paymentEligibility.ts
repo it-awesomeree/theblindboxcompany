@@ -1,5 +1,10 @@
 import { canTransitionPayment } from './guards'
-import type { Order, Payment, PaymentStatus } from './types'
+import type {
+  DemoState,
+  Order,
+  Payment,
+  PaymentStatus,
+} from './types'
 
 export const ACTIVE_PAYMENT_STATUSES: readonly PaymentStatus[] = [
   'created',
@@ -21,6 +26,98 @@ export interface PaymentEligibility {
 
 export function paymentWasCaptured(payment: Payment) {
   return payment.events.some((event) => event.type === 'succeeded' && !event.ignoredReason)
+}
+
+export function immediatePriorAcceptedPaymentStatus(
+  payment: Payment,
+  eventIndex: number,
+) {
+  if (
+    !Number.isInteger(eventIndex) ||
+    eventIndex < 0 ||
+    eventIndex >= payment.events.length
+  ) {
+    return undefined
+  }
+  return payment.events
+    .slice(0, eventIndex)
+    .filter((event) => event.ignoredReason === undefined)
+    .at(-1)?.type
+}
+
+export function acceptedRefundedSenBeforePaymentEvent(
+  payment: Payment,
+  eventIndex: number,
+) {
+  if (
+    !Number.isInteger(eventIndex) ||
+    eventIndex < 0 ||
+    eventIndex >= payment.events.length
+  ) {
+    return undefined
+  }
+  return payment.events
+    .slice(0, eventIndex)
+    .reduce(
+      (sum, event) =>
+        sum + (
+          event.ignoredReason === undefined
+            ? (event.refundIntent?.amountSen ?? 0)
+            : 0
+        ),
+      0,
+    )
+}
+
+export function acceptedDisputeResolutionShapeIsValid(
+  state: Pick<DemoState, 'orders'>,
+  payment: Payment,
+  eventIndex: number,
+) {
+  const event = payment.events[eventIndex]
+  const priorStatus = immediatePriorAcceptedPaymentStatus(payment, eventIndex)
+  const priorRefundedSen = acceptedRefundedSenBeforePaymentEvent(
+    payment,
+    eventIndex,
+  )
+  if (
+    !event ||
+    event.ignoredReason !== undefined ||
+    event.source !== 'admin_reconcile' ||
+    priorStatus !== 'disputed' ||
+    priorRefundedSen === undefined ||
+    !Number.isInteger(priorRefundedSen)
+  ) {
+    return false
+  }
+
+  if (event.type === 'refunded') {
+    const remainingSen = payment.amountSen - priorRefundedSen
+    const linkedOrders = state.orders.filter((order) =>
+      order.id === payment.orderId &&
+      order.paymentIds.includes(payment.id))
+    return Boolean(
+      event.refundIntent &&
+      event.refundIntent.paymentId === payment.id &&
+      event.refundIntent.claimId === undefined &&
+      Number.isInteger(remainingSen) &&
+      remainingSen > 0 &&
+      event.refundIntent.amountSen === remainingSen &&
+      priorRefundedSen + event.refundIntent.amountSen === payment.amountSen &&
+      payment.status === 'refunded' &&
+      payment.refundedSen === payment.amountSen &&
+      linkedOrders.length === 1 &&
+      linkedOrders[0].status === 'refunded',
+    )
+  }
+
+  if (event.refundIntent !== undefined) return false
+  if (priorRefundedSen === 0) return event.type === 'succeeded'
+  return (
+    priorRefundedSen > 0 &&
+    priorRefundedSen < payment.amountSen &&
+    event.type === 'partially_refunded'
+  )
 }
 
 export function paymentAttemptCreationEligibility(

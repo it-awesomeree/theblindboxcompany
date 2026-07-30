@@ -40,16 +40,46 @@ import { resolveOrderFulfillment } from '../src/domain/orderFulfillment'
 import {
   assertClaimOrderAllowsTypedRemedy,
   assertFullPaymentRefundCompatible,
+  availableClaimShipmentIdsAt,
   CLAIM_ORDER_FINANCIAL_HOLD_CODE,
   claimBlocksFullPaymentRefund,
   claimHasAcceptedLinkedRefundOnPayment,
   claimHoldsRemedyEntitlement,
+  claimHoldsRemedyEntitlementAt,
+  claimRemedyEntitlementStartedAt,
   FULL_REFUND_REMEDY_CONFLICT_CODE,
+  matchingAppliedUnlinkedRefundAudit,
   orderBoxSettlementAllocations,
   requiredSettlementForBoxScope,
   terminalReplacementFallbackAmount,
 } from '../src/domain/remedyPolicy'
+import { isActionableInTransitShipment } from '../src/domain/shipmentPolicy'
 import type { Claim, Payment } from '../src/domain/types'
+import { AppServices } from '../src/services/AppServices'
+import { FIXED_NOW, MemoryStorage } from './helpers'
+
+function validDisputeRefundState() {
+  const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+  services.auth.oneClick('admin')
+  services.payments.dispute(
+    'pay-unopened',
+    'Confirmed matcher customer dispute',
+    'evt-matcher-customer-dispute',
+  )
+  services.payments.resolveDispute(
+    'pay-unopened',
+    'refund',
+    'Confirmed matcher customer-won refund',
+    'evt-matcher-customer-refund',
+  )
+  const state = services.repository.exportForTest()
+  const payment = state.payments.find((entry) =>
+    entry.id === 'pay-unopened')!
+  const event = payment.events.find((entry) =>
+    entry.id === 'evt-matcher-customer-refund')!
+  const order = state.orders.find((entry) => entry.id === payment.orderId)!
+  return { event, order, payment, state }
+}
 
 describe('Series 001 and domain guards', () => {
   it('has exactly 10,000 fixed allocations and every value clears RM100', () => {
@@ -327,7 +357,7 @@ describe('Series 001 and domain guards', () => {
     })).toBe(false)
   })
 
-  it('classifies full-payment refund blockers with explicit safe terminal exceptions', () => {
+  it('classifies full-payment refund blockers fail-closed without exact completion evidence', () => {
     const base: Claim = {
       id: 'clm-full-refund-blocker',
       requestId: 'req-clm-full-refund-blocker',
@@ -344,8 +374,9 @@ describe('Series 001 and domain guards', () => {
       updatedAt: '2026-07-28T00:00:00.000Z',
       history: [],
     }
+    const evidence = { audits: [], payments: [], shipments: [] }
     for (const status of ['submitted', 'reviewing', 'approved'] as const) {
-      expect(claimBlocksFullPaymentRefund({ ...base, status })).toBe(true)
+      expect(claimBlocksFullPaymentRefund(evidence, { ...base, status })).toBe(true)
     }
     for (const remedyState of [
       'rma_created',
@@ -354,36 +385,224 @@ describe('Series 001 and domain guards', () => {
       'refund_linked',
       'refund_completed',
     ] as const) {
-      expect(claimBlocksFullPaymentRefund({
+      expect(claimBlocksFullPaymentRefund(evidence, {
         ...base,
         status: 'resolved',
         remedyState,
         resolutionOutcome: 'refund_recorded',
       })).toBe(true)
     }
-    expect(claimBlocksFullPaymentRefund({
+    expect(claimBlocksFullPaymentRefund(evidence, {
       ...base,
       status: 'resolved',
       remedyState: 'none',
       resolutionOutcome: 'replacement_authorized',
     })).toBe(true)
-    expect(claimBlocksFullPaymentRefund({
+    expect(claimBlocksFullPaymentRefund(evidence, {
       ...base,
       status: 'rejected',
       remedyState: 'replacement_authorized',
     })).toBe(false)
-    expect(claimBlocksFullPaymentRefund({
+    expect(claimBlocksFullPaymentRefund(evidence, {
       ...base,
       status: 'resolved',
       remedyState: 'no_remedy',
       resolutionOutcome: 'no_remedy',
     })).toBe(false)
-    expect(claimBlocksFullPaymentRefund({
+    expect(claimBlocksFullPaymentRefund(evidence, {
       ...base,
       remedyState: 'refund_completed',
       legacyUnderSettledRefund: true,
-    })).toBe(false)
+    })).toBe(true)
   })
+
+  it('filters original claim candidates using immutable remedy entitlement start time', () => {
+    const state = createDemoState()
+    const holder: Claim = {
+      id: 'clm-as-of-holder',
+      requestId: 'req-clm-as-of-holder',
+      orderId: 'ord-failed',
+      userId: 'usr-customer',
+      kind: 'non_delivery',
+      note: 'DEMO immutable as-of remedy holder',
+      shipmentId: 'shp-failed',
+      status: 'approved',
+      remedyState: 'replacement_authorized',
+      remedyBoxIds: ['box-failed-01'],
+      requiredSettlementSen: 11_200,
+      replacementShipmentId: 'shp-as-of-replacement',
+      replacementAuthorization: {
+        at: '2026-07-28T05:00:00.000Z',
+        reason: 'Confirmed immutable as-of replacement authorization',
+      },
+      createdAt: '2026-07-28T03:00:00.000Z',
+      updatedAt: '2026-07-28T05:00:00.000Z',
+      history: [],
+    }
+    state.claims.push(holder)
+    const original = state.shipments.find((shipment) =>
+      shipment.id === holder.shipmentId)!
+    state.shipments.push({
+      ...structuredClone(original),
+      id: holder.replacementShipmentId!,
+      purpose: 'replacement',
+      sourceClaimId: holder.id,
+      replacementForShipmentId: original.id,
+      status: 'unfulfilled',
+      createdAt: holder.replacementAuthorization!.at,
+      timeline: [{
+        id: 'stl-as-of-replacement-authorized',
+        status: 'unfulfilled',
+        label: holder.replacementAuthorization!.reason,
+        at: holder.replacementAuthorization!.at,
+      }],
+    })
+    state.audits.push({
+      id: 'audit-as-of-holder',
+      sequence: state.auditCount + 1,
+      previousId: state.auditHeadId,
+      outcome: 'applied',
+      actorId: 'usr-demo-admin',
+      actorRole: 'super_admin',
+      action: 'claim.replacement_authorized',
+      targetType: 'claim',
+      targetId: holder.id,
+      reason: holder.replacementAuthorization!.reason,
+      at: holder.replacementAuthorization!.at,
+      requestId: 'req-audit-as-of-holder',
+      before: {
+        originalShipmentId: original.id,
+        remedyState: 'none',
+      },
+      after: {
+        remedyState: 'replacement_authorized',
+        replacementShipmentId: holder.replacementShipmentId!,
+      },
+    })
+    state.auditCount += 1
+    state.auditHeadId = 'audit-as-of-holder'
+
+    expect(claimRemedyEntitlementStartedAt(state, holder))
+      .toBe('2026-07-28T05:00:00.000Z')
+    expect(claimHoldsRemedyEntitlementAt(
+      state,
+      holder,
+      '2026-07-28T04:59:59.999Z',
+    )).toBe(false)
+    expect(claimHoldsRemedyEntitlementAt(
+      state,
+      holder,
+      '2026-07-28T05:00:00.000Z',
+    )).toBe(true)
+    expect(availableClaimShipmentIdsAt(
+      state,
+      holder.orderId,
+      'non_delivery',
+      '2026-07-28T04:59:59.999Z',
+    )).toEqual(['shp-failed'])
+    expect(availableClaimShipmentIdsAt(
+      state,
+      holder.orderId,
+      'non_delivery',
+      '2026-07-28T05:00:00.000Z',
+    )).toEqual([])
+  })
+
+  it('counts only the currently actionable original or authorized reissue in transit', () => {
+    const services = new AppServices(new MemoryStorage(), () =>
+      '2026-07-28T04:00:00.000Z')
+    services.auth.oneClick('customer')
+    const claim = services.claims.submit({
+      orderId: 'ord-shipped',
+      kind: 'non_delivery',
+      shipmentId: 'shp-shipped',
+      note: 'DEMO actionable in-transit replacement evidence',
+    }).data
+    services.auth.oneClick('admin')
+    services.claims.review(
+      claim.id,
+      'acknowledge',
+      'Confirmed actionable transit acknowledgement',
+    )
+    services.claims.review(
+      claim.id,
+      'approve',
+      'Confirmed actionable transit approval',
+    )
+    const replacement = services.claims.authorizeReplacement(
+      claim.id,
+      'Confirmed actionable transit replacement authorization',
+    ).data
+    for (const status of ['picking', 'packed', 'label_created', 'shipped'] as const) {
+      services.fulfilment.advance(
+        replacement.id,
+        status,
+        `Confirmed actionable transit replacement ${status}`,
+      )
+    }
+    let state = services.repository.getSnapshot()
+    const original = state.shipments.find((shipment) =>
+      shipment.id === 'shp-shipped')!
+    let currentReplacement = state.shipments.find((shipment) =>
+      shipment.id === replacement.id)!
+
+    expect(isActionableInTransitShipment(state, original)).toBe(false)
+    expect(isActionableInTransitShipment(state, currentReplacement)).toBe(true)
+
+    services.fulfilment.advance(
+      replacement.id,
+      'lost',
+      'Confirmed actionable replacement terminal loss',
+    )
+    state = services.repository.getSnapshot()
+    currentReplacement = state.shipments.find((shipment) =>
+      shipment.id === replacement.id)!
+    expect(isActionableInTransitShipment(state, original)).toBe(true)
+    expect(isActionableInTransitShipment(state, currentReplacement)).toBe(false)
+  })
+
+  it.each([
+    ['partial event type', (fixture: ReturnType<typeof validDisputeRefundState>) => {
+      fixture.event.type = 'partially_refunded'
+    }],
+    ['claim-linked intent', (fixture: ReturnType<typeof validDisputeRefundState>) => {
+      fixture.event.refundIntent!.claimId = 'claim-forged-route'
+    }],
+    ['non-remaining intent amount', (fixture: ReturnType<typeof validDisputeRefundState>) => {
+      fixture.event.refundIntent!.amountSen -= 1
+    }],
+    ['partial current payment status', (fixture: ReturnType<typeof validDisputeRefundState>) => {
+      fixture.payment.status = 'partially_refunded'
+    }],
+    ['incomplete current refunded total', (fixture: ReturnType<typeof validDisputeRefundState>) => {
+      fixture.payment.refundedSen -= 1
+    }],
+    ['active linked order', (fixture: ReturnType<typeof validDisputeRefundState>) => {
+      fixture.order.status = 'processing'
+    }],
+    ['missing reverse payment link', (fixture: ReturnType<typeof validDisputeRefundState>) => {
+      fixture.order.paymentIds = fixture.order.paymentIds.filter((id) =>
+        id !== fixture.payment.id)
+    }],
+  ] as const)(
+    'fails closed when the dispute-origin refund matcher sees a mutated %s',
+    (_label, mutate) => {
+      const fixture = validDisputeRefundState()
+      expect(matchingAppliedUnlinkedRefundAudit(
+        fixture.state,
+        fixture.payment,
+        fixture.event,
+      )).toBeDefined()
+
+      mutate(fixture)
+
+      expect(matchingAppliedUnlinkedRefundAudit(
+        fixture.state,
+        fixture.payment,
+        fixture.event,
+      )).toBeUndefined()
+    },
+  )
 
   it('requires exact accepted admin evidence on the same payment for coordinated full refunds', () => {
     const payment: Payment = {
@@ -442,14 +661,14 @@ describe('Series 001 and domain guards', () => {
       payment,
     )).toBe(false)
     expect(() => assertFullPaymentRefundCompatible(
-      { claims: [claim] },
+      { audits: [], claims: [claim], payments: [payment], shipments: [] },
       payment,
     )).toThrow(expect.objectContaining({
       code: FULL_REFUND_REMEDY_CONFLICT_CODE,
       message: expect.stringContaining(claim.id),
     }))
     expect(() => assertFullPaymentRefundCompatible(
-      { claims: [claim] },
+      { audits: [], claims: [claim], payments: [payment], shipments: [] },
       payment,
       'clm-completing-refund',
     )).not.toThrow()

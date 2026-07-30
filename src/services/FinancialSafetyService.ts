@@ -37,6 +37,7 @@ export class FinancialSafetyService {
     requestId: string,
     actor: FinancialActor,
   ) {
+    const stoppedShipmentIds: string[] = []
     const before = {
       orderStatus: order.status,
       shipments: state.shipments
@@ -60,6 +61,7 @@ export class FinancialSafetyService {
         at,
         financialHold: status,
       })
+      stoppedShipmentIds.push(shipment.id)
     }
     for (const boxId of order.boxIds) {
       const box = state.boxes.find((entry) => entry.id === boxId)
@@ -87,9 +89,8 @@ export class FinancialSafetyService {
       before,
       after: {
         orderStatus: order.status,
-        stoppedShipmentIds: state.shipments
-          .filter((shipment) => shipment.orderId === order.id && shipment.status === 'cancelled')
-          .map((shipment) => shipment.id),
+        stoppedShipmentIds: stoppedShipmentIds.sort((left, right) =>
+          left.localeCompare(right)),
         heldBoxIds: state.boxes
           .filter((box) => order.boxIds.includes(box.id) && box.status === 'on_hold')
           .map((box) => box.id),
@@ -105,6 +106,7 @@ export class FinancialSafetyService {
     requestId: string,
     actor: FinancialActor,
   ) {
+    const resumedShipmentIds: string[] = []
     assert(order.status === 'disputed', 'Only a disputed order can resume.', 'ORDER_NOT_DISPUTED')
     for (const shipment of state.shipments.filter((entry) =>
       entry.orderId === order.id &&
@@ -122,6 +124,7 @@ export class FinancialSafetyService {
         label: reason,
         at,
       })
+      resumedShipmentIds.push(shipment.id)
     }
     const previous = order.timeline.at(-1)?.financialHoldPreviousStatus
     const resolution = resolveOrderFulfillment(state, order)
@@ -140,7 +143,11 @@ export class FinancialSafetyService {
       at,
       requestId,
       before: { status: 'disputed' },
-      after: { status: restored },
+      after: {
+        resumedShipmentIds: resumedShipmentIds.sort((left, right) =>
+          left.localeCompare(right)),
+        status: restored,
+      },
     })
   }
 }

@@ -4,6 +4,21 @@ This document is a plan, not an implementation. The public GitHub Pages demo
 must stay fake. A commercial shop needs a separately deployed, reviewed backend
 that owns money, identity, inventory, prize assignment and fulfilment.
 
+The browser demo’s current local schema is version 9. Its v5/v6/v7 upgrade
+chain first produces version 8. The explicit v8-to-v9 step first runs
+read-only disputed-resolution, RMA receipt, direct post-delivery replacement
+and ignored-payment preflights and collision-checks every synthetic identity.
+Only a valid cloned candidate may receive deterministic migration,
+transition/refund and immutable evidence before final validation. Exact old RMA
+receipt semantics become a canonical returned-original timeline plus rich
+receipt evidence. Exact direct post-delivery replacements receive a
+migration-only marker/audit without a fake RMA. The frozen version 8
+one-effective-delivery-per-box rule is rechecked, so impossible
+original-plus-replacement dual delivery fails closed instead of gaining a
+migration exception. Exact old ignored events without submitted reason/route
+evidence remain explicitly non-replayable. Failed migration keeps the source
+object and exact source bytes unchanged.
+
 ## Recommended production shape
 
 Use Supabase as a managed starting point:
@@ -52,6 +67,12 @@ Important uniqueness/check rules include:
   for a published RM100-floor series.
 - append-only audit table with database permissions that deny update/delete.
 
+Use a monotonic immutable sequence on every audit row. Historical policy
+compares parsed UTC instants first and audit sequence second, so equal instants
+remain deterministic even when ISO precision differs. Every ordinary shipment
+transition, financial stop/resume transition and RMA-receipt return must bind
+to the exact audit row that created it.
+
 Published series rows and their allocation lines must be immutable. Editing
 starts a new draft/version. Orders snapshot item price, shipping fee, address,
 odds version, policy version, acknowledgements and calculated totals so later
@@ -69,8 +90,10 @@ remedy-entitlement-holding claim on the order. It must stop rather than orphan
 or duplicate a linked refund, RMA or replacement. Already shipped/delivered
 events remain append-only history.
 While an order remains refunded or disputed, legal carrier outcomes for an
-already-shipped record may still be appended without reopening fulfilment,
-unlocking tracking edits or releasing unopened boxes.
+already-shipped **original physical carrier record** may still be appended
+without reopening fulfilment, unlocking tracking edits or releasing unopened
+boxes. This exception does not permit digital delivery, replacement work or an
+unshipped original to progress under the financial hold.
 Resuming a dispute hold needs its own authorized resolution command and audit
 record; it must not be a generic status edit.
 
@@ -78,6 +101,21 @@ Cancelled, refunded and disputed orders are financial holds. Server-side guards
 must prevent both new and progressing typed RMA/replacement work while any of
 those holds applies. Existing evidence stays readable and immutable; only
 explicit, audited financial resolution may make eligible work available again.
+
+Expose one authoritative actionable-shipment query for account transit counts.
+A sent/shipped original is superseded by an exact authorized overlapping
+reissue that is active or delivered; the active sent/shipped reissue counts
+instead. A physical original becomes actionable again only when every
+overlapping authorized reissue is physical and terminal `lost` or `returned`.
+Failed or cancelled reissues do not reactivate an original, and a digital
+original never reactivates after any authorized reissue.
+
+Late delivery of an original physical shipment after replacement authorization
+is valid only when every exact authorized overlapping reissue is physical and
+currently terminal `lost` or `returned`. Any active, delivered or digital
+reissue rejects it. Persist the exact shipment transition audit, keep claim,
+remedy and payment bytes unchanged, and preserve any financial hold. The
+validator must still reject duplicate effective delivery for a box.
 
 ## Trusted checkout creation
 
@@ -189,22 +227,60 @@ immutable reveal.
 Store append-only claim events for acknowledge, approve, reject and final audit,
 including actor, note and UTC time. Delivery claims must not require customers
 to reveal unrelated prizes. While any box remains sealed, show exactly one
-neutral order-level option and store every eligible physical shipment in a
-sorted candidate relation captured at submission, without choosing an arbitrary
-exact shipment. Do not expose the candidate IDs, candidate count, shipment IDs,
+neutral order-level option and store every available eligible original shipment
+in a sorted candidate relation captured at submission, without choosing an
+arbitrary exact shipment. Damage candidates require delivered physical evidence.
+Non-delivery candidates include eligible failed/overdue physical or digital
+evidence. Do not expose the candidate IDs, candidate count, shipment IDs,
 carrier, kind, flags, prize or per-split status to the customer. Exact shipment
 claims unlock only after every box is revealed; authorized claim staff may
 inspect candidate evidence.
+
+Candidate availability is immutable and audit-sequenced. Derive a claim’s remedy
+entitlement start from its immutable RMA creation, replacement authorization,
+linked refund `processed_at`, or exact grandfathered completed-history evidence.
+At each submission or widening audit boundary, exclude every original shipment
+whose boxes overlap any entitlement already held at that instant and sequence.
+Any box overlap
+excludes the whole delivery shipment because this model does not partially
+settle one shipment. The current browser model stores each candidate’s evidence
+timestamp. The validator finds the matching immutable submission or widening
+audit and uses that audit’s sequence as the boundary; the claim does not store
+separate candidate audit-ID or sequence fields. Validator and repair jobs must
+recompute with the same as-of query while ignoring the claim being checked, so
+later same-instant transitions or self-entitlement cannot invalidate its older
+snapshot. Submitted/reviewing neutral claims may widen; a later disjoint failed
+shipment may create a new claim. If raw eligible evidence exists but every
+shipment is reserved or remediated, reject without writing instead of creating
+an impossible claim. Apply the same prior-entitlement check to exact-shipment
+and value-floor submissions.
+
+Before availability checks, look for an exact owned replay of the same
+order/kind/note/evidence scope. Exact shipment, value-floor and sole neutral
+replays return the existing current claim byte-for-byte with no transaction,
+revision, audit, notification or listener effect, even after remedy work starts
+or resolves. A changed note/evidence for the same replay identity is an
+idempotency conflict. Customer eligibility responses may retain the generic
+replay choice but must never return neutral candidate IDs or hidden candidate
+sets.
 
 Approval does not resolve a claim. Starting an RMA or replacement must lock the
 claim, order and all requested `(order_id, box_id)` entitlement rows in one
 transaction. The unique entitlement key prevents overlapping damage,
 non-delivery and value-floor claims from owning a second remedy for the same
 box. RMA created → received → inspected stays approved/open and retains those
-entitlement rows. Replacement authorization also stays approved/open and
-retains the entitlement until the exact replacement is delivered. Only
-delivered replacement evidence, an audited completed linked refund, or an
-explicit no-remedy decision may close the applicable path.
+entitlement rows. Recording RMA received must atomically mark a still-delivered
+linked original as returned and append exact shipment timeline plus claim audit
+evidence; an already-returned original is idempotent. A physical damage or
+post-delivery value-floor replacement requires the completed RMA return path,
+inspection and a returned original before authorization. Direct replacement
+from no selected remedy remains valid for genuine non-delivery, digital failure
+and other non-delivered originals. Replacement authorization stays
+approved/open and retains the entitlement until the exact replacement is
+delivered. Persisted invariants must reject any post-delivery authorization
+that cannot reach delivery, while keeping one effective delivered shipment per
+box. Only delivered replacement evidence, an audited completed linked refund,
+or an explicit no-remedy decision may close the applicable path.
 
 ## Transactional refund and remedy coordination
 
@@ -220,18 +296,74 @@ the final audit verifies that exact accepted event.
 A safe partial goodwill refund remains unlinked. It is a separate financial
 adjustment and cannot satisfy a claim, consume an entitlement or finalize a
 claim scope. Before a generic full-payment refund or a dispute-origin refund,
-the server must lock and coordinate every open or entitlement-holding claim on
-the order. It must reject any action that would orphan or duplicate an RMA,
-replacement or refund remedy. Full refunds may proceed only through an
-explicitly coordinated transaction that preserves one auditable completion
-path per box.
+the server must lock and classify every claim on the order. Open claims, RMA
+work, `refund_linked`, undelivered replacements, malformed terminal evidence
+remain fail-closed blockers. An exact non-legacy completed
+claim refund requires resolved `refund_completed`/`refund_recorded`, exact
+forward and reverse refund IDs, exact payment and claim-link audits, exact final
+resolution audit, and a valid recorded settlement shape. An exact completed
+replacement requires resolved `replacement_delivered`/
+`replacement_authorized`, exact forward and reverse shipment IDs, and exact
+authorization and delivery audits.
+
+Those exact completed claims permanently keep their box ownership and immutable
+evidence, but they no longer block a later unlinked payment-level refund of the
+remaining balance, including a customer-won dispute. The later event must have
+no claim link, must not rewrite the claim or replacement, and must include the
+canonical sorted unique preserved completed claim IDs in its payment-refund
+audit evidence.
+Admin record and confirmation screens must warn prominently that the additional
+refund may compensate the customer again. Any mixture of completed evidence and
+an active blocker rejects atomically.
+
+The only migrated legacy exception is an exact preserved under-settled history:
+resolved `refund_completed`/`refund_recorded`; resolution reference equal to
+one unique linked same-order accepted refund event; legacy marker true; no
+settlement policy; integer accepted amount greater than zero and below required;
+and exact payment-refund, claim-link and final resolution audit/history. It
+permanently owns the scope from its exact linked-refund audit boundary. Any
+malformed legacy history fails closed. The exception
+applies only to the full/remaining payment-refund blocker, so it never permits
+a new overlapping remedy or marks delivery fulfilled.
+
+Every accepted refund intent must bind to exactly one audit row. For an
+unlinked generic refund, validate exact action, payment, prior
+status/refunded-sen, resulting status/refunded-sen, zero returned allocations,
+amount, canonical reason, request/event IDs and event time. A dispute refund
+must additionally bind the disputed prior state, refunded order state and exact
+remaining amount. The preservation-ID field is required with the exact set and
+order when nonempty and forbidden when empty. Ignored events cannot carry
+refund intents, and financial totals sum accepted intents only.
+
+Validate a protected finance reason before duplicate lookup. Reject unsafe,
+non-normalized or over-240-character input instead of cleaning or truncating
+it. Accepted dispute initiation and dispute resolution/refund events use the
+canonical reason stored in the immutable audit/refund intent for replay
+comparison. Exact concurrent replay is write-free; a changed reason is an
+idempotency conflict. Bind each identity to its command route through the
+immutable immediate prior accepted status: `disputed` for dispute resolution,
+and `succeeded`/`partially_refunded` for generic or claim refunds. Wrong-route
+reuse is an idempotency conflict, and a fresh dispute-resolution identity
+requires the payment to remain disputed.
+
+Current ignored provider events must persist their payment, event ID, type,
+source, request ID, submitted canonical reason, route, effective prior status,
+ignored outcome/reason and related payment when applicable, with one exact
+immutable ignored audit. An exact redelivery returns that stored ignored result
+without a transaction, revision, listener or audit change. Any changed field is
+an atomic idempotency conflict. A generic ignored event cannot be reused as a
+dispute, dispute resolution or refund. Migrated v8 ignored events are replayable
+only when all those inputs were genuinely preserved; the browser demo marks its
+exact recoverable old shapes non-replayable rather than inventing missing
+reason/route evidence.
 
 Ordinary claim refunds use the snapshotted required settlement. After an
 authorized replacement reaches an eligible terminal failure, the fallback
 amount is `min(required claim settlement, remaining refundable payment
 balance)`; it never uses an uncapped payment-remainder rule. Migrated legacy
-under-settled evidence remains immutable and incomplete and cannot be reused or
-edited to finalize its claim or box scope.
+under-settled history remains immutable and cannot be reused or edited to mark
+delivery fulfilled; it owns its scope while a later separate finance event may
+refund only the payment remainder.
 
 ## Roles and admin security
 

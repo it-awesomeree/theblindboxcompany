@@ -34,9 +34,27 @@ jobs:
           name: playwright-report
           path: playwright-report/
           retention-days: 7
-      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+      # The repository requires every action reference to use a full commit SHA.
+      # upload-pages-artifact is a composite action that internally uses the
+      # floating actions/upload-artifact@v4 tag, so create the same Pages archive
+      # directly and upload it with our pinned action instead.
+      - name: Create Pages artifact
+        run: |
+          tar \
+            --dereference --hard-dereference \
+            --directory dist \
+            -cvf "$RUNNER_TEMP/artifact.tar" \
+            --exclude=.git \
+            --exclude=.github \
+            .
+      - name: Upload Pages artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          path: dist
+          name: github-pages
+          path: ${{ runner.temp }}/artifact.tar
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
 
   deploy:
     permissions:

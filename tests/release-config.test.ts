@@ -120,11 +120,17 @@ describe('release and responsive safety configuration', () => {
       buildTestUpload.indexOf('npm run e2e:dist'),
     )
     expect(buildTestUpload.indexOf('npm run e2e:dist')).toBeLessThan(
-      buildTestUpload.indexOf('actions/upload-pages-artifact'),
+      buildTestUpload.indexOf('- name: Create Pages artifact'),
     )
     expect(buildTestUpload.slice(buildTestUpload.indexOf('npm run verify')))
       .not.toContain('npm run build')
-    expect(buildTestUpload).toMatch(/upload-pages-artifact@[^\n]+[\s\S]*?path: dist/)
+    expect(buildTestUpload).not.toContain('actions/upload-pages-artifact@')
+    expect(buildTestUpload).toMatch(
+      /- name: Create Pages artifact[\s\S]*?--directory dist[\s\S]*?-cvf "\$RUNNER_TEMP\/artifact\.tar"/,
+    )
+    expect(buildTestUpload).toMatch(
+      /- name: Upload Pages artifact[\s\S]*?uses: actions\/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4[\s\S]*?name: github-pages[\s\S]*?path: \$\{\{ runner\.temp \}\}\/artifact\.tar[\s\S]*?retention-days: 1[\s\S]*?if-no-files-found: error[\s\S]*?compression-level: 0/,
+    )
     expect(deployJob).toContain('needs: build-test-upload')
   })
 
@@ -281,16 +287,16 @@ describe('release and responsive safety configuration', () => {
       'actions/checkout': { sha: '11d5960a326750d5838078e36cf38b85af677262', version: 'v4' },
       'actions/setup-node': { sha: '49933ea5288caeca8642d1e84afbd3f7d6820020', version: 'v4' },
       'actions/upload-artifact': { sha: 'ea165f8d65b6e75b540449e92b4886f43607fa02', version: 'v4' },
-      'actions/upload-pages-artifact': { sha: '56afc609e74202658d3ffba0e8f6dda462b719fa', version: 'v3' },
       'actions/deploy-pages': { sha: 'd6db90164ac5ed86f2b6aed7e0febac5b3c0c03e', version: 'v4' },
     } as const
     const references = [...workflows.matchAll(
-      /uses:\s*(actions\/(?:checkout|setup-node|upload-artifact|upload-pages-artifact|deploy-pages))@([^\s#]+)(?:\s+#\s*(v\d+))?/g,
+      /uses:\s*(actions\/(?:checkout|setup-node|upload-artifact|deploy-pages))@([^\s#]+)(?:\s+#\s*(v\d+))?/g,
     )]
 
     expect(workflows).not.toMatch(
-      /uses:\s*actions\/(?:checkout|setup-node|upload-artifact|upload-pages-artifact|deploy-pages)@v\d+\b/,
+      /uses:\s*actions\/(?:checkout|setup-node|upload-artifact|deploy-pages)@v\d+\b/,
     )
+    expect(workflows).not.toContain('actions/upload-pages-artifact@')
     expect(references.length).toBeGreaterThan(0)
     for (const [, action, reference, versionComment] of references) {
       const pin = expected[action as keyof typeof expected]

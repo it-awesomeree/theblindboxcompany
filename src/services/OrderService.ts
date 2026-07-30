@@ -5,6 +5,7 @@ import {
   RESERVATION_MINUTES,
   SERIES_ID,
   SHIPPING_FEES,
+  VALUE_FLOOR_SEN,
 } from '../domain/constants'
 import {
   assert,
@@ -135,6 +136,7 @@ export class OrderService {
           seriesId: SERIES_ID,
           quantity: input.quantity,
           unitPriceSen: BOX_PRICE_SEN,
+          valueFloorSen: VALUE_FLOOR_SEN,
           shippingMethod: input.shippingMethod,
           address,
           oddsVersion: series.oddsVersion,

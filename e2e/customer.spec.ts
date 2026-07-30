@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import type { DemoState, ShipmentStatus } from '../src/domain/types'
 
 async function clearAndOpen(page: Page) {
   await page.goto('')
@@ -21,8 +22,47 @@ async function reachCheckout(page: Page) {
   await page.getByRole('button', { name: /create pending demo attempt/i }).click()
 }
 
+const mobile320RemedyTag = '@mobile320-remedy'
+
 test.describe('desktop customer journeys', () => {
-  test.skip(({ isMobile }) => isMobile, 'Detailed journeys run once in installed Chrome.')
+  test.beforeEach(({ isMobile }, testInfo) => {
+    test.skip(
+      isMobile &&
+        (testInfo.project.name !== 'mobile-320' || !testInfo.tags.includes(mobile320RemedyTag)),
+      'Detailed customer journeys run on desktop; the audited refund regression also runs at 320px.',
+    )
+  })
+
+  test('safe customer titles and h1 focus survive browser history', async ({ page }) => {
+    await clearAndOpen(page)
+    await page.getByRole('link', { name: /demo sign in/i }).click()
+    await page.getByRole('button', { name: /one-click aina demo/i }).click()
+
+    const accountHeading = page.getByRole('heading', { level: 1, name: 'Aina Demo' })
+    await expect(accountHeading).toBeFocused()
+    await expect(page).toHaveTitle('Account | The Blind Box Company | Demo / No Real Charge')
+    expect(await page.title()).not.toMatch(/Aina Demo|aina@example\.test/)
+
+    await page.getByRole('link', { name: /^Cart\b/ }).click()
+    const cartHeading = page.getByRole('heading', { level: 1, name: /demo cargo list/i })
+    await expect(cartHeading).toBeFocused()
+    await expect(page).toHaveTitle('Cart | The Blind Box Company | Demo / No Real Charge')
+
+    await page.goBack()
+    await expect(accountHeading).toBeFocused()
+    await expect(page).toHaveTitle('Account | The Blind Box Company | Demo / No Real Charge')
+
+    await page.goForward()
+    await expect(cartHeading).toBeFocused()
+    await expect(page).toHaveTitle('Cart | The Blind Box Company | Demo / No Real Charge')
+
+    await page.goto('#/pay/ord-unopened/new')
+    const paymentHeading = page.getByRole('heading', { level: 1, name: /mock hitpay payment/i })
+    await expect(paymentHeading).toBeFocused()
+    await expect(page.getByRole('heading', { level: 1 })).toHaveCount(1)
+    await expect(page).toHaveTitle('Mock Payment | The Blind Box Company | Demo / No Real Charge')
+    expect(await page.title()).not.toMatch(/ord-unopened|Aina Demo|aina@example\.test/)
+  })
 
   test('successful mock checkout, valid event and immutable reveal', async ({ page }) => {
     await reachCheckout(page)
@@ -80,7 +120,7 @@ test.describe('desktop customer journeys', () => {
     await page.getByRole('link', { name: /demo sign in/i }).click()
     await page.getByRole('button', { name: /one-click aina demo/i }).click()
     await page.goto('#/order/ord-shipped')
-    await expect(page.getByText('DEMO-P-SHIPPED')).toBeVisible()
+    await expect(page.getByText('DEMO-SHIPPED')).toBeVisible()
     await expect(page.getByText(/signature required/i)).toBeVisible()
     await page.getByRole('link', { name: /start a demo claim/i }).click()
     await expect(page.getByRole('heading', { name: /start a fake claim/i })).toBeVisible()
@@ -185,19 +225,49 @@ test.describe('desktop customer journeys', () => {
     await page.getByRole('button', { name: /one-click aina demo/i }).click()
     await page.evaluate(() => {
       const key = 'tbbc:demo:repository:v5'
-      const state = JSON.parse(localStorage.getItem(key)!)
-      const shipment = state.shipments.find((entry: { id: string }) => entry.id === 'shp-processing')
-      for (const [index, status] of ['packed', 'label_created', 'shipped', 'delivered'].entries()) {
+      const state = JSON.parse(localStorage.getItem(key)!) as DemoState
+      const shipment = state.shipments.find((entry) => entry.id === 'shp-processing')!
+      const appendShipmentTransition = (status: ShipmentStatus, index: number) => {
+        const previousStatus = shipment.status
+        const reason = `Digital and bulky split clue ${status}`
+        const at = `2026-07-22T0${index + 4}:00:00.000Z`
         shipment.timeline.push({
           id: `privacy-partial-${index}`,
           status,
-          label: `Digital and bulky split clue ${status}`,
-          at: `2026-07-22T0${index + 4}:00:00.000Z`,
+          label: reason,
+          at,
         })
+        shipment.status = status
+        const sequence = state.auditCount + 1
+        const auditId = `audit-privacy-partial-${index}`
+        state.audits.push({
+          id: auditId,
+          sequence,
+          previousId: state.auditHeadId,
+          outcome: 'applied',
+          actorId: 'system',
+          actorRole: 'super_admin',
+          action: 'shipment.transitioned',
+          targetType: 'shipment',
+          targetId: shipment.id,
+          reason,
+          at,
+          before: { status: previousStatus },
+          after: {
+            financialHoldPreserved: false,
+            orderStatus: 'partially_fulfilled',
+            status,
+          },
+          requestId: `req-privacy-partial-${index}`,
+        })
+        state.auditCount = sequence
+        state.auditHeadId = auditId
       }
-      shipment.status = 'delivered'
-      state.boxes.find((entry: { id: string }) => entry.id === 'box-processing-01').status = 'fulfilled'
-      const order = state.orders.find((entry: { id: string }) => entry.id === 'ord-processing')
+      for (const [index, status] of (['packed', 'label_created', 'shipped', 'delivered'] as const).entries()) {
+        appendShipmentTransition(status, index)
+      }
+      state.boxes.find((entry) => entry.id === 'box-processing-01')!.status = 'fulfilled'
+      const order = state.orders.find((entry) => entry.id === 'ord-processing')!
       order.status = 'partially_fulfilled'
       order.updatedAt = '2026-07-22T07:00:00.000Z'
       order.timeline.push({
@@ -247,7 +317,9 @@ test.describe('desktop customer journeys', () => {
     await expect(accountOrder.getByText(/maggi|tng reload/i)).toHaveCount(0)
   })
 
-  test('eligible claim moves through protected admin review without an automatic refund', async ({ page }) => {
+  test('claim-linked exact-scope refund requires exact Payments action and separate Claims finalization', {
+    tag: mobile320RemedyTag,
+  }, async ({ page }) => {
     await clearAndOpen(page)
     await page.getByRole('link', { name: /demo sign in/i }).click()
     await page.getByRole('button', { name: /one-click aina demo/i }).click()
@@ -271,20 +343,45 @@ test.describe('desktop customer journeys', () => {
     await claim.getByRole('button', { name: 'Approve' }).click()
     await page.getByRole('button', { name: /confirm note & audit/i }).click()
     await expect(claim.getByText('Approved', { exact: true })).toBeVisible()
-    await claim.getByRole('button', { name: 'Resolve' }).click()
-    await expect(page.getByLabel(/structured outcome/i)).toHaveValue('replacement_authorized')
-    await expect(page.getByLabel(/fictional demo- reference/i)).toHaveValue(/DEMO-CLM-/)
-    await page.getByRole('button', { name: /confirm note & audit/i }).click()
-    await expect(claim.getByText('Resolved', { exact: true })).toBeVisible()
-    await expect(claim.getByText(/structured resolution recorded/i)).toBeVisible()
-    await expect(claim.getByText(/replacement authorized/i)).toBeVisible()
-    await expect(claim.getByText(/no refund is created here/i)).toBeVisible()
+    const claimId = (await claim.locator('summary b').first().textContent())!
+    await claim.getByRole('button', { name: /record typed remedy/i }).click()
+    const remedyDialog = page.getByRole('dialog', { name: new RegExp(claimId) })
+    await expect(remedyDialog.getByRole('group', { name: /choose one exact remedy action/i })).toBeVisible()
+    await expect(remedyDialog.getByRole('radio', { name: /open exact claim-scope settlement/i })).toBeChecked()
+    await remedyDialog.getByRole('button', { name: /open exact payment/i }).click()
+
+    const payment = page.locator('.payment-record').filter({ hasText: 'pay-shipped' })
+    await payment.locator('summary').click()
+    await expect(page.getByText(/unrelated payment actions are hidden; leave or clear this claim workflow/i)).toBeVisible()
+    await expect(payment.getByRole('button', { name: /unlinked partial refund/i })).toHaveCount(0)
+    await expect(payment.getByRole('button', { name: /unlinked refund remaining/i })).toHaveCount(0)
+    await expect(payment.getByRole('button', { name: /mark disputed/i })).toHaveCount(0)
+    const linkedRefund = payment.getByRole('button', { name: new RegExp(`linked claim ${claimId}.+exact claim-scope settlement rm\\s*112\\.00`, 'i') })
+    await expect(linkedRefund).toBeVisible()
+    await expect(payment.getByRole('button', { name: /linked claim.+partial/i })).toHaveCount(0)
+    await linkedRefund.click()
+    const refundDialog = page.getByRole('dialog', { name: new RegExp(`exact claim-scope settlement of rm\\s*112\\.00 for claim ${claimId}`, 'i') })
+    await expect(refundDialog).toContainText('pay-shipped')
+    await expect(refundDialog).toContainText(/rm\s*112\.00/i)
+    await refundDialog.getByRole('button', { name: /confirm exact settlement & audit/i }).click()
+    await expect(payment.getByText(new RegExp(`linked claim ${claimId}`, 'i')).first()).toBeVisible()
+    await page.getByRole('link', { name: 'Back to claim', exact: true }).click()
+
+    const focusedClaim = page.locator('.claim-record[data-focused="true"]')
+    await expect(focusedClaim).toContainText(claimId)
+    await expect(focusedClaim.getByText('Approved', { exact: true })).toBeVisible()
+    await expect(focusedClaim.getByText(/refund linked.+final claims audit still required/i)).toBeVisible()
+    await focusedClaim.getByRole('button', { name: /record typed remedy/i }).click()
+    const finalDialog = page.getByRole('dialog', { name: new RegExp(claimId) })
+    await expect(finalDialog.getByRole('radio', { name: /finalize exact audited refund link/i })).toBeChecked()
+    await finalDialog.getByRole('button', { name: /confirm typed evidence/i }).click()
+    await expect(focusedClaim.getByText('Resolved', { exact: true })).toBeVisible()
+    await expect(focusedClaim.getByText(/audited refund complete/i)).toBeVisible()
 
     await page.getByRole('button', { name: /log out/i }).click()
     await page.getByRole('link', { name: /demo sign in/i }).click()
     await page.getByRole('button', { name: /one-click aina demo/i }).click()
     await page.goto('#/order/ord-shipped')
-    await expect(page.getByText(/recorded resolution/i)).toBeVisible()
-    await expect(page.getByText(/replacement authorized/i)).toBeVisible()
+    await expect(page.getByText(/audited refund complete/i).first()).toBeVisible()
   })
 })

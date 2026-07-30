@@ -20,6 +20,18 @@ export class CountingStorage extends MemoryStorage {
 
 export const FIXED_NOW = '2026-07-28T04:00:00.000Z'
 
+export function incrementingClock(
+  start = FIXED_NOW,
+  stepMilliseconds = 1_000,
+) {
+  let current = Date.parse(start)
+  return () => {
+    const value = new Date(current).toISOString()
+    current += stepMilliseconds
+    return value
+  }
+}
+
 export function makeProcessingOrderTwoPhysicalShipments(services: AppServices) {
   services.repository.update((state) => {
     const box = state.boxes.find((entry) => entry.id === 'box-processing-02')!
@@ -33,5 +45,21 @@ export function makeProcessingOrderTwoPhysicalShipments(services: AppServices) {
     shipment.insured = false
     shipment.signatureRequired = false
     shipment.timeline[0].label = 'PARCEL fulfilment queued'
+  })
+}
+
+export function makeProcessingOrderSingleGroupedPhysicalShipment(
+  services: AppServices,
+) {
+  services.repository.update((state) => {
+    const secondBox = state.boxes.find((entry) => entry.id === 'box-processing-02')!
+    secondBox.prizeId = 'water'
+    secondBox.shipmentId = 'shp-processing'
+    const series = state.series.find((entry) => entry.id === secondBox.seriesId)!
+    series.inventory.find((entry) => entry.prizeId === 'tng')!.assigned -= 1
+    series.inventory.find((entry) => entry.prizeId === 'water')!.assigned += 1
+    const grouped = state.shipments.find((entry) => entry.id === 'shp-processing')!
+    grouped.boxIds.push(secondBox.id)
+    state.shipments = state.shipments.filter((entry) => entry.id !== 'shp-digital')
   })
 }

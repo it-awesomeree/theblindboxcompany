@@ -1,5 +1,95 @@
 import { expect, test, type Locator, type Page } from '@playwright/test'
 
+const denseInterfaceSelector = [
+  '.demo-banner',
+  '.nav-links a',
+  '.nav-action',
+  '.button',
+  '.demo-opener-label',
+  '.section-code',
+  '.tier',
+  '.eyebrow',
+  '.panel-heading span',
+  '.panel-heading > small',
+  '.status',
+  '.dialog-code',
+  '.admin-bar span',
+  '.admin-bar b',
+  '.admin-nav a',
+  '.table-action',
+  '.filter-bar button',
+  '.admin-record > summary small',
+  '.record-detail-grid h3',
+  '.inventory-summary span',
+].join(', ')
+
+const actualControlSelector = [
+  'button',
+  'a.button',
+  '.nav-links a',
+  '.nav-action',
+  '.admin-nav a',
+  '.admin-shortcuts a',
+  '.queue-list > a',
+  '.table-action',
+  '.subsection-heading > a',
+  'summary',
+].join(', ')
+
+interface VisibleMetric {
+  element: string
+  value: number
+}
+
+async function visibleMetrics(
+  page: Page,
+  selector: string,
+  property: 'fontSize' | 'height',
+): Promise<VisibleMetric[]> {
+  return page.locator(selector).evaluateAll((elements, measuredProperty) =>
+    elements.flatMap((element) => {
+      const htmlElement = element as HTMLElement
+      const style = getComputedStyle(htmlElement)
+      const bounds = htmlElement.getBoundingClientRect()
+      const intentionallyHidden = htmlElement.matches('.sr-only')
+        || htmlElement.closest('.sr-only') !== null
+        || htmlElement.matches('.skip-link:not(:focus)')
+        || htmlElement.matches('.quantity-control label > span')
+      const visible = !intentionallyHidden
+        && style.display !== 'none'
+        && style.visibility !== 'hidden'
+        && style.opacity !== '0'
+        && bounds.width > 0
+        && bounds.height > 0
+      if (!visible) return []
+      return [{
+        element: `${htmlElement.tagName.toLowerCase()}${htmlElement.className ? `.${String(htmlElement.className).trim().replace(/\s+/g, '.')}` : ''}`,
+        value: measuredProperty === 'fontSize'
+          ? Number.parseFloat(style.fontSize)
+          : bounds.height,
+      }]
+    }), property)
+}
+
+async function expectVisibleFloor(
+  page: Page,
+  selector: string,
+  property: 'fontSize' | 'height',
+  floor: number,
+) {
+  const metrics = await visibleMetrics(page, selector, property)
+  expect(metrics.length, `Expected visible elements for ${selector}`).toBeGreaterThan(0)
+  expect(
+    metrics.filter(({ value }) => value + 0.01 < floor),
+    `Expected every visible ${selector} ${property} to be at least ${floor}px`,
+  ).toEqual([])
+}
+
+async function expectResponsiveInterfaceFloors(page: Page) {
+  await expectVisibleFloor(page, denseInterfaceSelector, 'fontSize', 11)
+  await expectVisibleFloor(page, actualControlSelector, 'height', 44)
+}
+
 async function expectNoRootOverflow(page: Page) {
   const overflow = await page.evaluate(() => ({
     scrollWidth: document.documentElement.scrollWidth,
@@ -34,7 +124,7 @@ async function computedThemeColors(page: Page) {
   })
 }
 
-test('responsive shell preserves navigation, legal text, input sizing and important bounds', async ({ page }) => {
+test('responsive shell preserves navigation, legal text, input sizing and important bounds', async ({ page, isMobile }) => {
   await page.addInitScript(() => localStorage.clear())
   await page.goto('')
   await expect(page.getByText('DEMO PROTOTYPE')).toBeVisible()
@@ -49,6 +139,7 @@ test('responsive shell preserves navigation, legal text, input sizing and import
     gold: '#e8b44c',
     cyan: '#72d9ed',
   })
+  const legalText = page.locator('.hero-copy > small')
   const importantSmallCopySizes = await page
     .locator('.hero-copy > small, .demo-opener-label')
     .evaluateAll((elements) =>
@@ -58,6 +149,12 @@ test('responsive shell preserves navigation, legal text, input sizing and import
   expect(importantSmallCopySizes.every((size) => size >= 11)).toBe(true)
 
   const width = page.viewportSize()?.width ?? 1000
+  if (width <= 820) {
+    await expectResponsiveInterfaceFloors(page)
+  }
+  if (isMobile) {
+    await expect(page.locator('canvas')).toHaveAttribute('data-render-profile', 'balanced')
+  }
   if (width <= 768) {
     await expect(page.locator('#pool')).toBeVisible()
     await expect(page.locator('#pool').getByRole('heading', { name: /everything in the box/i })).toBeVisible()
@@ -84,25 +181,24 @@ test('responsive shell preserves navigation, legal text, input sizing and import
     await expect(buyBar).toBeVisible()
     const buttonHeight = await buyBar.locator('.button').evaluate((element) => element.getBoundingClientRect().height)
     expect(buttonHeight).toBeGreaterThanOrEqual(44)
-    const clearance = await page.evaluate(() => {
-      const legal = document.querySelector('.hero-copy > small')!.getBoundingClientRect()
-      const bar = document.querySelector('.mobile-buy-bar')!.getBoundingClientRect()
-      return { legalBottom: legal.bottom, barTop: bar.top }
-    })
+    await legalText.evaluate((element) => element.scrollIntoView({ block: 'center', behavior: 'instant' }))
+    await expect(legalText).toBeInViewport()
+    const [legalBottom, barTop] = await Promise.all([
+      legalText.evaluate((element) => element.getBoundingClientRect().bottom),
+      buyBar.evaluate((element) => element.getBoundingClientRect().top),
+    ])
+    const clearance = { legalBottom, barTop }
     expect(clearance.legalBottom).toBeLessThanOrEqual(clearance.barTop - 4)
+    await page.evaluate(() => window.scrollTo({ top: 0, behavior: 'instant' }))
+    await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(0)
   }
 
   await page.getByRole('link', { name: /demo sign in/i }).click()
-  const fontSizes = await page.locator('input, select, textarea').evaluateAll((elements) =>
-    elements.map((element) => Number.parseFloat(getComputedStyle(element).fontSize)),
-  )
-  expect(fontSizes.length).toBeGreaterThan(0)
-  expect(fontSizes.every((size) => size >= 16)).toBe(true)
-  const labelSizes = await page.locator('label').evaluateAll((elements) =>
-    elements.map((element) => Number.parseFloat(getComputedStyle(element).fontSize)),
-  )
-  expect(labelSizes.length).toBeGreaterThan(0)
-  expect(labelSizes.every((size) => size >= 12)).toBe(true)
+  if (width <= 820) {
+    await expectVisibleFloor(page, 'input, select, textarea', 'fontSize', 16)
+    await expectVisibleFloor(page, 'label', 'fontSize', 12)
+    await expectResponsiveInterfaceFloors(page)
+  }
   await page.getByRole('button', { name: /one-click aina demo/i }).click()
   const accountLink = page.getByRole('link', { name: 'Account', exact: true })
   await expect(accountLink).toBeVisible()
@@ -110,6 +206,9 @@ test('responsive shell preserves navigation, legal text, input sizing and import
   await accountLink.click()
   await expect(page.getByRole('heading', { name: 'Aina Demo' })).toBeVisible()
   await expectNoRootOverflow(page)
+  if (width <= 820) {
+    await expectResponsiveInterfaceFloors(page)
+  }
 
   await page.getByRole('button', { name: 'Reset demo data' }).click()
   const resetDialog = page.getByRole('dialog', { name: 'Reset all demo data?' })
@@ -122,6 +221,9 @@ test('responsive shell preserves navigation, legal text, input sizing and import
   await expectInsideViewport(goBackButton, page)
   await expectInsideViewport(confirmResetButton, page)
   await expectNoRootOverflow(page)
+  if (width <= 820) {
+    await expectResponsiveInterfaceFloors(page)
+  }
 
   await page.evaluate(() => {
     Storage.prototype.setItem = () => {
@@ -135,6 +237,47 @@ test('responsive shell preserves navigation, legal text, input sizing and import
   await expectInsideViewport(resetAlert, page)
   await expect(resetDialog).toBeVisible()
   await expect(resetDialog).toHaveAttribute('open', '')
+  await expectNoRootOverflow(page)
+})
+
+test('360px cart keeps a blank quantity draft visible and restores the last committed quantity', async ({ page }) => {
+  test.skip(page.viewportSize()?.width !== 360, 'This focused cart regression runs only at 360px.')
+  await page.addInitScript(() => localStorage.clear())
+  await page.goto('#/cart')
+  const quantityInput = page.getByRole('spinbutton', { name: /quantity/i })
+  const quantityLabel = page.locator('.quantity-control label > span')
+  const orderSummary = page.locator('.order-summary')
+
+  await expect(quantityLabel).toHaveCount(1)
+  expect(await visibleMetrics(page, '.quantity-control label > span', 'fontSize')).toEqual([])
+  await expect(quantityInput).toHaveValue('1')
+  await quantityInput.fill('')
+
+  await expect(quantityInput).toHaveValue('')
+  await expect(page.getByRole('heading', { name: /your demo cart is empty/i })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: /sign in to checkout/i })).toBeVisible()
+  await expect(orderSummary).toContainText('RM 100.00')
+  await expectNoRootOverflow(page)
+
+  await quantityInput.fill('2')
+
+  await expect(quantityInput).toHaveValue('2')
+  await expect(orderSummary).toContainText('RM 200.00')
+  await expect.poll(() => page.evaluate(() => {
+    const state = JSON.parse(localStorage.getItem('tbbc:demo:repository:v5')!)
+    return state.cart[0].quantity
+  })).toBe(2)
+
+  await quantityInput.fill('')
+  await quantityInput.blur()
+
+  await expect(quantityInput).toHaveValue('2')
+  await expect(page.getByRole('heading', { name: /your demo cart is empty/i })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: /sign in to checkout/i })).toBeVisible()
+  await expect.poll(() => page.evaluate(() => {
+    const state = JSON.parse(localStorage.getItem('tbbc:demo:repository:v5')!)
+    return state.cart[0].quantity
+  })).toBe(2)
   await expectNoRootOverflow(page)
 })
 
@@ -188,9 +331,20 @@ test('header keyboard order follows the visible desktop and mobile arrangement',
   const cart = page.getByRole('link', { name: /^Cart/ })
   const stackedMobile = (page.viewportSize()?.width ?? 1000) <= 620
 
+  const routeHeading = page.locator('main h1')
+  await expect(routeHeading).toHaveCount(1)
+  await expect(routeHeading).toBeFocused()
+  await page.locator('body').evaluate((body) => {
+    body.tabIndex = -1
+    body.focus()
+  })
   await expect(page.locator('body')).toBeFocused()
   await page.keyboard.press('Tab')
-  await expect(page.getByRole('button', { name: /skip to content/i })).toBeFocused()
+  const skipToContent = page.getByRole('button', { name: /skip to content/i })
+  await expect(skipToContent).toBeFocused()
+  await page.locator('body').evaluate((body) => body.removeAttribute('tabindex'))
+  await expect(page.locator('body')).not.toHaveAttribute('tabindex')
+  await expect(skipToContent).toBeFocused()
   await page.keyboard.press('Tab')
   await expect(brand).toBeFocused()
   await page.keyboard.press('Tab')
@@ -222,15 +376,103 @@ test('admin mobile keeps fulfilment actions', async ({ page, isMobile }) => {
   await expect(page.getByLabel(/fictional tracking code/i)).toBeVisible()
   await expect(page.getByRole('button', { name: /review tracking change/i })).toBeVisible()
   await expectNoRootOverflow(page)
+  await expectVisibleFloor(page, 'input, select, textarea', 'fontSize', 16)
+  await expectVisibleFloor(page, 'label', 'fontSize', 12)
+  await expectResponsiveInterfaceFloors(page)
+})
+
+test('320px typed remedy dialog stays scrollable, labelled, and restores its opener', async ({ page }) => {
+  test.skip(page.viewportSize()?.width !== 320, 'This exact dialog overflow regression runs at 320px.')
+  await page.addInitScript(() => localStorage.clear())
+  await page.goto('#/auth')
+  await page.getByRole('button', { name: /one-click aina demo/i }).click()
+  await page.goto('#/order/ord-delivered')
+  await expectVisibleFloor(page, '.remedy-original span', 'fontSize', 11)
+  await expectVisibleFloor(page, '.remedy-original small', 'fontSize', 11)
+  await page.getByRole('link', { name: /start a demo claim/i }).click()
+  await page.getByLabel(/fictional note/i).fill('DEMO mobile typed remedy dialog evidence.')
+  await page.getByRole('button', { name: /submit demo claim/i }).click()
+  await page.getByRole('button', { name: /log out/i }).click()
+  await page.getByRole('link', { name: /demo sign in/i }).click()
+  await page.getByRole('button', { name: /one-click vault admin/i }).click()
+  await page.getByRole('link', { name: 'Claims', exact: true }).click()
+  const claim = page.locator('.claim-record').first()
+  await claim.getByRole('button', { name: 'Acknowledge' }).click()
+  await page.getByRole('button', { name: /confirm note & audit/i }).click()
+  await claim.getByRole('button', { name: 'Approve' }).click()
+  await page.getByRole('button', { name: /confirm note & audit/i }).click()
+
+  const opener = claim.getByRole('button', { name: /record typed remedy/i })
+  await opener.click()
+  const dialog = page.getByRole('dialog', { name: /record typed remedy for exact claim/i })
+  await expect(dialog).toBeVisible()
+  await expect(dialog).toHaveAttribute('aria-busy', 'false')
+  await expect(dialog.getByRole('group', { name: /choose one exact remedy action/i })).toBeVisible()
+  await expect(dialog.getByLabel(/required review note/i)).toBeVisible()
+  await expectInsideViewport(dialog, page)
+  await expectInsideViewport(dialog.getByRole('button', { name: /go back/i }), page)
+  await expectInsideViewport(dialog.getByRole('button', { name: /confirm typed evidence/i }), page)
+  await expectNoRootOverflow(page)
+  await expectResponsiveInterfaceFloors(page)
+  const dialogMetrics = await dialog.evaluate((element) => ({
+    clientHeight: element.clientHeight,
+    scrollHeight: element.scrollHeight,
+    viewportHeight: window.innerHeight,
+  }))
+  expect(dialogMetrics.clientHeight).toBeLessThanOrEqual(dialogMetrics.viewportHeight - 14)
+  expect(dialogMetrics.scrollHeight).toBeGreaterThanOrEqual(dialogMetrics.clientHeight)
+
+  await page.keyboard.press('Escape')
+  await expect(dialog).toBeHidden()
+  await expect(opener).toBeFocused()
+})
+
+test('66px and 104px sticky site headers keep admin navigation below them after scrolling', async ({ page }) => {
+  const width = page.viewportSize()?.width
+  test.skip(
+    width !== 320 && width !== 390 && width !== 768,
+    'This overlap regression covers narrow mobile and tablet header heights.',
+  )
+  await page.addInitScript(() => localStorage.clear())
+  await page.goto('#/auth')
+  await page.getByRole('button', { name: /one-click vault admin/i }).click()
+  await page.getByRole('link', { name: 'Inventory' }).click()
+  await expect(page.getByRole('heading', { name: 'Inventory' })).toBeVisible()
+
+  await page.evaluate(() => window.scrollTo({ top: 900, behavior: 'instant' }))
+  await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(0)
+
+  const rectangles = await page.evaluate(() => {
+    const site = document.querySelector<HTMLElement>('.site-nav')!.getBoundingClientRect()
+    const admin = document.querySelector<HTMLElement>('.admin-nav')!.getBoundingClientRect()
+    return {
+      site: { top: site.top, bottom: site.bottom, height: site.height },
+      admin: { top: admin.top, bottom: admin.bottom, height: admin.height },
+    }
+  })
+  expect(rectangles.site.height).toBe(width === 768 ? 66 : 104)
+  expect(rectangles.admin.top).toBeGreaterThanOrEqual(rectangles.site.bottom - 1)
+  expect(rectangles.admin.height).toBeGreaterThanOrEqual(44)
+
+  await page.getByRole('link', { name: 'Payments' }).click()
+  await expect(page.getByRole('heading', { name: 'Payments' })).toBeVisible()
+  await expect(page.getByRole('navigation', { name: 'Admin navigation' })).toBeVisible()
+  await expectNoRootOverflow(page)
 })
 
 test('every mobile viewport completes checkout, payment, order, reveal, account and admin flows', async ({ page, isMobile }) => {
-  test.skip(!isMobile, 'The complete mobile journey runs at 360, 390, 430 and 768 widths.')
+  test.skip(!isMobile, 'The complete mobile journey runs at 320, 360, 390, 430 and 768 widths.')
   await page.addInitScript(() => localStorage.clear())
   await page.goto('')
   await page.getByRole('button', { name: /get a demo box/i }).first().click()
   await page.getByRole('button', { name: /sign in to checkout/i }).click()
   await page.getByRole('button', { name: /one-click aina demo/i }).click()
+  const checkoutPrimaryLabelSpans = page.locator('label > span:not(.sr-only)')
+  const checkoutLabelHelpers = page.locator('label small')
+  await expect(checkoutPrimaryLabelSpans).toHaveCount(4)
+  await expect(checkoutLabelHelpers).toHaveCount(3)
+  await expectVisibleFloor(page, 'label > span:not(.sr-only)', 'fontSize', 12)
+  await expectVisibleFloor(page, 'label small', 'fontSize', 11)
   await expectInsideViewport(page.getByRole('button', { name: /reserve & continue/i }), page)
   await expectNoRootOverflow(page)
   await page.getByRole('checkbox').check()

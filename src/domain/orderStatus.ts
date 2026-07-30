@@ -1,4 +1,8 @@
 import type { OrderStatus, ShipmentStatus } from './types'
+import {
+  deriveOrderStatusFromScopeStatuses,
+  type FulfillmentScopeStatus,
+} from './orderFulfillment'
 
 export type ShipmentDerivedOrderStatus = Extract<
   OrderStatus,
@@ -8,13 +12,13 @@ export type ShipmentDerivedOrderStatus = Extract<
 export function deriveOrderStatusFromShipments(
   statuses: readonly ShipmentStatus[],
 ): ShipmentDerivedOrderStatus {
-  if (statuses.length === 0 || statuses.every((status) => status === 'unfulfilled')) {
-    return 'confirmed'
-  }
-  const delivered = statuses.filter((status) => status === 'delivered').length
-  if (delivered === statuses.length) return 'fulfilled'
-  if (delivered > 0) return 'partially_fulfilled'
-  return 'processing'
+  const scopes: FulfillmentScopeStatus[] = statuses.map((status) =>
+    status === 'unfulfilled'
+      ? 'confirmed'
+      : status === 'delivered'
+        ? 'fulfilled'
+        : 'processing')
+  return deriveOrderStatusFromScopeStatuses(scopes)
 }
 
 export function neutralOrderDeliveryCode(orderId: string) {

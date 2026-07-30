@@ -1,17 +1,54 @@
 import { describe, expect, it, vi } from 'vitest'
-import { MockRepository, STORAGE_KEY } from '../src/data/MockRepository'
-import { createDemoState } from '../src/data/fixtures'
+import {
+  type LegacyDemoStateV8,
+  migrateDemoStateV8,
+  MockRepository,
+  STORAGE_KEY,
+  version9RmaReceiptAuditId,
+  version9RmaReturnedTimelineId,
+} from '../src/data/MockRepository'
+import { createDemoState, DEMO_ADDRESS } from '../src/data/fixtures'
 import { validateDemoState } from '../src/data/StateValidator'
+import {
+  AUDIT_EVIDENCE_MAX_BYTES,
+  canonicalizeAuditEvidence,
+} from '../src/domain/auditEvidence'
 import { CLAIM_EVIDENCE_WIDENING_NOTE } from '../src/domain/claimStatus'
-import { BOX_PRICE_SEN, MAX_CART_QUANTITY } from '../src/domain/constants'
+import {
+  BOX_PRICE_SEN,
+  MAX_CART_QUANTITY,
+  VALUE_FLOOR_SEN,
+} from '../src/domain/constants'
+import { exactOddsLabel } from '../src/domain/odds'
+import { legacyDirectReplacementMigrationId } from '../src/domain/migrationEvidence'
+import { refreshOrderFulfillment } from '../src/domain/orderFulfillment'
+import {
+  legacyIgnoredPaymentEventMigrationId,
+  matchingCurrentIgnoredPaymentEventAudit,
+  matchingLegacyIgnoredPaymentEventMigrationAudit,
+} from '../src/domain/paymentEventEvidence'
+import {
+  availableClaimShipmentIdsAt,
+  claimHasPreservedLegacyUnderSettledHistory,
+  FULL_REFUND_REMEDY_CONFLICT_CODE,
+  preservedCompletedClaimIdsForUnlinkedRefund,
+} from '../src/domain/remedyPolicy'
 import type { DemoState } from '../src/domain/types'
 import { AppServices } from '../src/services/AppServices'
 import {
   CountingStorage,
   FIXED_NOW,
+  incrementingClock,
   MemoryStorage,
+  makeProcessingOrderSingleGroupedPhysicalShipment,
   makeProcessingOrderTwoPhysicalShipments,
 } from './helpers'
+import {
+  handEditedPreviousWriterDualDeliveryState,
+  PREVIOUS_WRITER_CLAIM_ID,
+  previousWriterReplacementState,
+  previousWriterRmaState,
+} from './fixtures/previousWriterV8'
 
 class FaultStorage extends MemoryStorage {
   throwOnRead = false
@@ -33,6 +70,18 @@ class FaultStorage extends MemoryStorage {
     }
     super.setItem(key, value)
     this.successfulWrites += 1
+  }
+}
+
+class MutateThenFailOnceStorage extends MemoryStorage {
+  failAfterNextWrite = false
+
+  setItem(key: string, value: string) {
+    super.setItem(key, value)
+    if (this.failAfterNextWrite) {
+      this.failAfterNextWrite = false
+      throw new Error('write failed after mutation')
+    }
   }
 }
 
@@ -120,34 +169,1789 @@ function stateWithWidenedSealedClaim() {
     orderId: 'ord-processing',
     kind: 'non_delivery',
     orderLevelDelivery: true,
-    note: 'DEMO persisted widened neutral evidence',
+    note: 'DEMO persisted first neutral evidence',
   })
   return services.repository.exportForTest()
 }
 
+function stateWithTwoSameTimeWidenings() {
+  let now = FIXED_NOW
+  const services = new AppServices(new MemoryStorage(), () => now)
+  services.auth.oneClick('customer')
+  services.orders.setCartQuantity(3)
+  const order = services.orders.create({
+    requestId: 'checkout_0000000000000000000000000000d00d',
+    quantity: 3,
+    shippingMethod: 'standard',
+    address: DEMO_ADDRESS,
+    acknowledged: true,
+    displayedTotalSen: 31_200,
+  })
+  const payment = services.payments.createAttempt(order.id)
+  services.payments.act(payment.id, 'approve')
+  services.repository.update((state) => {
+    const originals = state.shipments.filter((shipment) =>
+      shipment.orderId === order.id &&
+      shipment.purpose === 'original')
+    let splitIndex = 0
+    while (originals.length < 3) {
+      const source = originals.find((shipment) =>
+        shipment.boxIds.length > 1)!
+      const boxId = source.boxIds.pop()!
+      splitIndex += 1
+      const split = {
+        ...structuredClone(source),
+        id: `shp-two-widenings-${splitIndex}`,
+        boxIds: [boxId],
+        trackingNumber: `DEMO-TWO-WIDENINGS-${splitIndex}`,
+        timeline: [{
+          ...structuredClone(source.timeline[0]),
+          id: `stl-two-widenings-${splitIndex}`,
+        }],
+      }
+      state.shipments.push(split)
+      state.boxes.find((box) => box.id === boxId)!.shipmentId = split.id
+      originals.push(split)
+    }
+  })
+  const shipmentIds = services.repository.getSnapshot().shipments
+    .filter((shipment) =>
+      shipment.orderId === order.id &&
+      shipment.purpose === 'original')
+    .map((shipment) => shipment.id)
+    .sort((left, right) => left.localeCompare(right))
+  const makeEligible = (shipmentId: string) => {
+    const shipment = services.repository.getSnapshot().shipments.find(
+      (entry) => entry.id === shipmentId,
+    )!
+    const path = shipment.kind === 'DIGITAL'
+      ? ['issued', 'sent', 'failed'] as const
+      : ['picking', 'packed', 'label_created', 'shipped', 'failed_delivery'] as const
+    services.auth.oneClick('admin')
+    for (const status of path) {
+      services.fulfilment.advance(
+        shipment.id,
+        status,
+        `Confirmed same-time widening evidence ${status}`,
+      )
+    }
+  }
+
+  now = '2026-07-28T05:00:00.000Z'
+  makeEligible(shipmentIds[0])
+  services.auth.oneClick('customer')
+  now = '2026-07-28T06:00:00.000Z'
+  const claim = services.claims.submit({
+    orderId: order.id,
+    kind: 'non_delivery',
+    orderLevelDelivery: true,
+    note: 'DEMO two same-time widening histories',
+  }).data
+
+  now = '2026-07-28T08:00:00.000Z'
+  makeEligible(shipmentIds[1])
+  services.auth.oneClick('customer')
+  services.claims.submit({
+    orderId: order.id,
+    kind: 'non_delivery',
+    orderLevelDelivery: true,
+    note: 'DEMO two same-time widening histories',
+  })
+  makeEligible(shipmentIds[2])
+  services.auth.oneClick('customer')
+  services.claims.submit({
+    orderId: order.id,
+    kind: 'non_delivery',
+    orderLevelDelivery: true,
+    note: 'DEMO two same-time widening histories',
+  })
+
+  return {
+    claimId: claim.id,
+    state: services.repository.exportForTest(),
+  }
+}
+
+function stateWithTwoCompletedClaimsAndUnlinkedRefund(
+  origin: 'generic' | 'dispute' = 'generic',
+) {
+  const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+  services.auth.oneClick('customer')
+  services.orders.setCartQuantity(3)
+  const order = services.orders.create({
+    requestId: 'checkout_0000000000000000000000000000cafe',
+    quantity: 3,
+    shippingMethod: 'standard',
+    address: DEMO_ADDRESS,
+    acknowledged: true,
+    displayedTotalSen: 31_200,
+  })
+  const payment = services.payments.createAttempt(order.id)
+  services.payments.act(payment.id, 'approve')
+  order.boxIds.forEach((boxId) => services.openBox(boxId))
+  const completedClaimIds: string[] = []
+  for (const [index, boxId] of order.boxIds.slice(0, 2).entries()) {
+    services.auth.oneClick('customer')
+    const claim = services.claims.submit({
+      orderId: order.id,
+      kind: 'value_floor',
+      boxId,
+      note: `DEMO completed preservation claim ${index + 1}`,
+    }).data
+    services.auth.oneClick('admin')
+    services.claims.review(
+      claim.id,
+      'acknowledge',
+      `Confirmed preservation claim ${index + 1} acknowledgement`,
+    )
+    services.claims.review(
+      claim.id,
+      'approve',
+      `Confirmed preservation claim ${index + 1} approval`,
+    )
+    services.payments.refund(
+      payment.id,
+      claim.requiredSettlementSen,
+      `Confirmed preservation claim ${index + 1} refund`,
+      `req-preservation-claim-${index + 1}`,
+      claim.id,
+    )
+    const linkedEventId = services.repository.getSnapshot().claims.find((entry) =>
+      entry.id === claim.id)!.linkedRefundEventId!
+    services.claims.review(
+      claim.id,
+      'resolve',
+      `Confirmed preservation claim ${index + 1} final audit`,
+      { outcome: 'refund_recorded', reference: linkedEventId },
+    )
+    completedClaimIds.push(claim.id)
+  }
+  const beforeFinal = services.repository.getSnapshot()
+  const remainingSen = beforeFinal.payments.find((entry) =>
+    entry.id === payment.id)!.amountSen -
+    beforeFinal.payments.find((entry) => entry.id === payment.id)!.refundedSen
+  if (origin === 'dispute') {
+    services.payments.dispute(
+      payment.id,
+      'Confirmed preservation-set dispute initiation',
+      'evt-preservation-set-dispute',
+    )
+    services.payments.resolveDispute(
+      payment.id,
+      'refund',
+      'Confirmed preservation-set dispute refund',
+      'evt-preservation-set-dispute-refund',
+    )
+  } else {
+    services.payments.refund(
+      payment.id,
+      remainingSen,
+      'Confirmed preservation-set generic refund',
+      'req-preservation-set-generic-refund',
+    )
+  }
+  return {
+    completedClaimIds: completedClaimIds.sort((left, right) =>
+      left.localeCompare(right)),
+    eventId: origin === 'dispute'
+      ? 'evt-preservation-set-dispute-refund'
+      : services.repository.getSnapshot().payments.find((entry) =>
+          entry.id === payment.id)!.events.find((event) =>
+          event.requestId === 'req-preservation-set-generic-refund')!.id,
+    paymentId: payment.id,
+    state: services.repository.exportForTest(),
+  }
+}
+
+function forgedPartialDisputeResolutionState() {
+  const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+  services.auth.oneClick('admin')
+  services.payments.refund(
+    'pay-processing',
+    1000,
+    'Confirmed ordinary partial refund before forged dispute history',
+    'req-forged-dispute-prior-partial',
+  )
+  services.payments.dispute(
+    'pay-processing',
+    'Confirmed dispute before forged partial resolution',
+    'evt-forged-partial-dispute',
+  )
+  services.payments.resolveDispute(
+    'pay-processing',
+    'merchant_won',
+    'Confirmed merchant path before forged customer intent',
+    'evt-forged-partial-resolution',
+  )
+  const state = services.repository.exportForTest()
+  const payment = state.payments.find((entry) =>
+    entry.id === 'pay-processing')!
+  const event = payment.events.find((entry) =>
+    entry.id === 'evt-forged-partial-resolution')!
+  const audit = state.audits.find((entry) =>
+    entry.eventId === event.id &&
+    entry.targetType === 'payment')!
+  payment.refundedSen += 1000
+  event.refundIntent = {
+    paymentId: payment.id,
+    amountSen: 1000,
+    reason: audit.reason,
+  }
+  audit.before = {
+    refundedSen: 1000,
+    status: 'disputed',
+  }
+  audit.after = {
+    allocationsReturned: 0,
+    amountSen: 1000,
+    orderStatus: 'refunded',
+    refundedSen: 2000,
+    status: 'partially_refunded',
+  }
+  return {
+    eventId: event.id,
+    paymentId: payment.id,
+    state,
+  }
+}
+
+function stateWithLateOriginalDelivery(
+  replacementTerminal: 'lost' | 'returned' = 'lost',
+) {
+  const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+  services.auth.oneClick('customer')
+  const claim = services.claims.submit({
+    orderId: 'ord-shipped',
+    kind: 'non_delivery',
+    shipmentId: 'shp-shipped',
+    note: `DEMO validator late original after ${replacementTerminal}`,
+  }).data
+  services.auth.oneClick('admin')
+  services.claims.review(
+    claim.id,
+    'acknowledge',
+    'Confirmed validator late original acknowledgement',
+  )
+  services.claims.review(
+    claim.id,
+    'approve',
+    'Confirmed validator late original approval',
+  )
+  const replacement = services.claims.authorizeReplacement(
+    claim.id,
+    'Confirmed validator late original replacement',
+  ).data
+  for (const status of [
+    'picking',
+    'packed',
+    'label_created',
+    'shipped',
+    replacementTerminal,
+  ] as const) {
+    services.fulfilment.advance(
+      replacement.id,
+      status,
+      `Confirmed validator late replacement ${status}`,
+    )
+  }
+  services.fulfilment.advance(
+    'shp-shipped',
+    'delivered',
+    'Confirmed validator permitted late original delivery',
+  )
+  return {
+    claimId: claim.id,
+    replacementId: replacement.id,
+    state: services.repository.exportForTest(),
+  }
+}
+
+function auditBusinessFields(audit: DemoState['audits'][number]) {
+  const businessFields = structuredClone(audit) as Partial<DemoState['audits'][number]>
+  delete businessFields.sequence
+  delete businessFields.previousId
+  delete businessFields.outcome
+  return businessFields
+}
+
+function toVersion5(state: DemoState = createDemoState()) {
+  const businessState = structuredClone(state) as Partial<DemoState>
+  const audits = state.audits.map(auditBusinessFields)
+  for (const order of businessState.orders ?? []) {
+    delete (order.snapshot as Partial<typeof order.snapshot>).valueFloorSen
+  }
+  for (const series of businessState.series ?? []) {
+    for (const prize of [
+      ...(series.publishedPrizes ?? []),
+      ...(series.draftPrizes ?? []),
+    ]) {
+      prize.odds = prize.id === 'iphone17'
+        ? '1 in 3,333'
+        : `legacy odds ${prize.allocation}`
+    }
+  }
+  for (const claim of businessState.claims ?? []) {
+    delete (claim as Partial<typeof claim>).remedyBoxIds
+    delete (claim as Partial<typeof claim>).requiredSettlementSen
+    delete (claim as Partial<typeof claim>).acceptedSettlementSen
+    delete (claim as Partial<typeof claim>).settlementPolicy
+    delete (claim as Partial<typeof claim>).legacyUnderSettledRefund
+  }
+  delete businessState.auditCount
+  delete businessState.auditHeadId
+  delete businessState.audits
+  return {
+    ...businessState,
+    schemaVersion: 5 as const,
+    audits,
+  }
+}
+
+function toVersion6(state: DemoState = createDemoState()) {
+  const legacy = structuredClone(state) as unknown as Omit<
+    DemoState,
+    'schemaVersion' | 'shipments' | 'claims'
+  > & {
+    schemaVersion: number
+    shipments: Array<Partial<DemoState['shipments'][number]>>
+    claims: Array<Partial<DemoState['claims'][number]>>
+  }
+  legacy.schemaVersion = 6
+  for (const shipment of legacy.shipments) {
+    delete shipment.purpose
+    delete shipment.sourceClaimId
+    delete shipment.replacementForShipmentId
+  }
+  for (const claim of legacy.claims) {
+    delete claim.remedyState
+    delete claim.rma
+    delete claim.replacementShipmentId
+    delete claim.replacementAuthorization
+    delete claim.legacyTypedResolution
+    delete claim.remedyBoxIds
+    delete claim.requiredSettlementSen
+    delete claim.acceptedSettlementSen
+    delete claim.settlementPolicy
+    delete claim.legacyUnderSettledRefund
+  }
+  return legacy
+}
+
+function toVersion7(state: DemoState = createDemoState()) {
+  const legacy = structuredClone(state) as unknown as Omit<
+    DemoState,
+    'schemaVersion' | 'claims'
+  > & {
+    schemaVersion: number
+    claims: Array<Partial<DemoState['claims'][number]>>
+  }
+  legacy.schemaVersion = 7
+  for (const claim of legacy.claims) {
+    delete claim.remedyBoxIds
+    delete claim.requiredSettlementSen
+    delete claim.acceptedSettlementSen
+    delete claim.settlementPolicy
+    delete claim.legacyUnderSettledRefund
+  }
+  return legacy
+}
+
+function toPreviousWriterVersion8(
+  state: DemoState = createDemoState(),
+  options: { preserveFinancialStopAudits?: boolean } = {},
+): LegacyDemoStateV8 {
+  const legacy = structuredClone(state) as unknown as LegacyDemoStateV8
+  legacy.schemaVersion = 8
+  legacy.audits = legacy.audits.filter((audit) => {
+    if (
+      audit.action === 'shipment.transitioned' ||
+      audit.action === 'order.dispute_resolved'
+    ) {
+      return false
+    }
+    if (
+      audit.action.startsWith('order.financial_hold_') &&
+      !options.preserveFinancialStopAudits
+    ) return false
+    if (
+      audit.targetType === 'payment' &&
+      ['payment.partially_refunded', 'payment.refunded'].includes(audit.action)
+    ) {
+      const payment = legacy.payments.find((entry) =>
+        entry.id === audit.targetId)
+      const event = payment?.events.find((entry) =>
+        entry.id === audit.eventId)
+      if (event?.refundIntent && event.refundIntent.claimId === undefined) {
+        return false
+      }
+    }
+    return true
+  }).map((audit, index, audits) => {
+    const withoutPrevious = { ...audit }
+    delete withoutPrevious.previousId
+    return {
+      ...withoutPrevious,
+      sequence: index + 1,
+      ...(index > 0 ? { previousId: audits[index - 1].id } : {}),
+    }
+  })
+  legacy.auditCount = legacy.audits.length
+  legacy.auditHeadId = legacy.audits.at(-1)?.id ?? ''
+  return legacy
+}
+
+function ignoredPaymentEventFixture(
+  source: 'mock_webhook' | 'admin_reconcile',
+) {
+  const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+  services.auth.oneClick(source === 'mock_webhook' ? 'customer' : 'admin')
+  const paymentId = 'pay-unopened'
+  const eventId = `evt-current-ignored-${source}`
+  const reason = source === 'mock_webhook'
+    ? 'Processed one idempotent demo payment event'
+    : 'Confirmed current ignored finance event evidence'
+  services.payments.processEvent(
+    paymentId,
+    eventId,
+    'failed',
+    source,
+    reason,
+  )
+  return {
+    eventId,
+    paymentId,
+    reason,
+    state: services.repository.exportForTest(),
+  }
+}
+
+function previousWriterIgnoredPaymentEvent(
+  source: 'mock_webhook' | 'admin_reconcile',
+) {
+  const fixture = ignoredPaymentEventFixture(source)
+  const legacy = toPreviousWriterVersion8(fixture.state)
+  const payment = legacy.payments.find((entry) =>
+    entry.id === fixture.paymentId)!
+  const event = payment.events.find((entry) =>
+    entry.id === fixture.eventId)!
+  delete event.ignoredOutcome
+  delete event.ignoredPriorStatus
+  delete event.ignoredRelatedPaymentId
+  delete event.ignoredRoute
+  delete event.ignoredInputReason
+  const audit = legacy.audits.find((entry) =>
+    entry.eventId === event.id &&
+    entry.action === 'payment.event_ignored')
+  if (source === 'admin_reconcile') {
+    audit!.after = {
+      attemptedStatus: event.type,
+      ignoredReason: event.ignoredReason!,
+      status: 'succeeded',
+    }
+  } else {
+    removeAudit(
+      legacy as unknown as DemoState,
+      (entry) =>
+        entry.eventId === event.id &&
+        entry.action === 'payment.event_ignored',
+    )
+  }
+  return { ...fixture, event, legacy, payment }
+}
+
+function previousWriterConflictingSuccessIgnoredEvent(
+  outcome: 'other_payment_active' | 'other_payment_captured',
+) {
+  const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+  services.auth.oneClick('customer')
+  services.orders.setCartQuantity(1)
+  const order = services.orders.create({
+    requestId: outcome === 'other_payment_active'
+      ? 'checkout_000000000000000000000000000000a1'
+      : 'checkout_000000000000000000000000000000a2',
+    quantity: 1,
+    shippingMethod: 'standard',
+    address: DEMO_ADDRESS,
+    acknowledged: true,
+    displayedTotalSen: BOX_PRICE_SEN + 1200,
+  })
+  const ignoredPayment = services.payments.createAttempt(order.id)
+  services.payments.act(ignoredPayment.id, 'decline')
+  const relatedPayment = services.payments.createAttempt(order.id)
+  if (outcome === 'other_payment_captured') {
+    services.payments.processEvent(
+      relatedPayment.id,
+      `evt-related-${outcome}`,
+      'succeeded',
+    )
+  }
+  const eventId = `evt-previous-writer-${outcome}`
+  services.payments.processEvent(
+    ignoredPayment.id,
+    eventId,
+    'succeeded',
+  )
+  const legacy = toPreviousWriterVersion8(
+    services.repository.exportForTest(),
+  )
+  const payment = legacy.payments.find((entry) =>
+    entry.id === ignoredPayment.id)!
+  const event = payment.events.find((entry) => entry.id === eventId)!
+  delete event.ignoredOutcome
+  delete event.ignoredPriorStatus
+  delete event.ignoredRelatedPaymentId
+  delete event.ignoredRoute
+  delete event.ignoredInputReason
+  removeAudit(
+    legacy as unknown as DemoState,
+    (audit) =>
+      audit.eventId === eventId &&
+      audit.action === 'payment.event_ignored',
+  )
+  return {
+    event,
+    eventId,
+    ignoredPaymentId: ignoredPayment.id,
+    legacy,
+    relatedPaymentId: relatedPayment.id,
+  }
+}
+
+function previousWriterActiveConflictThenSameInstantCapture() {
+  const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+  services.auth.oneClick('customer')
+  services.orders.setCartQuantity(1)
+  const order = services.orders.create({
+    requestId: 'checkout_000000000000000000000000000000a3',
+    quantity: 1,
+    shippingMethod: 'standard',
+    address: DEMO_ADDRESS,
+    acknowledged: true,
+    displayedTotalSen: BOX_PRICE_SEN + 1200,
+  })
+  const ignoredPayment = services.payments.createAttempt(order.id)
+  services.payments.act(ignoredPayment.id, 'decline')
+  const relatedPayment = services.payments.createAttempt(order.id)
+  const eventId = 'evt-previous-writer-active-before-same-instant-capture'
+  services.payments.processEvent(
+    ignoredPayment.id,
+    eventId,
+    'succeeded',
+  )
+  services.payments.processEvent(
+    relatedPayment.id,
+    'evt-previous-writer-later-same-instant-capture',
+    'succeeded',
+  )
+  const legacy = toPreviousWriterVersion8(
+    services.repository.exportForTest(),
+  )
+  const event = legacy.payments.find((entry) =>
+    entry.id === ignoredPayment.id)!.events.find((entry) =>
+    entry.id === eventId)!
+  delete event.ignoredOutcome
+  delete event.ignoredPriorStatus
+  delete event.ignoredRelatedPaymentId
+  delete event.ignoredRoute
+  delete event.ignoredInputReason
+  removeAudit(
+    legacy as unknown as DemoState,
+    (audit) =>
+      audit.eventId === eventId &&
+      audit.action === 'payment.event_ignored',
+  )
+  return {
+    eventId,
+    ignoredPaymentId: ignoredPayment.id,
+    legacy,
+    relatedPaymentId: relatedPayment.id,
+  }
+}
+
+function ordersWithoutValueFloor(orders: DemoState['orders']) {
+  return structuredClone(orders).map((order) => {
+    delete (order.snapshot as Partial<typeof order.snapshot>).valueFloorSen
+    return order
+  })
+}
+
+function seriesWithoutOdds(series: DemoState['series']) {
+  const copy = structuredClone(series)
+  for (const entry of copy) {
+    for (const prize of [
+      ...(entry.publishedPrizes ?? []),
+      ...(entry.draftPrizes ?? []),
+    ]) {
+      delete (prize as Partial<typeof prize>).odds
+    }
+  }
+  return copy
+}
+
+function claimsWithoutV8Snapshot(claims: DemoState['claims']) {
+  return structuredClone(claims).map((claim) => {
+    delete (claim as Partial<typeof claim>).remedyBoxIds
+    delete (claim as Partial<typeof claim>).requiredSettlementSen
+    delete (claim as Partial<typeof claim>).acceptedSettlementSen
+    delete (claim as Partial<typeof claim>).settlementPolicy
+    delete (claim as Partial<typeof claim>).legacyUnderSettledRefund
+    return claim
+  })
+}
+
+function stateWithTwoAudits() {
+  const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+  services.auth.oneClick('customer')
+  services.openBox('box-unopened-01')
+  return services.repository.exportForTest()
+}
+
+function stateWithLinkedRefundClaim(resolved = false) {
+  const services = servicesWithClaim('damage')
+  const claim = services.repository.getSnapshot().claims[0]
+  services.auth.oneClick('admin')
+  services.claims.review(claim.id, 'acknowledge', 'Acknowledged linked validator evidence')
+  services.claims.review(claim.id, 'approve', 'Approved linked validator evidence')
+  services.payments.refund(
+    'pay-delivered',
+    claim.requiredSettlementSen,
+    'Confirmed linked validator refund',
+    'req-linked-validator-refund',
+    claim.id,
+  )
+  if (resolved) {
+    const linked = services.repository.getSnapshot().claims[0].linkedRefundEventId!
+    services.claims.review(
+      claim.id,
+      'resolve',
+      'Resolved with the exact linked and audited refund event',
+      { outcome: 'refund_recorded', reference: linked },
+    )
+  }
+  return services.repository.exportForTest()
+}
+
+function stateWithReplacement(delivered = true) {
+  const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+  services.auth.oneClick('customer')
+  const claim = services.claims.submit({
+    orderId: 'ord-failed',
+    kind: 'non_delivery',
+    shipmentId: 'shp-failed',
+    note: 'DEMO validator replacement provenance claim',
+  }).data
+  services.auth.oneClick('admin')
+  services.claims.review(claim.id, 'acknowledge', 'Confirmed validator replacement acknowledgement')
+  services.claims.review(claim.id, 'approve', 'Confirmed validator replacement approval')
+  const replacement = services.claims.authorizeReplacement(
+    claim.id,
+    'Confirmed validator replacement authorization',
+  ).data
+  if (delivered) {
+    for (const status of ['picking', 'packed', 'label_created', 'shipped', 'delivered'] as const) {
+      services.fulfilment.advance(
+        replacement.id,
+        status,
+        `Confirmed validator replacement ${status}`,
+      )
+    }
+  }
+  return services.repository.exportForTest()
+}
+
+function stateWithInspectedRma() {
+  const services = new AppServices(new MemoryStorage(), incrementingClock())
+  services.auth.oneClick('customer')
+  const claim = services.claims.submit({
+    orderId: 'ord-delivered',
+    kind: 'damage',
+    shipmentId: 'shp-delivered',
+    note: 'DEMO validator ordered RMA evidence claim',
+  }).data
+  services.auth.oneClick('admin')
+  services.claims.review(claim.id, 'acknowledge', 'Confirmed validator RMA acknowledgement')
+  services.claims.review(claim.id, 'approve', 'Confirmed validator RMA approval')
+  services.claims.createRma(claim.id, 'DEMO-RMA-VALIDATOR-01', 'Confirmed validator RMA creation')
+  services.claims.recordRmaReceived(claim.id, 'DEMO-RMA-VALIDATOR-01', 'Confirmed validator RMA receipt')
+  services.claims.recordRmaInspected(claim.id, 'DEMO-RMA-VALIDATOR-01', 'Confirmed validator RMA inspection')
+  return services.repository.exportForTest()
+}
+
+function legacyUnderSettledVersion7State() {
+  const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+  makeProcessingOrderSingleGroupedPhysicalShipment(services)
+  services.auth.oneClick('customer')
+  services.openBox('box-processing-02')
+  const claim = services.claims.submit({
+    orderId: 'ord-processing',
+    kind: 'value_floor',
+    boxId: 'box-processing-01',
+    note: 'DEMO legacy under-settled value-floor evidence',
+  }).data
+  services.auth.oneClick('admin')
+  services.claims.review(
+    claim.id,
+    'acknowledge',
+    'Confirmed legacy under-settled acknowledgement',
+  )
+  services.claims.review(
+    claim.id,
+    'approve',
+    'Confirmed legacy under-settled approval',
+  )
+  services.payments.refund(
+    'pay-processing',
+    claim.requiredSettlementSen,
+    'Confirmed legacy refund evidence before downgrade',
+    'req-legacy-under-settled',
+    claim.id,
+  )
+  const linked = services.repository.getSnapshot().claims
+    .find((entry) => entry.id === claim.id)!.linkedRefundEventId!
+  services.claims.review(
+    claim.id,
+    'resolve',
+    'Confirmed legacy refund resolution evidence',
+    { outcome: 'refund_recorded', reference: linked },
+  )
+
+  const legacy = toVersion7(services.repository.exportForTest())
+  const payment = legacy.payments.find((entry) => entry.id === 'pay-processing')!
+  const event = payment.events.find((entry) => entry.id === linked)!
+  event.refundIntent!.amountSen = 1000
+  payment.refundedSen = 1000
+  const paymentAudit = legacy.audits.find((audit) =>
+    audit.eventId === linked && audit.targetType === 'payment')!
+  ;(paymentAudit.after as Record<string, unknown>).refundedSen = 1000
+  return legacy
+}
+
+function cappedTerminalFallbackVersion7State() {
+  const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+  services.auth.oneClick('customer')
+  const claim = services.claims.submit({
+    orderId: 'ord-failed',
+    kind: 'non_delivery',
+    shipmentId: 'shp-failed',
+    note: 'DEMO capped terminal version 7 migration evidence',
+  }).data
+  services.auth.oneClick('admin')
+  services.claims.review(
+    claim.id,
+    'acknowledge',
+    'Confirmed capped terminal migration acknowledgement',
+  )
+  services.claims.review(
+    claim.id,
+    'approve',
+    'Confirmed capped terminal migration approval',
+  )
+  const replacement = services.claims.authorizeReplacement(
+    claim.id,
+    'Confirmed capped terminal migration replacement',
+  ).data
+  for (const status of [
+    'picking',
+    'packed',
+    'label_created',
+    'shipped',
+    'returned',
+  ] as const) {
+    services.fulfilment.advance(
+      replacement.id,
+      status,
+      `Confirmed capped terminal migration ${status}`,
+    )
+  }
+  services.payments.refund(
+    'pay-failed',
+    1000,
+    'Confirmed prior partial for capped terminal migration',
+    'req-v7-capped-terminal-prior',
+  )
+  services.payments.refund(
+    'pay-failed',
+    10_200,
+    'Confirmed capped terminal version 7 claim refund',
+    'req-v7-capped-terminal-claim',
+    claim.id,
+  )
+  return toVersion7(services.repository.exportForTest())
+}
+
+function overSettledVersion7State() {
+  const legacy = legacyUnderSettledVersion7State()
+  const claim = legacy.claims[0]
+  const payment = legacy.payments.find((entry) => entry.id === 'pay-processing')!
+  const event = payment.events.find((entry) =>
+    entry.id === claim.linkedRefundEventId)!
+  event.refundIntent!.amountSen = 10_601
+  payment.refundedSen = 10_601
+  const paymentAudit = legacy.audits.find((audit) =>
+    audit.eventId === event.id && audit.targetType === 'payment')!
+  ;(paymentAudit.after as Record<string, unknown>).refundedSen = 10_601
+  return legacy
+}
+
+function stateWithDeliveredDigitalReissue() {
+  let now = FIXED_NOW
+  const services = new AppServices(new MemoryStorage(), () => now)
+  services.auth.oneClick('customer')
+  services.openBox('box-processing-02')
+  services.auth.oneClick('admin')
+  services.fulfilment.advance(
+    'shp-digital',
+    'issued',
+    'Confirmed validator digital original issued',
+  )
+  services.fulfilment.advance(
+    'shp-digital',
+    'sent',
+    'Confirmed validator digital original sent',
+  )
+  now = '2026-08-01T04:00:00.000Z'
+  services.auth.oneClick('customer')
+  const claim = services.claims.submit({
+    orderId: 'ord-processing',
+    kind: 'non_delivery',
+    shipmentId: 'shp-digital',
+    note: 'DEMO validator digital reissue entitlement evidence',
+  }).data
+  services.auth.oneClick('admin')
+  services.claims.review(
+    claim.id,
+    'acknowledge',
+    'Confirmed validator digital reissue acknowledgement',
+  )
+  services.claims.review(
+    claim.id,
+    'approve',
+    'Confirmed validator digital reissue approval',
+  )
+  const replacement = services.claims.authorizeReplacement(
+    claim.id,
+    'Confirmed validator digital reissue authorization',
+  ).data
+  services.fulfilment.advance(
+    replacement.id,
+    'issued',
+    'Confirmed validator digital replacement issued',
+  )
+  services.fulfilment.advance(
+    replacement.id,
+    'sent',
+    'Confirmed validator digital replacement sent',
+  )
+  now = '2026-08-01T05:00:00.000Z'
+  services.fulfilment.advance(
+    replacement.id,
+    'delivered',
+    'Confirmed validator digital replacement delivered',
+  )
+  return services.repository.exportForTest()
+}
+
+function removeAudit(
+  state: DemoState,
+  predicate: (audit: DemoState['audits'][number]) => boolean,
+) {
+  state.audits = state.audits.filter((audit) => !predicate(audit))
+  state.audits.forEach((audit, index) => {
+    audit.sequence = index + 1
+    if (index === 0) {
+      delete audit.previousId
+    } else {
+      audit.previousId = state.audits[index - 1].id
+    }
+  })
+  state.auditCount = state.audits.length
+  state.auditHeadId = state.audits.at(-1)!.id
+}
+
 describe('MockRepository recovery and persistence', () => {
+  it('accepts both approved intermediate and resolved bidirectional claim-refund links', () => {
+    expect(() => validateDemoState(stateWithLinkedRefundClaim())).not.toThrow()
+    expect(() => validateDemoState(stateWithLinkedRefundClaim(true))).not.toThrow()
+  })
+
+  it.each(['generic', 'dispute'] as const)(
+    'requires the exact sorted preservation set on an unlinked %s refund audit',
+    (origin) => {
+      const fixture = stateWithTwoCompletedClaimsAndUnlinkedRefund(origin)
+      const payment = fixture.state.payments.find((entry) =>
+        entry.id === fixture.paymentId)!
+      const event = payment.events.find((entry) =>
+        entry.id === fixture.eventId)!
+      const audit = fixture.state.audits.find((entry) =>
+        entry.eventId === fixture.eventId &&
+        entry.targetType === 'payment')!
+
+      expect(preservedCompletedClaimIdsForUnlinkedRefund(
+        fixture.state,
+        payment,
+        audit,
+      )).toEqual(fixture.completedClaimIds)
+      expect(audit.after).toMatchObject({
+        preservedCompletedClaimIds: fixture.completedClaimIds,
+        refundedSen: payment.amountSen,
+        status: event.type,
+      })
+      expect(() => validateDemoState(fixture.state)).not.toThrow()
+
+      for (const corrupt of [
+        (state: DemoState) => {
+          delete (state.audits.find((entry) =>
+            entry.eventId === fixture.eventId)!.after as
+              Record<string, unknown>).preservedCompletedClaimIds
+        },
+        (state: DemoState) => {
+          ;(state.audits.find((entry) =>
+            entry.eventId === fixture.eventId)!.after as
+              Record<string, unknown>).preservedCompletedClaimIds = [
+              ...fixture.completedClaimIds,
+              'clm-phantom-preserved',
+            ]
+        },
+        (state: DemoState) => {
+          ;(state.audits.find((entry) =>
+            entry.eventId === fixture.eventId)!.after as
+              Record<string, unknown>).preservedCompletedClaimIds =
+              [...fixture.completedClaimIds].reverse()
+        },
+      ]) {
+        const state = structuredClone(fixture.state)
+        corrupt(state)
+        expect(() => validateDemoState(state)).toThrow(
+          /exact immutable payment audit|matching applied refund audit|exact generic or dispute-origin payment audit/i,
+        )
+      }
+    },
+  )
+
+  it('rejects a generic-partial then disputed forged partial customer refund even with exact-looking audit evidence and an active order', () => {
+    const fixture = forgedPartialDisputeResolutionState()
+    const payment = fixture.state.payments.find((entry) =>
+      entry.id === fixture.paymentId)!
+    const order = fixture.state.orders.find((entry) =>
+      entry.id === payment.orderId)!
+    const event = payment.events.find((entry) =>
+      entry.id === fixture.eventId)!
+
+    expect(payment).toMatchObject({
+      status: 'partially_refunded',
+      refundedSen: 2000,
+    })
+    expect(event).toMatchObject({
+      type: 'partially_refunded',
+      refundIntent: {
+        amountSen: 1000,
+        paymentId: payment.id,
+      },
+    })
+    expect(['confirmed', 'processing', 'partially_fulfilled', 'fulfilled'])
+      .toContain(order.status)
+    expect(() => validateDemoState(fixture.state)).toThrow(
+      /invalid customer-won or merchant-won shape/i,
+    )
+  })
+
+  it('requires omission rather than an empty preservation set when no completed history exists', () => {
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    services.auth.oneClick('admin')
+    const result = services.payments.refund(
+      'pay-unopened',
+      1000,
+      'Confirmed refund with no preservation histories',
+      'req-no-preservation-histories',
+    )
+    const state = services.repository.exportForTest()
+    const event = result.payment.events.find((entry) =>
+      entry.requestId === 'req-no-preservation-histories')!
+    const audit = state.audits.find((entry) => entry.eventId === event.id)!
+    expect(audit.after).not.toHaveProperty('preservedCompletedClaimIds')
+    expect(() => validateDemoState(state)).not.toThrow()
+
+    ;(audit.after as Record<string, unknown>).preservedCompletedClaimIds = []
+    expect(() => validateDemoState(state)).toThrow(
+      /matching applied refund audit|exact generic or dispute-origin payment audit/i,
+    )
+  })
+
+  it.each(['generic', 'dispute'] as const)(
+    'binds every accepted unlinked %s refund intent to one exact audit',
+    (origin) => {
+      const fixture = stateWithTwoCompletedClaimsAndUnlinkedRefund(origin)
+      const mutations: Array<(state: DemoState) => void> = [
+        (state) => {
+          state.audits.find((audit) =>
+            audit.eventId === fixture.eventId)!.targetId = 'pay-wrong-target'
+        },
+        (state) => {
+          state.audits.find((audit) =>
+            audit.eventId === fixture.eventId)!.reason =
+              'Altered accepted refund reason'
+        },
+        (state) => {
+          state.audits.find((audit) =>
+            audit.eventId === fixture.eventId)!.requestId =
+              'req-altered-accepted-refund'
+        },
+        (state) => {
+          ;(state.audits.find((audit) =>
+            audit.eventId === fixture.eventId)!.before as
+              Record<string, unknown>).refundedSen = 1
+        },
+        (state) => {
+          ;(state.audits.find((audit) =>
+            audit.eventId === fixture.eventId)!.after as
+              Record<string, unknown>).allocationsReturned = 1
+        },
+        (state) => {
+          const event = state.payments.find((payment) =>
+            payment.id === fixture.paymentId)!.events.find((entry) =>
+            entry.id === fixture.eventId)!
+          event.refundIntent!.reason = 'Altered refund intent reason'
+        },
+        (state) => {
+          const event = state.payments.find((payment) =>
+            payment.id === fixture.paymentId)!.events.find((entry) =>
+            entry.id === fixture.eventId)!
+          event.processedAt = '2026-07-28T04:00:00.001Z'
+        },
+      ]
+      if (origin === 'dispute') {
+        mutations.push(
+          (state) => {
+            ;(state.audits.find((audit) =>
+              audit.eventId === fixture.eventId)!.after as
+                Record<string, unknown>).orderStatus = 'processing'
+          },
+          (state) => {
+            ;(state.audits.find((audit) =>
+              audit.eventId === fixture.eventId)!.after as
+                Record<string, unknown>).amountSen = 1
+          },
+        )
+      }
+
+      for (const mutate of mutations) {
+        const state = structuredClone(fixture.state)
+        mutate(state)
+        expect(() => validateDemoState(state)).toThrow()
+      }
+    },
+  )
+
+  it.each([
+    ['ignored forged refund intent', (state: DemoState) => {
+      const event = state.payments.find((payment) =>
+        payment.id === 'pay-refunded')!.events.find((entry) =>
+        entry.refundIntent)!
+      event.ignoredReason = 'Forged ignored refund intent'
+    }],
+    ['missing unlinked refund audit', (state: DemoState) => {
+      removeAudit(state, (audit) =>
+        audit.eventId === 'evt-ord-refunded-refund')
+    }],
+    ['extra matching unlinked refund audit', (state: DemoState) => {
+      const original = state.audits.find((audit) =>
+        audit.eventId === 'evt-ord-refunded-refund')!
+      const duplicate = {
+        ...structuredClone(original),
+        id: 'audit-duplicate-unlinked-refund',
+        sequence: state.auditCount + 1,
+        previousId: state.auditHeadId,
+      }
+      state.audits.push(duplicate)
+      state.auditCount = duplicate.sequence
+      state.auditHeadId = duplicate.id
+    }],
+    ['altered unlinked refund audit amount', (state: DemoState) => {
+      const audit = state.audits.find((entry) =>
+        entry.eventId === 'evt-ord-refunded-refund')!
+      ;(audit.after as Record<string, unknown>).amountSen = 11_199
+    }],
+    ['altered unlinked refund audit before total', (state: DemoState) => {
+      const audit = state.audits.find((entry) =>
+        entry.eventId === 'evt-ord-refunded-refund')!
+      ;(audit.before as Record<string, unknown>).refundedSen = 1
+    }],
+    ['wrong payment refunded total', (state: DemoState) => {
+      state.payments.find((payment) =>
+        payment.id === 'pay-refunded')!.refundedSen = 11_199
+    }],
+  ] as Array<[string, (state: DemoState) => void]>)(
+    'rejects accepted refund-intent corruption: %s',
+    (_label, corrupt) => {
+      const state = createDemoState()
+      corrupt(state)
+      expect(() => validateDemoState(state)).toThrow()
+    },
+  )
+
+  it('rejects a fully refunded payment corrupted with a restored generic blocker', () => {
+    const original = servicesWithClaim('damage').repository.exportForTest()
+    const blocker = structuredClone(original.claims[0])
+    const stripped = structuredClone(original)
+    stripped.claims = []
+    const strippedOrder = stripped.orders.find((order) =>
+      order.id === blocker.orderId)!
+    strippedOrder.claimIds = []
+    refreshOrderFulfillment(
+      stripped,
+      strippedOrder,
+      FIXED_NOW,
+      'Removed blocker only to construct validator corruption fixture',
+    )
+    const storage = new MemoryStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(stripped))
+    const isolated = new AppServices(storage, () => FIXED_NOW)
+    isolated.auth.oneClick('admin')
+    isolated.payments.refund(
+      'pay-delivered',
+      11_200,
+      'Confirmed generic full refund before corruption',
+      'req-validator-generic-full-before-corruption',
+    )
+    const corrupt = isolated.repository.exportForTest()
+    corrupt.claims.push(blocker)
+    corrupt.orders.find((order) => order.id === blocker.orderId)!
+      .claimIds.push(blocker.id)
+
+    expect(() => validateDemoState(corrupt)).toThrow(expect.objectContaining({
+      code: FULL_REFUND_REMEDY_CONFLICT_CODE,
+      message: expect.stringContaining(blocker.id),
+    }))
+  })
+
+  it('rejects a claim-linked full refund corrupted with another uncoordinated blocker', () => {
+    const setup = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    setup.auth.oneClick('customer')
+    const completing = setup.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'damage',
+      shipmentId: 'shp-delivered',
+      note: 'DEMO completing linked refund validator claim',
+    }).data
+    const blocker = setup.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'value_floor',
+      boxId: 'box-delivered-01',
+      note: 'DEMO uncoordinated validator blocker claim',
+    }).data
+    setup.auth.oneClick('admin')
+    setup.claims.review(
+      completing.id,
+      'acknowledge',
+      'Confirmed completing validator claim acknowledgement',
+    )
+    setup.claims.review(
+      completing.id,
+      'approve',
+      'Confirmed completing validator claim approval',
+    )
+    const stripped = setup.repository.exportForTest()
+    stripped.claims = stripped.claims.filter((claim) => claim.id !== blocker.id)
+    stripped.orders.find((order) => order.id === blocker.orderId)!.claimIds =
+      stripped.orders.find((order) => order.id === blocker.orderId)!.claimIds
+        .filter((claimId) => claimId !== blocker.id)
+    const storage = new MemoryStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(stripped))
+    const isolated = new AppServices(storage, () => FIXED_NOW)
+    isolated.auth.oneClick('admin')
+    isolated.payments.refund(
+      'pay-delivered',
+      11_200,
+      'Confirmed linked full refund before corruption',
+      'req-validator-linked-full-before-corruption',
+      completing.id,
+    )
+    const corrupt = isolated.repository.exportForTest()
+    corrupt.claims.push(blocker)
+    corrupt.orders.find((order) => order.id === blocker.orderId)!
+      .claimIds.push(blocker.id)
+
+    expect(() => validateDemoState(corrupt)).toThrow(expect.objectContaining({
+      code: FULL_REFUND_REMEDY_CONFLICT_CODE,
+      message: expect.stringContaining(blocker.id),
+    }))
+  })
+
+  it.each([
+    ['missing claim reverse link', (state: DemoState) => {
+      delete state.claims[0].linkedRefundEventId
+    }],
+    ['wrong refund-event claim ID', (state: DemoState) => {
+      const event = state.payments.find((payment) => payment.id === 'pay-delivered')!
+        .events.find((entry) => entry.requestId === 'req-linked-validator-refund')!
+      event.refundIntent!.claimId = 'clm-wrong-link-owner'
+    }],
+    ['refund event before claim creation', (state: DemoState) => {
+      const event = state.payments.find((payment) => payment.id === 'pay-delivered')!
+        .events.find((entry) => entry.requestId === 'req-linked-validator-refund')!
+      event.createdAt = '2026-07-28T03:59:59.000Z'
+      event.processedAt = event.createdAt
+    }],
+    ['missing matching payment refund audit', (state: DemoState) => {
+      const audit = state.audits.find((entry) =>
+        entry.action === 'payment.refunded' &&
+        entry.requestId === 'req-linked-validator-refund')!
+      audit.eventId = 'evt-missing-payment-refund-audit'
+    }],
+    ['ignored linked refund event', (state: DemoState) => {
+      const event = state.payments.find((payment) => payment.id === 'pay-delivered')!
+        .events.find((entry) => entry.requestId === 'req-linked-validator-refund')!
+      event.ignoredReason = 'Tampered into an ignored event'
+    }],
+    ['tampered claim-link audit evidence', (state: DemoState) => {
+      const audit = state.audits.find((entry) =>
+        entry.action === 'claim.refund_linked')!
+      const after = audit.after as Record<string, unknown>
+      after.paymentId = 'pay-wrong-audit'
+    }],
+    ['one refund event reused across two claims', (state: DemoState) => {
+      const original = state.claims[0]
+      const reused = structuredClone(original)
+      reused.id = 'clm-reused-refund-event'
+      reused.requestId = 'req-clm-reused-refund-event'
+      reused.kind = 'value_floor'
+      reused.note = 'DEMO second claim reusing one refund event'
+      delete reused.shipmentId
+      reused.boxId = 'box-delivered-01'
+      reused.history = reused.history.map((entry, index) => ({
+        ...entry,
+        id: `${reused.id}-h-${String(index + 1).padStart(2, '0')}`,
+        ...(index === 0 ? { note: reused.note } : {}),
+      }))
+      state.claims.push(reused)
+      state.orders.find((order) => order.id === reused.orderId)!.claimIds.push(reused.id)
+    }],
+  ] as Array<[string, (state: DemoState) => void]>)(
+    'rejects linked refund corruption: %s',
+    (_label, mutate) => {
+      const state = stateWithLinkedRefundClaim()
+      mutate(state)
+      expect(() => validateDemoState(state)).toThrow()
+    },
+  )
+
+  it.each([
+    ['authorization actorId', (claim: DemoState['claims'][number]) => {
+      const history = claim.history.find((entry) =>
+        entry.note === claim.replacementAuthorization!.reason)!
+      history.actorId = 'usr-fulfilment'
+    }],
+    ['authorization actorRole', (claim: DemoState['claims'][number]) => {
+      const history = claim.history.find((entry) =>
+        entry.note === claim.replacementAuthorization!.reason)!
+      history.actorRole = 'admin'
+    }],
+    ['delivery actorId', (claim: DemoState['claims'][number]) => {
+      claim.history.at(-1)!.actorId = 'usr-fulfilment'
+    }],
+    ['delivery actorRole', (claim: DemoState['claims'][number]) => {
+      claim.history.at(-1)!.actorRole = 'admin'
+    }],
+  ] as Array<[string, (claim: DemoState['claims'][number]) => void]>)(
+    'rejects replacement history %s tampering even when the role remains otherwise allowed',
+    (_label, mutate) => {
+      const state = stateWithReplacement(true)
+      mutate(state.claims[0])
+      expect(() => validateDemoState(state)).toThrow(
+        /matching immutable claim history|exact resolved claim history/i,
+      )
+    },
+  )
+
+  it.each([
+    ['remedy box scope', (claim: DemoState['claims'][number]) => {
+      claim.remedyBoxIds = ['box-unopened-01']
+    }],
+    ['required settlement', (claim: DemoState['claims'][number]) => {
+      claim.requiredSettlementSen -= 1
+    }],
+    ['accepted settlement', (claim: DemoState['claims'][number]) => {
+      claim.acceptedSettlementSen! -= 1
+    }],
+    ['settlement policy', (claim: DemoState['claims'][number]) => {
+      claim.settlementPolicy = 'terminal_replacement_fallback'
+    }],
+    ['legacy marker on exact current evidence', (claim: DemoState['claims'][number]) => {
+      claim.legacyUnderSettledRefund = true
+      delete claim.settlementPolicy
+    }],
+  ] as Array<[string, (claim: DemoState['claims'][number]) => void]>)(
+    'rejects exact claim snapshot corruption: %s',
+    (_label, mutate) => {
+      const state = stateWithLinkedRefundClaim()
+      mutate(state.claims[0])
+      expect(() => validateDemoState(state)).toThrow()
+    },
+  )
+
+  it('rejects two currently delivered digital rows for one immutable box entitlement', () => {
+    const state = stateWithDeliveredDigitalReissue()
+    const original = state.shipments.find((entry) => entry.id === 'shp-digital')!
+    original.status = 'delivered'
+    original.timeline.push({
+      id: 'shp-digital-tampered-second-delivery',
+      status: 'delivered',
+      label: 'Tampered duplicate digital delivery',
+      at: '2026-08-01T06:00:00.000Z',
+    })
+
+    expect(() => validateDemoState(state)).toThrow(
+      /matching applied transition audit|post-delivery replacement authorization|effective delivered shipment box/i,
+    )
+  })
+
+  it.each(['unfulfilled', 'issued'] as const)(
+    'rejects financially refunded digital work corrupted back to %s',
+    (status) => {
+      const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+      services.auth.oneClick('admin')
+      services.payments.refund(
+        'pay-processing',
+        21_200,
+        'Confirmed digital stop validator fixture',
+        `req-digital-stop-validator-${status}`,
+      )
+      const state = services.repository.exportForTest()
+      const digital = state.shipments.find((entry) => entry.id === 'shp-digital')!
+      digital.status = status
+      digital.timeline.at(-1)!.status = status
+      delete digital.timeline.at(-1)!.financialHold
+
+      expect(() => validateDemoState(state)).toThrow(
+        /financially stopped order cannot retain eligible unshipped fulfilment/i,
+      )
+    },
+  )
+
+  it.each([
+    ['missing claim reverse link', (state: DemoState) => {
+      delete state.claims[0].replacementShipmentId
+    }],
+    ['wrong original reverse link', (state: DemoState) => {
+      state.shipments.find((shipment) => shipment.purpose === 'replacement')!
+        .replacementForShipmentId = 'shp-delivered'
+    }],
+    ['reused replacement claim and original', (state: DemoState) => {
+      const replacement = state.shipments.find((shipment) => shipment.purpose === 'replacement')!
+      state.shipments.push({
+        ...structuredClone(replacement),
+        id: 'shp-reused-replacement',
+        trackingNumber: 'DEMO-REUSED-REPLACEMENT',
+      })
+    }],
+    ['mismatched replacement box scope', (state: DemoState) => {
+      state.shipments.find((shipment) => shipment.purpose === 'replacement')!
+        .boxIds = ['box-delivered-01']
+    }],
+    ['mismatched replacement flags', (state: DemoState) => {
+      const replacement = state.shipments.find((shipment) => shipment.purpose === 'replacement')!
+      replacement.insured = !replacement.insured
+    }],
+    ['mismatched replacement kind', (state: DemoState) => {
+      const replacement = state.shipments.find((shipment) => shipment.purpose === 'replacement')!
+      replacement.kind = 'DIGITAL'
+    }],
+    ['mismatched replacement order', (state: DemoState) => {
+      const replacement = state.shipments.find((shipment) => shipment.purpose === 'replacement')!
+      replacement.orderId = 'ord-delivered'
+    }],
+    ['replacement cycle', (state: DemoState) => {
+      const replacement = state.shipments.find((shipment) => shipment.purpose === 'replacement')!
+      replacement.replacementForShipmentId = replacement.id
+    }],
+    ['replacement before claim and approval', (state: DemoState) => {
+      const replacement = state.shipments.find((shipment) => shipment.purpose === 'replacement')!
+      replacement.createdAt = '2026-07-18T00:00:00.000Z'
+      replacement.timeline[0].at = replacement.createdAt
+    }],
+    ['missing replacement authorization audit', (state: DemoState) => {
+      removeAudit(state, (audit) => audit.action === 'claim.replacement_authorized')
+    }],
+    ['missing delivered replacement transition audit', (state: DemoState) => {
+      const replacement = state.shipments.find((shipment) => shipment.purpose === 'replacement')!
+      const deliveredAt = replacement.timeline.at(-1)!.at
+      removeAudit(state, (audit) =>
+        audit.action === 'shipment.transitioned' &&
+        audit.targetId === replacement.id &&
+        audit.at === deliveredAt &&
+        (audit.after as { status?: string })?.status === 'delivered')
+    }],
+    ['missing replacement delivery claim audit', (state: DemoState) => {
+      removeAudit(state, (audit) => audit.action === 'claim.replacement_delivered')
+    }],
+    ['replacement scope inflation', (state: DemoState) => {
+      const replacement = state.shipments.find((shipment) => shipment.purpose === 'replacement')!
+      state.orders.find((order) => order.id === replacement.orderId)!.boxIds.push('box-delivered-01')
+    }],
+  ] as Array<[string, (state: DemoState) => void]>)(
+    'rejects delivered replacement corruption: %s',
+    (_label, mutate) => {
+      const state = stateWithReplacement(true)
+      mutate(state)
+      expect(() => validateDemoState(state)).toThrow()
+    },
+  )
+
+  it('rejects a claim marked resolved before its authorized replacement is delivered', () => {
+    const state = stateWithReplacement(false)
+    const claim = state.claims[0]
+    const replacement = state.shipments.find((shipment) => shipment.purpose === 'replacement')!
+    claim.status = 'resolved'
+    claim.remedyState = 'replacement_delivered'
+    claim.resolutionOutcome = 'replacement_authorized'
+    claim.resolutionReference = replacement.id
+    claim.resolutionNote = 'Tampered premature replacement completion'
+    claim.history.push({
+      id: `${claim.id}-tampered-resolved`,
+      status: 'resolved',
+      note: claim.resolutionNote,
+      actorId: 'usr-fulfilment',
+      actorRole: 'fulfilment',
+      at: claim.updatedAt,
+    })
+
+    expect(() => validateDemoState(state)).toThrow(/undelivered replacement|delivered shipment|audit/i)
+  })
+
+  it.each(['lost', 'returned'] as const)(
+    'accepts exact audited late original delivery after a physical replacement is terminal %s',
+    (terminalStatus) => {
+      const fixture = stateWithLateOriginalDelivery(terminalStatus)
+      expect(fixture.state.shipments.find((shipment) =>
+        shipment.id === 'shp-shipped')?.status).toBe('delivered')
+      expect(fixture.state.shipments.find((shipment) =>
+        shipment.id === fixture.replacementId)?.status).toBe(terminalStatus)
+      expect(fixture.state.claims.find((claim) =>
+        claim.id === fixture.claimId)).toMatchObject({
+        status: 'approved',
+        remedyState: 'replacement_authorized',
+      })
+      expect(() => validateDemoState(fixture.state)).not.toThrow()
+    },
+  )
+
+  it.each([
+    ['missing late original audit', (state: DemoState, replacementId: string) => {
+      removeAudit(state, (audit) =>
+        audit.action === 'shipment.transitioned' &&
+        audit.targetId === 'shp-shipped' &&
+        (audit.after as { status?: string })?.status === 'delivered')
+      expect(replacementId).toBeTruthy()
+    }],
+    ['active physical reissue', (state: DemoState, replacementId: string) => {
+      const replacement = state.shipments.find((shipment) =>
+        shipment.id === replacementId)!
+      replacement.timeline.pop()
+      replacement.status = 'shipped'
+      removeAudit(state, (audit) =>
+        audit.action === 'shipment.transitioned' &&
+        audit.targetId === replacementId &&
+        (audit.after as { status?: string })?.status === 'lost')
+    }],
+    ['digital reissue', (state: DemoState, replacementId: string) => {
+      state.shipments.find((shipment) =>
+        shipment.id === replacementId)!.kind = 'DIGITAL'
+    }],
+    ['duplicate delivered reissue', (state: DemoState, replacementId: string) => {
+      const replacement = state.shipments.find((shipment) =>
+        shipment.id === replacementId)!
+      replacement.status = 'delivered'
+      replacement.timeline.at(-1)!.status = 'delivered'
+      const audit = state.audits.find((entry) =>
+        entry.action === 'shipment.transitioned' &&
+        entry.targetId === replacementId &&
+        (entry.after as { status?: string })?.status === 'lost')!
+      ;(audit.after as Record<string, unknown>).status = 'delivered'
+    }],
+  ] as Array<[string, (state: DemoState, replacementId: string) => void]>)(
+    'rejects late-original corruption with %s',
+    (_label, corrupt) => {
+      const fixture = stateWithLateOriginalDelivery('lost')
+      corrupt(fixture.state, fixture.replacementId)
+      expect(() => validateDemoState(fixture.state)).toThrow()
+    },
+  )
+
+  it.each([
+    ['receipt before creation', (state: DemoState) => {
+      const rma = state.claims[0].rma!
+      rma.receivedAt = '2026-07-27T23:59:59.000Z'
+    }],
+    ['inspection before receipt', (state: DemoState) => {
+      const rma = state.claims[0].rma!
+      rma.inspectedAt = '2026-07-27T23:59:59.000Z'
+    }],
+    ['missing receipt evidence', (state: DemoState) => {
+      delete state.claims[0].rma!.receivedAt
+    }],
+    ['mismatched inspection audit', (state: DemoState) => {
+      const audit = state.audits.find((entry) => entry.action === 'claim.rma_inspected')!
+      audit.reason = 'Tampered inspection audit reason'
+    }],
+    ['missing immutable receipt audit', (state: DemoState) => {
+      removeAudit(state, (audit) => audit.action === 'claim.rma_received')
+    }],
+  ] as Array<[string, (state: DemoState) => void]>)(
+    'rejects ordered RMA corruption: %s',
+    (_label, mutate) => {
+      const state = stateWithInspectedRma()
+      mutate(state)
+      expect(() => validateDemoState(state)).toThrow()
+    },
+  )
+
+  it.each([
+    ['physical history using digital issued', (state: DemoState) => {
+      const shipment = state.shipments.find((entry) => entry.id === 'shp-processing')!
+      shipment.status = 'issued'
+      shipment.timeline.push({
+        id: 'physical-issued-tamper',
+        status: 'issued',
+        label: 'Tampered physical digital status',
+        at: FIXED_NOW,
+      })
+    }],
+    ['digital history using physical shipped', (state: DemoState) => {
+      const shipment = state.shipments.find((entry) => entry.id === 'shp-digital')!
+      shipment.status = 'shipped'
+      shipment.timeline.push({
+        id: 'digital-shipped-tamper',
+        status: 'shipped',
+        label: 'Tampered digital physical status',
+        at: FIXED_NOW,
+      })
+    }],
+    ['digital carrier edited directly', (state: DemoState) => {
+      state.shipments.find((entry) => entry.id === 'shp-digital')!.carrier = 'Demo Express'
+    }],
+    ['digital tracking edited directly', (state: DemoState) => {
+      state.shipments.find((entry) => entry.id === 'shp-digital')!.trackingNumber =
+        'DEMO-DIGITAL-TAMPER'
+    }],
+    ['failed original rewritten delivered', (state: DemoState) => {
+      const shipment = state.shipments.find((entry) => entry.id === 'shp-failed')!
+      shipment.status = 'delivered'
+      shipment.timeline.push(
+        {
+          id: 'failed-original-retry-tamper',
+          status: 'shipped',
+          label: 'Tampered original retry',
+          at: FIXED_NOW,
+        },
+        {
+          id: 'failed-original-delivered-tamper',
+          status: 'delivered',
+          label: 'Tampered original delivered',
+          at: FIXED_NOW,
+        },
+      )
+      state.orders.find((order) => order.id === shipment.orderId)!.status = 'fulfilled'
+      state.orders.find((order) => order.id === shipment.orderId)!.timeline.push({
+        id: 'failed-original-order-tamper',
+        status: 'fulfilled',
+        label: 'Tampered original order fulfilment',
+        at: FIXED_NOW,
+      })
+      state.boxes.find((box) => box.id === 'box-failed-01')!.status = 'fulfilled'
+    }],
+  ] as Array<[string, (state: DemoState) => void]>)(
+    'rejects kind-specific or immutable original history corruption: %s',
+    (_label, mutate) => {
+      const state = createDemoState()
+      mutate(state)
+      expect(() => validateDemoState(state)).toThrow()
+    },
+  )
+
+  it.each([
+    ['mismatched resolution reference', (state: DemoState) => {
+      state.claims[0].resolutionReference = 'evt-ord-delivered-success'
+    }],
+    ['non-refund resolution carrying a refund link', (state: DemoState) => {
+      const claim = state.claims[0]
+      claim.resolutionOutcome = 'replacement_authorized'
+      claim.resolutionReference = `DEMO-${claim.id.toUpperCase()}`
+      claim.resolutionNote = 'Descriptive replacement must not retain a refund link'
+    }],
+    ['resolved refund with its reverse link removed', (state: DemoState) => {
+      delete state.claims[0].linkedRefundEventId
+    }],
+  ] as Array<[string, (state: DemoState) => void]>)(
+    'rejects refund resolution corruption: %s',
+    (_label, mutate) => {
+      const state = stateWithLinkedRefundClaim(true)
+      mutate(state)
+      expect(() => validateDemoState(state)).toThrow()
+    },
+  )
+
   it('recovers missing data with current schema fixtures', () => {
     const storage = new MemoryStorage()
     const repository = new MockRepository(storage)
-    expect(repository.getSnapshot().schemaVersion).toBe(5)
+    expect(repository.getSnapshot().schemaVersion).toBe(9)
     expect(repository.recoveryNotice).toMatch(/missing/i)
-    expect(JSON.parse(storage.getItem(STORAGE_KEY)!).schemaVersion).toBe(5)
+    expect(JSON.parse(storage.getItem(STORAGE_KEY)!).schemaVersion).toBe(9)
   })
 
-  it('recovers corrupt data without throwing', () => {
+  it('keeps corrupt bytes untouched and requires an explicit confirmed reset', () => {
     const storage = new MemoryStorage()
-    storage.seed(STORAGE_KEY, '{not-json')
+    const raw = '{not-json'
+    storage.seed(STORAGE_KEY, raw)
     const repository = new MockRepository(storage)
     expect(repository.getSnapshot().orders.length).toBeGreaterThan(0)
-    expect(repository.recoveryNotice).toMatch(/recovered/i)
+    expect(repository.recoveryNotice).toMatch(/exact original browser bytes.+memory only.+not saved.+explicit confirmed reset/i)
+    expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+    expect(() => repository.update((state) => {
+      state.cart = []
+    })).toThrow(expect.objectContaining({ code: 'CONFIRMED_RESET_REQUIRED' }))
   })
 
-  it('recovers an older schema version', () => {
+  it('keeps an unsupported older schema untouched instead of silently replacing it', () => {
     const storage = new MemoryStorage()
-    storage.seed(STORAGE_KEY, JSON.stringify({ schemaVersion: 2, users: [] }))
+    const raw = '{ "schemaVersion": 2, "revision": 14, "users": [] }'
+    storage.seed(STORAGE_KEY, raw)
     const repository = new MockRepository(storage)
-    expect(repository.getSnapshot().schemaVersion).toBe(5)
-    expect(repository.recoveryNotice).toMatch(/current safe version/i)
+    expect(repository.getSnapshot().schemaVersion).toBe(9)
+    expect(repository.recoveryNotice).toMatch(/unsupported old version 2.+left unchanged.+explicit confirmed reset/i)
+    expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+  })
+
+  it.each([
+    {
+      label: 'empty invalid storage',
+      raw: '',
+      expectedRevision: 2,
+      notice: /damaged.+exact original browser bytes.+memory only.+not saved.+explicit confirmed reset/i,
+    },
+    {
+      label: 'corrupt JSON',
+      raw: '{ "schemaVersion": 6, broken',
+      expectedRevision: 2,
+      notice: /damaged.+exact original browser bytes.+memory only.+not saved.+explicit confirmed reset/i,
+    },
+    {
+      label: 'invalid current schema',
+      raw: (() => {
+        const invalid = createDemoState() as Partial<DemoState>
+        invalid.revision = 41
+        delete invalid.cart
+        return JSON.stringify(invalid)
+      })(),
+      expectedRevision: 42,
+      notice: /version 9.+failed the safety checks.+exact original browser bytes.+explicit confirmed reset/i,
+    },
+    {
+      label: 'future schema',
+      raw: '{ "schemaVersion": 99, "revision": 87, "opaque": "KEEP EXACTLY" }',
+      expectedRevision: 88,
+      notice: /newer unsupported version 99.+not silently downgraded.+exact original browser bytes.+explicit confirmed reset/i,
+    },
+  ])(
+    'protects $label bytes, blocks ordinary updates, and resets monotonically only after confirmation',
+    ({ raw, expectedRevision, notice }) => {
+      const storage = new CountingStorage()
+      storage.seed(STORAGE_KEY, raw)
+      const repository = new MockRepository(storage)
+      const published = repository.getSnapshot()
+      const mutator = vi.fn((state: DemoState) => {
+        state.sessionUserId = 'usr-demo-customer'
+      })
+      const listener = vi.fn()
+      repository.subscribe(listener)
+
+      expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+      expect(storage.writes).toBe(0)
+      expect(repository.recoveryNotice).toMatch(notice)
+      expect(() => repository.update(mutator)).toThrow(
+        expect.objectContaining({ code: 'CONFIRMED_RESET_REQUIRED' }),
+      )
+      expect(mutator).not.toHaveBeenCalled()
+      expect(repository.getSnapshot()).toBe(published)
+      expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+      expect(storage.writes).toBe(0)
+      expect(listener).not.toHaveBeenCalled()
+
+      repository.reset()
+
+      expect(repository.getSnapshot()).toMatchObject({
+        schemaVersion: 9,
+        revision: expectedRevision,
+        sessionUserId: null,
+        cart: [{ quantity: 1 }],
+      })
+      expect(() => validateDemoState(repository.getSnapshot())).not.toThrow()
+      expect(JSON.parse(storage.getItem(STORAGE_KEY)!)).toEqual(repository.getSnapshot())
+      expect(storage.writes).toBe(1)
+      expect(repository.recoveryNotice).toBeNull()
+      expect(listener).toHaveBeenCalledOnce()
+    },
+  )
+
+  it('rejects authority-disabled updates and resets before mutators, storage, or listeners', () => {
+    const storage = new CountingStorage()
+    const raw = JSON.stringify(createDemoState())
+    storage.seed(STORAGE_KEY, raw)
+    const repository = new MockRepository(storage, { writeAuthority: false })
+    const published = repository.getSnapshot()
+    const mutator = vi.fn((state: DemoState) => {
+      state.sessionUserId = 'usr-demo-customer'
+    })
+    const listener = vi.fn()
+    repository.subscribe(listener)
+
+    expect(repository.hasWriteAuthority()).toBe(false)
+    expect(() => repository.update(mutator)).toThrow(
+      expect.objectContaining({ code: 'WRITE_AUTHORITY_REQUIRED' }),
+    )
+    expect(() => repository.reset()).toThrow(
+      expect.objectContaining({ code: 'WRITE_AUTHORITY_REQUIRED' }),
+    )
+    expect(mutator).not.toHaveBeenCalled()
+    expect(repository.getSnapshot()).toBe(published)
+    expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+    expect(storage.writes).toBe(0)
+    expect(listener).not.toHaveBeenCalled()
+
+    repository.grantWriteAuthority()
+    expect(repository.hasWriteAuthority()).toBe(true)
+    repository.revokeWriteAuthority()
+    expect(repository.hasWriteAuthority()).toBe(false)
+  })
+
+  it('does not initialize missing storage until disabled authority is granted', () => {
+    const storage = new CountingStorage()
+    const repository = new MockRepository(storage, { writeAuthority: false })
+
+    expect(repository.hasWriteAuthority()).toBe(false)
+    expect(storage.getItem(STORAGE_KEY)).toBeNull()
+    expect(storage.writes).toBe(0)
+
+    repository.grantWriteAuthority()
+
+    expect(repository.hasWriteAuthority()).toBe(true)
+    expect(storage.writes).toBe(1)
+    expect(JSON.parse(storage.getItem(STORAGE_KEY)!)).toEqual(repository.getSnapshot())
+  })
+
+  it('lets a second disabled repository adopt first-tab initialization before taking authority', () => {
+    const storage = new CountingStorage()
+    const first = new MockRepository(storage, { writeAuthority: false })
+    const waiting = new MockRepository(storage, { writeAuthority: false })
+
+    first.grantWriteAuthority()
+    first.revokeWriteAuthority()
+    expect(storage.writes).toBe(1)
+
+    expect(waiting.syncFromStorage()).toBe(false)
+    expect(() => waiting.grantWriteAuthority()).not.toThrow()
+    expect(waiting.hasWriteAuthority()).toBe(true)
+    expect(storage.writes).toBe(1)
+    expect(waiting.getSnapshot()).toEqual(first.getSnapshot())
   })
 
   it('does not rewrite an already-valid loaded snapshot', () => {
@@ -159,6 +1963,2069 @@ describe('MockRepository recovery and persistence', () => {
     expect(repository.getSnapshot()).toEqual(createDemoState())
     expect(storage.writes).toBe(0)
     expect(repository.recoveryNotice).toBeNull()
+  })
+
+  it('deterministically upgrades authentic previous-writer version 8 data to version 9 without mutating its input', () => {
+    const legacy = toPreviousWriterVersion8()
+    const original = structuredClone(legacy)
+
+    const first = migrateDemoStateV8(legacy)
+    const second = migrateDemoStateV8(legacy)
+
+    expect(legacy).toEqual(original)
+    expect(first).toEqual(second)
+    expect(first.schemaVersion).toBe(9)
+    expect(first.audits.slice(0, legacy.audits.length)).toEqual(legacy.audits)
+    expect(first.audits.slice(legacy.audits.length)).not.toHaveLength(0)
+    expect(first.audits.slice(legacy.audits.length).every((audit) =>
+      audit.id.startsWith('audit-migration-v9-'))).toBe(true)
+    expect(() => validateDemoState(first)).not.toThrow()
+
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(legacy))
+    const repository = new MockRepository(storage)
+    expect(repository.getSnapshot()).toEqual(first)
+    expect(repository.recoveryNotice).toMatch(/version 8 to version 9/i)
+    expect(storage.writes).toBe(1)
+  })
+
+  it.each([
+    ['received', false],
+    ['inspected', false],
+    ['received after an already-returned original', true],
+  ] as const)(
+    'migrates authentic c3c8c28 RMA %s evidence without editing its immutable v8 prefix',
+    (statusLabel, originalReturnedBeforeReceipt) => {
+      const status = statusLabel.startsWith('inspected')
+        ? 'inspected'
+        : 'received'
+      const legacy = previousWriterRmaState(
+        status,
+        originalReturnedBeforeReceipt,
+      )
+      const originalInput = structuredClone(legacy)
+      const raw = JSON.stringify(legacy)
+
+      const first = migrateDemoStateV8(legacy)
+      const second = migrateDemoStateV8(legacy)
+      const claim = first.claims.find((entry) =>
+        entry.id === PREVIOUS_WRITER_CLAIM_ID)!
+      const original = first.shipments.find((entry) =>
+        entry.id === 'shp-delivered')!
+      const richReceipt = first.audits.find((audit) =>
+        audit.id === version9RmaReceiptAuditId(claim.id))
+
+      expect(legacy).toEqual(originalInput)
+      expect(JSON.stringify(legacy)).toBe(raw)
+      expect(first).toEqual(second)
+      expect(first.audits.slice(0, legacy.audits.length)).toEqual(
+        legacy.audits,
+      )
+      expect(original.status).toBe('returned')
+      expect(original.timeline.some((entry) =>
+        entry.status === 'returned' &&
+        Date.parse(entry.at) <= Date.parse(claim.rma?.receivedAt ?? ''))).toBe(
+        true,
+      )
+      expect(richReceipt).toMatchObject({
+        action: 'claim.rma_received',
+        before: {
+          originalShipmentId: original.id,
+          originalShipmentStatus: originalReturnedBeforeReceipt
+            ? 'returned'
+            : 'delivered',
+          remedyState: 'rma_created',
+          rmaStatus: 'created',
+        },
+        after: {
+          originalShipmentId: original.id,
+          originalShipmentStatus: 'returned',
+          remedyState: 'rma_received',
+          rmaReference: claim.rma?.reference,
+          rmaStatus: 'received',
+        },
+      })
+      expect(new Set(first.audits.map((audit) => audit.id)).size).toBe(
+        first.audits.length,
+      )
+      expect(new Set(first.shipments.flatMap((shipment) =>
+        shipment.timeline.map((entry) => entry.id))).size).toBe(
+        first.shipments.reduce(
+          (count, shipment) => count + shipment.timeline.length,
+          0,
+        ),
+      )
+      expect(() => validateDemoState(first)).not.toThrow()
+
+      const storage = new CountingStorage()
+      storage.seed(STORAGE_KEY, raw)
+      const firstLoad = new MockRepository(storage)
+      expect(firstLoad.getSnapshot()).toEqual(first)
+      expect(storage.writes).toBe(1)
+      const persisted = storage.getItem(STORAGE_KEY)
+      const secondLoad = new MockRepository(storage)
+      expect(secondLoad.getSnapshot()).toEqual(first)
+      expect(storage.getItem(STORAGE_KEY)).toBe(persisted)
+      expect(storage.writes).toBe(1)
+    },
+  )
+
+  it.each([
+    'authorized',
+    'dispute_resumed',
+    'dispute_resumed_repeated',
+    'in_transit',
+    'terminal',
+    'inspected_rma',
+  ] as const)(
+    'migrates authentic c3c8c28 post-delivery %s replacement history deterministically',
+    (variant) => {
+      const legacy = previousWriterReplacementState(variant)
+      const originalInput = structuredClone(legacy)
+      const first = migrateDemoStateV8(legacy)
+      const second = migrateDemoStateV8(legacy)
+      const claim = first.claims.find((entry) =>
+        entry.id === PREVIOUS_WRITER_CLAIM_ID)!
+      const replacement = first.shipments.find((entry) =>
+        entry.id === claim.replacementShipmentId)!
+      const original = first.shipments.find((entry) =>
+        entry.id === replacement.replacementForShipmentId)!
+
+      expect(legacy).toEqual(originalInput)
+      expect(first).toEqual(second)
+      expect(first.audits.slice(0, legacy.audits.length)).toEqual(
+        legacy.audits,
+      )
+      if (variant === 'inspected_rma') {
+        expect(claim.legacyDirectPostDeliveryReplacement).toBeUndefined()
+        expect(claim.rma?.status).toBe('inspected')
+        expect(original.status).toBe('returned')
+      } else {
+        expect(claim.legacyDirectPostDeliveryReplacement).toEqual({
+          originalShipmentId: original.id,
+          originalStatusAtMigration: 'delivered',
+          replacementShipmentId: replacement.id,
+          replacementStatusAtMigration: replacement.status,
+        })
+        expect(first.audits.find((audit) =>
+          audit.id === legacyDirectReplacementMigrationId(claim.id))).toBeTruthy()
+        expect(claim.rma).toBeUndefined()
+      }
+      expect(() => validateDemoState(first)).not.toThrow()
+      if (
+        variant === 'dispute_resumed' ||
+        variant === 'dispute_resumed_repeated'
+      ) {
+        const oldResumeAudits = legacy.audits.filter((audit) =>
+          audit.action === 'order.dispute_resolved')
+        const migratedResumeAudits = first.audits.filter((audit) =>
+          audit.action === 'order.dispute_resolved' &&
+          audit.id.startsWith('audit-migration-v9-'))
+        expect(oldResumeAudits).toHaveLength(
+          variant === 'dispute_resumed_repeated' ? 2 : 1,
+        )
+        expect(migratedResumeAudits).toHaveLength(oldResumeAudits.length)
+        expect(oldResumeAudits.every((audit) =>
+          JSON.stringify(audit.after) ===
+            JSON.stringify({ status: 'processing' }))).toBe(true)
+        migratedResumeAudits.forEach((audit, index) => {
+          expect(audit).toMatchObject({
+            before: { status: 'disputed' },
+            after: {
+              resumedShipmentIds: [replacement.id],
+              status: 'processing',
+            },
+            requestId: oldResumeAudits[index].requestId,
+          })
+        })
+      }
+
+      const storage = new CountingStorage()
+      storage.seed(STORAGE_KEY, JSON.stringify(legacy))
+      const firstLoad = new MockRepository(storage)
+      expect(firstLoad.getSnapshot()).toEqual(first)
+      expect(storage.writes).toBe(1)
+      const secondLoad = new MockRepository(storage)
+      expect(secondLoad.getSnapshot()).toEqual(first)
+      expect(storage.writes).toBe(1)
+    },
+  )
+
+  it('rejects an impossible previous-writer dual delivery without mutating source or raw storage', () => {
+    const legacy = handEditedPreviousWriterDualDeliveryState()
+    const deliveredBoxIds = legacy.shipments
+      .filter((shipment) => shipment.status === 'delivered')
+      .flatMap((shipment) => shipment.boxIds)
+    const original = structuredClone(legacy)
+    const raw = JSON.stringify(legacy)
+
+    expect(new Set(deliveredBoxIds).size).toBeLessThan(
+      deliveredBoxIds.length,
+    )
+    expect(() => migrateDemoStateV8(legacy)).toThrow(
+      expect.objectContaining({ code: 'MIGRATION_SOURCE_INVALID' }),
+    )
+    expect(legacy).toEqual(original)
+    expect(JSON.stringify(legacy)).toBe(raw)
+
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, raw)
+    const repository = new MockRepository(storage)
+    expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+    expect(storage.writes).toBe(0)
+    expect(repository.recoveryNotice).toMatch(
+      /version 8.+failed the migration safety checks.+exact original browser bytes were left unchanged/i,
+    )
+  })
+
+  it('keeps a migrated direct in-transit replacement readable but forbids a new delivery transition', () => {
+    const legacy = previousWriterReplacementState('in_transit')
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(legacy))
+    const services = new AppServices(storage, () => FIXED_NOW)
+    services.auth.oneClick('admin')
+    const claim = services.repository.getSnapshot().claims.find((entry) =>
+      entry.id === PREVIOUS_WRITER_CLAIM_ID)!
+    const before = structuredClone(services.repository.getSnapshot())
+    const writesBefore = storage.writes
+
+    expect(() => services.fulfilment.advance(
+      claim.replacementShipmentId!,
+      'delivered',
+      'Attempted delivery of frozen migrated direct replacement',
+    )).toThrow(expect.objectContaining({
+      code: 'LEGACY_POST_DELIVERY_REPLACEMENT_FROZEN',
+    }))
+    expect(services.repository.getSnapshot()).toEqual(before)
+    expect(storage.writes).toBe(writesBefore)
+  })
+
+  it.each([
+    ['missing old receipt audit', () => {
+      const legacy = previousWriterRmaState('received')
+      removeAudit(
+        legacy as unknown as DemoState,
+        (audit) =>
+          audit.action === 'claim.rma_received' &&
+          !audit.id.startsWith('audit-migration-v9-'),
+      )
+      return legacy
+    }],
+    ['ambiguous old receipt audit', () => {
+      const legacy = previousWriterRmaState('received')
+      const source = legacy.audits.find((audit) =>
+        audit.action === 'claim.rma_received')!
+      legacy.audits.push({
+        ...structuredClone(source),
+        id: `${source.id}-ambiguous`,
+        sequence: legacy.auditCount + 1,
+        previousId: legacy.auditHeadId,
+      })
+      legacy.auditCount += 1
+      legacy.auditHeadId = legacy.audits.at(-1)!.id
+      return legacy
+    }],
+    ['malformed direct authorization audit', () => {
+      const legacy = previousWriterReplacementState('authorized')
+      const audit = legacy.audits.find((entry) =>
+        entry.action === 'claim.replacement_authorized')!
+      ;(audit.before as Record<string, unknown>).remedyState =
+        'rma_inspected'
+      return legacy
+    }],
+    ['forged old receipt request identity', () => {
+      const legacy = previousWriterRmaState('received')
+      legacy.audits.find((audit) =>
+        audit.action === 'claim.rma_received')!.requestId =
+          'req-forged-old-rma-receipt'
+      return legacy
+    }],
+    ['forged direct authorization request identity', () => {
+      const legacy = previousWriterReplacementState('authorized')
+      legacy.audits.find((audit) =>
+        audit.action === 'claim.replacement_authorized')!.requestId =
+          'req-forged-old-replacement-authorization'
+      return legacy
+    }],
+    ['missing pre-receipt return transition audit', () => {
+      const legacy = previousWriterRmaState('received', true)
+      removeAudit(
+        legacy as unknown as DemoState,
+        (audit) =>
+          audit.action === 'shipment.transitioned' &&
+          audit.targetId === 'shp-delivered',
+      )
+      return legacy
+    }],
+    ['missing progressed replacement transition audit', () => {
+      const legacy = previousWriterReplacementState('in_transit')
+      const replacementId = legacy.claims[0].replacementShipmentId
+      removeAudit(
+        legacy as unknown as DemoState,
+        (audit) =>
+          audit.action === 'shipment.transitioned' &&
+          audit.targetId === replacementId,
+      )
+      return legacy
+    }],
+    ['missing old dispute-resume audit', () => {
+      const legacy = previousWriterReplacementState('dispute_resumed')
+      removeAudit(
+        legacy as unknown as DemoState,
+        (audit) => audit.action === 'order.dispute_resolved',
+      )
+      return legacy
+    }],
+    ['forged current dispute-resume evidence in version 8', () => {
+      const legacy = previousWriterReplacementState('dispute_resumed')
+      const replacementId = legacy.claims[0].replacementShipmentId!
+      legacy.audits.find((audit) =>
+        audit.action === 'order.dispute_resolved')!.after = {
+        resumedShipmentIds: [replacementId],
+        status: 'processing',
+      }
+      return legacy
+    }],
+    ['forged direct migration marker', () => {
+      const legacy = previousWriterReplacementState('authorized')
+      ;(legacy.claims[0] as unknown as Record<string, unknown>)
+        .legacyDirectPostDeliveryReplacement = {
+        originalShipmentId: 'forged',
+      }
+      return legacy
+    }],
+  ] as const)(
+    'rejects %s without mutating source or exact raw storage',
+    (_label, makeLegacy) => {
+      const legacy = makeLegacy()
+      const original = structuredClone(legacy)
+      const raw = JSON.stringify(legacy)
+
+      expect(() => migrateDemoStateV8(legacy)).toThrow(
+        expect.objectContaining({ code: 'MIGRATION_SOURCE_INVALID' }),
+      )
+      expect(legacy).toEqual(original)
+      expect(JSON.stringify(legacy)).toBe(raw)
+
+      const storage = new CountingStorage()
+      storage.seed(STORAGE_KEY, raw)
+      const repository = new MockRepository(storage)
+      expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+      expect(storage.writes).toBe(0)
+      expect(repository.recoveryNotice).toMatch(
+        /version 8.+failed the migration safety checks.+exact original browser bytes were left unchanged/i,
+      )
+    },
+  )
+
+  it.each([
+    ['RMA receipt audit', () => {
+      const legacy = previousWriterRmaState('received')
+      const collision = structuredClone(legacy.audits.at(-1)!)
+      collision.id = version9RmaReceiptAuditId(
+        PREVIOUS_WRITER_CLAIM_ID,
+      )
+      collision.sequence = legacy.auditCount + 1
+      collision.previousId = legacy.auditHeadId
+      collision.action = 'demo.collision'
+      legacy.audits.push(collision)
+      legacy.auditCount += 1
+      legacy.auditHeadId = collision.id
+      return legacy
+    }],
+    ['RMA return timeline', () => {
+      const legacy = previousWriterRmaState('received')
+      legacy.shipments.find((entry) =>
+        entry.id === 'shp-unopened')!.timeline[0].id =
+          version9RmaReturnedTimelineId(
+            PREVIOUS_WRITER_CLAIM_ID,
+            'shp-delivered',
+          )
+      return legacy
+    }],
+    ['direct replacement audit', () => {
+      const legacy = previousWriterReplacementState('authorized')
+      const collision = structuredClone(legacy.audits.at(-1)!)
+      collision.id = legacyDirectReplacementMigrationId(
+        PREVIOUS_WRITER_CLAIM_ID,
+      )
+      collision.sequence = legacy.auditCount + 1
+      collision.previousId = legacy.auditHeadId
+      collision.action = 'demo.collision'
+      legacy.audits.push(collision)
+      legacy.auditCount += 1
+      legacy.auditHeadId = collision.id
+      return legacy
+    }],
+    ['cross-record RMA audit and timeline', () => {
+      const legacy = previousWriterRmaState('received')
+      legacy.claims.push(structuredClone(legacy.claims[0]))
+      return legacy
+    }],
+  ] as const)(
+    'rejects a synthetic %s ID collision before changing source',
+    (_label, makeLegacy) => {
+      const legacy = makeLegacy()
+      const original = structuredClone(legacy)
+      expect(() => migrateDemoStateV8(legacy)).toThrow(
+        expect.objectContaining({ code: 'MIGRATION_ID_COLLISION' }),
+      )
+      expect(legacy).toEqual(original)
+    },
+  )
+
+  it.each([
+    'mock_webhook',
+    'admin_reconcile',
+  ] as const)(
+    'migrates an exact previous-writer %s ignored event as explicitly non-replayable evidence',
+    (source) => {
+      const fixture = previousWriterIgnoredPaymentEvent(source)
+      const original = structuredClone(fixture.legacy)
+      const raw = JSON.stringify(fixture.legacy)
+
+      const first = migrateDemoStateV8(fixture.legacy)
+      const second = migrateDemoStateV8(fixture.legacy)
+      const payment = first.payments.find((entry) =>
+        entry.id === fixture.paymentId)!
+      const event = payment.events.find((entry) =>
+        entry.id === fixture.eventId)!
+
+      expect(fixture.legacy).toEqual(original)
+      expect(JSON.stringify(fixture.legacy)).toBe(raw)
+      expect(first).toEqual(second)
+      expect(first.audits.slice(0, fixture.legacy.audits.length)).toEqual(
+        fixture.legacy.audits,
+      )
+      expect(event).not.toHaveProperty('ignoredOutcome')
+      expect(event).not.toHaveProperty('ignoredPriorStatus')
+      expect(event).not.toHaveProperty('ignoredRoute')
+      expect(event).not.toHaveProperty('ignoredInputReason')
+      expect(matchingCurrentIgnoredPaymentEventAudit(
+        first,
+        payment,
+        event,
+      )).toBeUndefined()
+      expect(matchingLegacyIgnoredPaymentEventMigrationAudit(
+        first,
+        payment,
+        event,
+      )).toMatchObject({
+        id: legacyIgnoredPaymentEventMigrationId(event.id),
+        action: 'migration.v8.ignored_payment_event',
+        outcome: 'applied',
+        after: {
+          legacyReplayable: false,
+          outcome: 'out_of_order',
+          schemaVersion: 9,
+        },
+      })
+      expect(() => validateDemoState(first)).not.toThrow()
+
+      const storage = new CountingStorage()
+      storage.seed(STORAGE_KEY, raw)
+      const firstLoad = new MockRepository(storage)
+      expect(firstLoad.getSnapshot()).toEqual(first)
+      expect(storage.writes).toBe(1)
+      const secondLoad = new MockRepository(storage)
+      expect(secondLoad.getSnapshot()).toEqual(first)
+      expect(storage.writes).toBe(1)
+
+      const services = new AppServices(storage, () => FIXED_NOW)
+      services.auth.oneClick(source === 'mock_webhook' ? 'customer' : 'admin')
+      const beforeReplay = structuredClone(services.repository.getSnapshot())
+      const writesBeforeReplay = storage.writes
+      expect(() => services.payments.processEvent(
+        fixture.paymentId,
+        fixture.eventId,
+        'failed',
+        source,
+        fixture.reason,
+      )).toThrow(expect.objectContaining({
+        code: 'IDEMPOTENCY_CONFLICT',
+      }))
+      expect(services.repository.getSnapshot()).toEqual(beforeReplay)
+      expect(storage.writes).toBe(writesBeforeReplay)
+    },
+  )
+
+  it.each([
+    'other_payment_active',
+    'other_payment_captured',
+  ] as const)(
+    'migrates exact previous-writer %s conflict evidence without guessing replay inputs',
+    (outcome) => {
+      const fixture = previousWriterConflictingSuccessIgnoredEvent(outcome)
+      const original = structuredClone(fixture.legacy)
+      const migrated = migrateDemoStateV8(fixture.legacy)
+      const payment = migrated.payments.find((entry) =>
+        entry.id === fixture.ignoredPaymentId)!
+      const event = payment.events.find((entry) =>
+        entry.id === fixture.eventId)!
+      const migrationAudit = matchingLegacyIgnoredPaymentEventMigrationAudit(
+        migrated,
+        payment,
+        event,
+      )
+
+      expect(fixture.legacy).toEqual(original)
+      expect(event.ignoredReason).toContain(fixture.relatedPaymentId)
+      expect(event).not.toHaveProperty('ignoredInputReason')
+      expect(migrationAudit).toMatchObject({
+        action: 'migration.v8.ignored_payment_event',
+        after: {
+          legacyReplayable: false,
+          outcome,
+          relatedPaymentId: fixture.relatedPaymentId,
+          schemaVersion: 9,
+        },
+      })
+      expect(() => validateDemoState(migrated)).not.toThrow()
+    },
+  )
+
+  it('migrates an authentic old active conflict followed by a same-instant capture using audit order', () => {
+    const fixture = previousWriterActiveConflictThenSameInstantCapture()
+    const original = structuredClone(fixture.legacy)
+    const migrated = migrateDemoStateV8(fixture.legacy)
+    const ignoredPayment = migrated.payments.find((payment) =>
+      payment.id === fixture.ignoredPaymentId)!
+    const event = ignoredPayment.events.find((entry) =>
+      entry.id === fixture.eventId)!
+    const related = migrated.payments.find((payment) =>
+      payment.id === fixture.relatedPaymentId)!
+    const migrationAudit = matchingLegacyIgnoredPaymentEventMigrationAudit(
+      migrated,
+      ignoredPayment,
+      event,
+    )
+
+    expect(fixture.legacy).toEqual(original)
+    expect(related.status).toBe('succeeded')
+    expect(migrationAudit).toMatchObject({
+      action: 'migration.v8.ignored_payment_event',
+      after: {
+        legacyReplayable: false,
+        outcome: 'other_payment_active',
+        relatedPaymentId: related.id,
+        schemaVersion: 9,
+      },
+    })
+    expect(() => validateDemoState(migrated)).not.toThrow()
+  })
+
+  it.each([
+    ['missing admin audit', () => {
+      const fixture = previousWriterIgnoredPaymentEvent('admin_reconcile')
+      removeAudit(
+        fixture.legacy as unknown as DemoState,
+        (audit) => audit.eventId === fixture.eventId,
+      )
+      return fixture.legacy
+    }],
+    ['altered admin audit outcome', () => {
+      const fixture = previousWriterIgnoredPaymentEvent('admin_reconcile')
+      fixture.legacy.audits.find((audit) =>
+        audit.eventId === fixture.eventId)!.outcome = 'applied'
+      return fixture.legacy
+    }],
+    ['forged mock audit', () => {
+      const fixture = ignoredPaymentEventFixture('mock_webhook')
+      const legacy = toPreviousWriterVersion8(fixture.state)
+      const event = legacy.payments.find((entry) =>
+        entry.id === fixture.paymentId)!.events.find((entry) =>
+        entry.id === fixture.eventId)!
+      delete event.ignoredOutcome
+      delete event.ignoredPriorStatus
+      delete event.ignoredRelatedPaymentId
+      delete event.ignoredRoute
+      delete event.ignoredInputReason
+      const audit = legacy.audits.find((entry) =>
+        entry.eventId === fixture.eventId)!
+      audit.after = {
+        attemptedStatus: event.type,
+        ignoredReason: event.ignoredReason!,
+        status: 'succeeded',
+      }
+      return legacy
+    }],
+    ['forged current replay field', () => {
+      const fixture = previousWriterIgnoredPaymentEvent('mock_webhook')
+      fixture.event.ignoredRoute = 'generic'
+      return fixture.legacy
+    }],
+    ['forged old request identity', () => {
+      const fixture = previousWriterIgnoredPaymentEvent('admin_reconcile')
+      fixture.event.requestId = 'req-forged-old-ignored-event'
+      fixture.legacy.audits.find((audit) =>
+        audit.eventId === fixture.eventId)!.requestId =
+          fixture.event.requestId
+      return fixture.legacy
+    }],
+    ['ambiguous ignored reason', () => {
+      const fixture = previousWriterIgnoredPaymentEvent('mock_webhook')
+      fixture.event.ignoredReason =
+        'Out-of-order: pending cannot become failed'
+      return fixture.legacy
+    }],
+    ['unproven related payment outcome', () => {
+      const fixture = previousWriterConflictingSuccessIgnoredEvent(
+        'other_payment_captured',
+      )
+      const related = fixture.legacy.payments.find((payment) =>
+        payment.id === fixture.relatedPaymentId)!
+      related.events.find((event) =>
+        event.type === 'succeeded' &&
+        event.ignoredReason === undefined)!.type = 'failed'
+      return fixture.legacy
+    }],
+    ['missing related payment creation evidence', () => {
+      const fixture = previousWriterActiveConflictThenSameInstantCapture()
+      removeAudit(
+        fixture.legacy as unknown as DemoState,
+        (audit) =>
+          audit.action === 'payment.attempt_created' &&
+          audit.targetId === fixture.relatedPaymentId,
+      )
+      return fixture.legacy
+    }],
+  ] as const)(
+    'rejects a %s v8 ignored event without changing source or raw storage',
+    (_label, makeLegacy) => {
+      const legacy = makeLegacy()
+      const original = structuredClone(legacy)
+      const raw = JSON.stringify(legacy)
+
+      expect(() => migrateDemoStateV8(legacy)).toThrow(
+        expect.objectContaining({ code: 'MIGRATION_SOURCE_INVALID' }),
+      )
+      expect(legacy).toEqual(original)
+      expect(JSON.stringify(legacy)).toBe(raw)
+
+      const storage = new CountingStorage()
+      storage.seed(STORAGE_KEY, raw)
+      const repository = new MockRepository(storage)
+      expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+      expect(storage.writes).toBe(0)
+      expect(repository.recoveryNotice).toMatch(
+        /version 8.+failed the migration safety checks.+exact original browser bytes were left unchanged/i,
+      )
+    },
+  )
+
+  it('collision-checks the synthetic ignored-event migration audit identity', () => {
+    const fixture = previousWriterIgnoredPaymentEvent('mock_webhook')
+    const collision = structuredClone(fixture.legacy.audits.at(-1)!)
+    collision.id = legacyIgnoredPaymentEventMigrationId(fixture.eventId)
+    collision.sequence = fixture.legacy.auditCount + 1
+    collision.previousId = fixture.legacy.auditHeadId
+    collision.action = 'demo.ignored-event-collision'
+    fixture.legacy.audits.push(collision)
+    fixture.legacy.auditCount += 1
+    fixture.legacy.auditHeadId = collision.id
+    const original = structuredClone(fixture.legacy)
+
+    expect(() => migrateDemoStateV8(fixture.legacy)).toThrow(
+      expect.objectContaining({ code: 'MIGRATION_ID_COLLISION' }),
+    )
+    expect(fixture.legacy).toEqual(original)
+  })
+
+  it.each([
+    ['missing', (state: DemoState, paymentId: string) => {
+      removeAudit(
+        state,
+        (audit) =>
+          audit.action === 'payment.attempt_created' &&
+          audit.targetId === paymentId,
+      )
+    }],
+    ['contradictory', (state: DemoState, paymentId: string) => {
+      const audit = state.audits.find((entry) =>
+        entry.action === 'payment.attempt_created' &&
+        entry.targetId === paymentId)!
+      ;(audit.after as Record<string, unknown>).status = 'succeeded'
+    }],
+  ] as const)(
+    'rejects current active-conflict evidence with %s related attempt creation proof',
+    (_label, corrupt) => {
+      const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+      services.auth.oneClick('customer')
+      services.orders.setCartQuantity(1)
+      const order = services.orders.create({
+        requestId: 'checkout_000000000000000000000000000000a4',
+        quantity: 1,
+        shippingMethod: 'standard',
+        address: DEMO_ADDRESS,
+        acknowledged: true,
+        displayedTotalSen: BOX_PRICE_SEN + 1200,
+      })
+      const stale = services.payments.createAttempt(order.id)
+      services.payments.act(stale.id, 'decline')
+      const active = services.payments.createAttempt(order.id)
+      services.payments.processEvent(
+        stale.id,
+        'evt-current-active-conflict-creation-proof',
+        'succeeded',
+      )
+      const state = services.repository.exportForTest()
+      corrupt(state, active.id)
+
+      expect(() => validateDemoState(state)).toThrow(
+        /ignored payment events require exact immutable/i,
+      )
+    },
+  )
+
+  it.each([
+    ['missing immutable audit', (state: DemoState, eventId: string) => {
+      removeAudit(state, (audit) => audit.eventId === eventId)
+    }],
+    ['altered audit reason', (state: DemoState, eventId: string) => {
+      state.audits.find((audit) =>
+        audit.eventId === eventId)!.reason = 'Altered ignored audit reason'
+    }],
+    ['altered submitted reason', (state: DemoState, eventId: string) => {
+      state.payments.flatMap((payment) => payment.events).find((event) =>
+        event.id === eventId)!.ignoredInputReason =
+          'Altered submitted ignored reason'
+    }],
+    ['altered route', (state: DemoState, eventId: string) => {
+      state.payments.flatMap((payment) => payment.events).find((event) =>
+        event.id === eventId)!.ignoredRoute = 'dispute_resolution'
+    }],
+    ['altered outcome', (state: DemoState, eventId: string) => {
+      state.payments.flatMap((payment) => payment.events).find((event) =>
+        event.id === eventId)!.ignoredOutcome = 'other_payment_captured'
+    }],
+    ['altered prior status', (state: DemoState, eventId: string) => {
+      state.payments.flatMap((payment) => payment.events).find((event) =>
+        event.id === eventId)!.ignoredPriorStatus = 'pending'
+    }],
+    ['generic route masquerading after a dispute', (
+      state: DemoState,
+      eventId: string,
+    ) => {
+      const payment = state.payments.find((entry) =>
+        entry.events.some((event) => event.id === eventId))!
+      const eventIndex = payment.events.findIndex((event) =>
+        event.id === eventId)
+      payment.events
+        .slice(0, eventIndex)
+        .filter((event) => event.ignoredReason === undefined)
+        .at(-1)!.type = 'disputed'
+      const event = payment.events[eventIndex]
+      event.ignoredPriorStatus = 'disputed'
+      event.ignoredReason = 'Out-of-order: disputed cannot become failed'
+      const audit = state.audits.find((entry) =>
+        entry.eventId === eventId)!
+      audit.reason = event.ignoredReason
+      ;(audit.before as Record<string, unknown>).status = 'disputed'
+      ;(audit.after as Record<string, unknown>).status = 'disputed'
+      ;(audit.after as Record<string, unknown>).ignoredReason =
+        event.ignoredReason
+    }],
+  ] as Array<[
+    string,
+    (state: DemoState, eventId: string) => void,
+  ]>)(
+    'rejects current ignored-event evidence with %s',
+    (_label, corrupt) => {
+      const fixture = ignoredPaymentEventFixture('admin_reconcile')
+      corrupt(fixture.state, fixture.eventId)
+      expect(() => validateDemoState(fixture.state)).toThrow(
+        /exact immutable current or non-replayable migrated evidence/i,
+      )
+    },
+  )
+
+  it('rejects accepted events carrying ignored evidence and ignored events carrying refunds', () => {
+    const accepted = createDemoState()
+    accepted.payments[0].events[0].ignoredOutcome = 'out_of_order'
+    expect(() => validateDemoState(accepted)).toThrow(
+      /accepted payment events cannot carry ignored-event evidence/i,
+    )
+
+    const fixture = ignoredPaymentEventFixture('admin_reconcile')
+    const event = fixture.state.payments.find((payment) =>
+      payment.id === fixture.paymentId)!.events.find((entry) =>
+      entry.id === fixture.eventId)!
+    event.refundIntent = {
+      amountSen: 1,
+      paymentId: fixture.paymentId,
+      reason: 'Forged refund on an ignored provider event',
+    }
+    expect(() => validateDemoState(fixture.state)).toThrow(
+      /ignored payment events can never carry a refund intent/i,
+    )
+  })
+
+  it('rejects orphan current ignored audits and tampered migrated source evidence', () => {
+    const current = ignoredPaymentEventFixture('admin_reconcile')
+    const sourceAudit = current.state.audits.find((audit) =>
+      audit.eventId === current.eventId)!
+    const orphan = {
+      ...structuredClone(sourceAudit),
+      id: 'audit-orphan-current-ignored-event',
+      sequence: current.state.auditCount + 1,
+      previousId: current.state.auditHeadId,
+      reason: 'Orphan altered ignored-event evidence',
+    }
+    current.state.audits.push(orphan)
+    current.state.auditCount = orphan.sequence
+    current.state.auditHeadId = orphan.id
+    expect(() => validateDemoState(current.state)).toThrow(
+      /ignored payment-event audit.+no orphan audit/i,
+    )
+
+    const legacy = previousWriterIgnoredPaymentEvent('admin_reconcile')
+    const migrated = migrateDemoStateV8(legacy.legacy)
+    migrated.audits.find((audit) =>
+      audit.eventId === legacy.eventId &&
+      audit.action === 'payment.event_ignored')!.reason =
+        'Tampered migrated source audit'
+    expect(() => validateDemoState(migrated)).toThrow(
+      /exact immutable current or non-replayable migrated evidence/i,
+    )
+  })
+
+  it('preflights forged partial dispute resolution history before v9 audit backfill and preserves exact v8 bytes', () => {
+    const fixture = forgedPartialDisputeResolutionState()
+    const legacy = toPreviousWriterVersion8(fixture.state)
+    const original = structuredClone(legacy)
+    expect(legacy.audits.some((audit) =>
+      audit.eventId === fixture.eventId &&
+      audit.targetType === 'payment')).toBe(false)
+
+    expect(() => migrateDemoStateV8(legacy)).toThrow(
+      expect.objectContaining({ code: 'MIGRATION_SOURCE_INVALID' }),
+    )
+    expect(legacy).toEqual(original)
+
+    const raw = JSON.stringify(legacy)
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, raw)
+    const repository = new MockRepository(storage)
+
+    expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+    expect(storage.writes).toBe(0)
+    expect(repository.recoveryNotice).toMatch(
+      /version 8.+failed the migration safety checks.+exact original browser bytes were left unchanged/i,
+    )
+    expect(() => repository.update(() => undefined)).toThrow(
+      expect.objectContaining({ code: 'CONFIRMED_RESET_REQUIRED' }),
+    )
+  })
+
+  it('upgrades a valid v8 exact remaining customer-won refund without an audit and validates the v9 backfill', () => {
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    services.auth.oneClick('admin')
+    services.payments.refund(
+      'pay-processing',
+      1000,
+      'Confirmed v8 partial refund before valid dispute',
+      'req-v8-valid-prior-partial',
+    )
+    services.payments.dispute(
+      'pay-processing',
+      'Confirmed v8 valid customer dispute',
+      'evt-v8-valid-customer-dispute',
+    )
+    const result = services.payments.resolveDispute(
+      'pay-processing',
+      'refund',
+      'Confirmed v8 valid exact remaining customer refund',
+      'evt-v8-valid-customer-refund',
+    )
+    const source = services.repository.exportForTest()
+    const event = result.payment.events.find((entry) =>
+      entry.id === 'evt-v8-valid-customer-refund')!
+    const legacy = toPreviousWriterVersion8(source, {
+      preserveFinancialStopAudits: true,
+    })
+    expect(legacy.audits.some((audit) =>
+      audit.action === 'order.financial_hold_disputed')).toBe(true)
+    expect(legacy.audits.some((audit) =>
+      audit.eventId === event.id &&
+      audit.targetType === 'payment')).toBe(false)
+
+    const migrated = migrateDemoStateV8(legacy)
+    const audit = migrated.audits.find((entry) =>
+      entry.eventId === event.id &&
+      entry.targetType === 'payment')!
+
+    expect(event.refundIntent?.amountSen).toBe(20_200)
+    expect(audit).toMatchObject({
+      action: 'payment.refunded',
+      before: {
+        refundedSen: 1000,
+        status: 'disputed',
+      },
+      after: {
+        allocationsReturned: 0,
+        amountSen: 20_200,
+        orderStatus: 'refunded',
+        refundedSen: 21_200,
+        status: 'refunded',
+      },
+    })
+    expect(() => validateDemoState(migrated)).not.toThrow()
+  })
+
+  it('keeps exact version 8 bytes and reports version 8 when migration persistence fails', () => {
+    const legacy = toPreviousWriterVersion8()
+    const raw = JSON.stringify(legacy)
+    const storage = new FaultStorage()
+    storage.seed(STORAGE_KEY, raw)
+    storage.failNextWrites = 1
+
+    const repository = new MockRepository(storage)
+
+    expect(repository.getSnapshot().schemaVersion).toBe(9)
+    expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+    expect(storage.successfulWrites).toBe(0)
+    expect(repository.recoveryNotice).toMatch(
+      /version 8 to version 9.+could not save the upgrade.+original version 8 data was left unchanged/i,
+    )
+  })
+
+  it.each([
+    ['broken', () => {
+      const broken = toPreviousWriterVersion8() as Partial<LegacyDemoStateV8>
+      delete broken.cart
+      return broken
+    }],
+    ['ambiguous', () => {
+      const ambiguous = structuredClone(createDemoState()) as unknown as LegacyDemoStateV8
+      ambiguous.schemaVersion = 8
+      const originalAudit = ambiguous.audits.find((audit) =>
+        audit.action === 'shipment.transitioned')!
+      const duplicateAudit = {
+        ...structuredClone(originalAudit),
+        id: `${originalAudit.id}-ambiguous-copy`,
+        sequence: ambiguous.auditCount + 1,
+        previousId: ambiguous.auditHeadId,
+      }
+      ambiguous.audits.push(duplicateAudit)
+      ambiguous.auditCount = duplicateAudit.sequence
+      ambiguous.auditHeadId = duplicateAudit.id
+      return ambiguous
+    }],
+  ] as const)(
+    'protects malformed or %s version 8 bytes without overwriting them',
+    (_label, makeLegacy) => {
+      const raw = JSON.stringify(makeLegacy())
+      const storage = new CountingStorage()
+      storage.seed(STORAGE_KEY, raw)
+
+      const repository = new MockRepository(storage)
+
+      expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+      expect(storage.writes).toBe(0)
+      expect(repository.recoveryNotice).toMatch(
+        /version 8.+failed the migration safety checks.+exact original browser bytes were left unchanged/i,
+      )
+      expect(() => repository.update(() => undefined)).toThrow(
+        expect.objectContaining({ code: 'CONFIRMED_RESET_REQUIRED' }),
+      )
+    },
+  )
+
+  it('defers a valid version 5 migration write until authority is granted', () => {
+    const legacy = toVersion5(createDemoState())
+    legacy.revision = 19
+    const raw = JSON.stringify(legacy)
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, raw)
+
+    const repository = new MockRepository(storage, { writeAuthority: false })
+
+    expect(repository.getSnapshot()).toMatchObject({ schemaVersion: 9, revision: 19 })
+    expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+    expect(storage.writes).toBe(0)
+
+    repository.grantWriteAuthority()
+
+    expect(repository.hasWriteAuthority()).toBe(true)
+    expect(storage.writes).toBe(1)
+    expect(JSON.parse(storage.getItem(STORAGE_KEY)!)).toEqual(repository.getSnapshot())
+  })
+
+  it('restores exact version 5 bytes when a deferred migration write mutates then fails', () => {
+    const legacy = toVersion5(createDemoState())
+    legacy.revision = 23
+    const raw = JSON.stringify(legacy)
+    const storage = new MutateThenFailOnceStorage()
+    storage.seed(STORAGE_KEY, raw)
+    const repository = new MockRepository(storage, { writeAuthority: false })
+    storage.failAfterNextWrite = true
+
+    expect(() => repository.grantWriteAuthority()).toThrow(
+      expect.objectContaining({ code: 'STORAGE_WRITE_FAILED' }),
+    )
+
+    expect(repository.hasWriteAuthority()).toBe(false)
+    expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+    expect(repository.recoveryNotice).toMatch(/original version 5 bytes were restored exactly/i)
+  })
+
+  it('migrates version 7 claim snapshots through version 8 to version 9 with the same storage key', () => {
+    const services = servicesWithClaim('damage')
+    const legacy = toVersion7(services.repository.exportForTest())
+    const raw = JSON.stringify(legacy)
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, raw)
+
+    const repository = new MockRepository(storage)
+    const snapshot = repository.getSnapshot()
+
+    expect(STORAGE_KEY).toBe('tbbc:demo:repository:v5')
+    expect(snapshot.schemaVersion).toBe(9)
+    expect(snapshot.claims[0]).toMatchObject({
+      remedyBoxIds: ['box-delivered-01'],
+      requiredSettlementSen: 11_200,
+    })
+    expect(snapshot.claims[0]).not.toHaveProperty('acceptedSettlementSen')
+    expect(storage.writes).toBe(1)
+    expect(repository.recoveryNotice).toMatch(/version 7 through version 8 to version 9/i)
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+  })
+
+  it('classifies exact and capped-terminal version 7 settlements with shared rules', () => {
+    const exactStorage = new MemoryStorage()
+    exactStorage.seed(
+      STORAGE_KEY,
+      JSON.stringify(toVersion7(stateWithLinkedRefundClaim(true))),
+    )
+    const exact = new MockRepository(exactStorage).getSnapshot().claims[0]
+    expect(exact).toMatchObject({
+      acceptedSettlementSen: 11_200,
+      requiredSettlementSen: 11_200,
+      settlementPolicy: 'exact_scope',
+    })
+    expect(exact.legacyUnderSettledRefund).toBeUndefined()
+
+    const terminalStorage = new MemoryStorage()
+    terminalStorage.seed(
+      STORAGE_KEY,
+      JSON.stringify(cappedTerminalFallbackVersion7State()),
+    )
+    const terminalSnapshot = new MockRepository(terminalStorage).getSnapshot()
+    const terminal = terminalSnapshot.claims.find((claim) =>
+      claim.orderId === 'ord-failed')!
+    expect(terminal).toMatchObject({
+      acceptedSettlementSen: 10_200,
+      requiredSettlementSen: 11_200,
+      settlementPolicy: 'terminal_replacement_fallback',
+    })
+    expect(terminal.legacyUnderSettledRefund).toBeUndefined()
+    expect(() => validateDemoState(terminalSnapshot)).not.toThrow()
+  })
+
+  it('protects raw over-settled nonterminal version 7 bytes without upgrading them', () => {
+    const raw = JSON.stringify(overSettledVersion7State())
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, raw)
+
+    const repository = new MockRepository(storage)
+
+    expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+    expect(storage.writes).toBe(0)
+    expect(repository.getSnapshot().schemaVersion).toBe(9)
+    expect(repository.recoveryNotice).toMatch(
+      /version 7.+failed.+exact original browser bytes were left unchanged/i,
+    )
+    expect(() => repository.update(() => undefined)).toThrow(
+      expect.objectContaining({ code: 'CONFIRMED_RESET_REQUIRED' }),
+    )
+  })
+
+  it('preserves a valid version 7 grouped replacement scope as history while activating only its exact claim scope', () => {
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    makeProcessingOrderSingleGroupedPhysicalShipment(services)
+    services.auth.oneClick('customer')
+    services.openBox('box-processing-02')
+    const claim = services.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'value_floor',
+      boxId: 'box-processing-01',
+      note: 'DEMO legacy grouped replacement scope evidence',
+    }).data
+    services.auth.oneClick('admin')
+    services.claims.review(
+      claim.id,
+      'acknowledge',
+      'Confirmed legacy grouped replacement acknowledgement',
+    )
+    services.claims.review(
+      claim.id,
+      'approve',
+      'Confirmed legacy grouped replacement approval',
+    )
+    const replacement = services.claims.authorizeReplacement(
+      claim.id,
+      'Confirmed legacy grouped replacement authorization',
+    ).data
+    const current = services.repository.exportForTest()
+    const original = current.shipments.find((entry) => entry.id === 'shp-processing')!
+    const legacyReplacement = current.shipments.find((entry) =>
+      entry.id === replacement.id)!
+    legacyReplacement.boxIds = [...original.boxIds]
+    const legacy = toVersion7(current)
+    const legacyTimeline = structuredClone(legacyReplacement.timeline)
+    const legacyAudits = structuredClone(legacy.audits)
+    const storage = new MemoryStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(legacy))
+
+    const snapshot = new MockRepository(storage).getSnapshot()
+    const migratedOriginal = snapshot.shipments.find((entry) =>
+      entry.id === original.id)!
+    const migratedReplacement = snapshot.shipments.find((entry) =>
+      entry.id === replacement.id)!
+
+    expect(migratedOriginal.boxIds).toEqual([
+      'box-processing-01',
+      'box-processing-02',
+    ])
+    expect(migratedReplacement).toMatchObject({
+      boxIds: ['box-processing-01'],
+      legacyRecordedBoxIds: ['box-processing-01', 'box-processing-02'],
+      sourceClaimId: claim.id,
+      replacementForShipmentId: original.id,
+    })
+    expect(migratedReplacement.timeline).toEqual(legacyTimeline)
+    expect(snapshot.audits).toEqual(legacyAudits)
+    expect(snapshot.claims.find((entry) => entry.id === claim.id)).toMatchObject({
+      remedyBoxIds: ['box-processing-01'],
+      requiredSettlementSen: 10_600,
+      replacementShipmentId: replacement.id,
+    })
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+
+    const tamperedLegacyScope = structuredClone(snapshot)
+    tamperedLegacyScope.shipments.find((entry) => entry.id === replacement.id)!
+      .legacyRecordedBoxIds = ['box-processing-01']
+    expect(() => validateDemoState(tamperedLegacyScope)).toThrow(
+      /broader legacy original scope/i,
+    )
+
+    const tamperedOriginal = structuredClone(snapshot)
+    tamperedOriginal.shipments.find((entry) => entry.id === original.id)!
+      .legacyRecordedBoxIds = [...original.boxIds]
+    expect(() => validateDemoState(tamperedOriginal)).toThrow(
+      /original shipments cannot carry replacement provenance/i,
+    )
+  })
+
+  it('keeps original version 7 bytes exactly when migration persistence fails', () => {
+    const raw = JSON.stringify(toVersion7(servicesWithClaim('damage').repository.exportForTest()))
+    const storage = new FaultStorage()
+    storage.seed(STORAGE_KEY, raw)
+    storage.failNextWrites = 1
+
+    const repository = new MockRepository(storage)
+
+    expect(repository.getSnapshot().schemaVersion).toBe(9)
+    expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+    expect(storage.successfulWrites).toBe(0)
+    expect(repository.recoveryNotice).toMatch(
+      /could not save the upgrade.+original version 7 data was left unchanged.+memory only/i,
+    )
+  })
+
+  it('reports the exact preserved legacy version when a deferred migration save fails', () => {
+    const raw = JSON.stringify(
+      toVersion7(servicesWithClaim('damage').repository.exportForTest()),
+    )
+    const storage = new FaultStorage()
+    storage.seed(STORAGE_KEY, raw)
+    const repository = new MockRepository(storage, { writeAuthority: false })
+    storage.failNextWrites = 1
+
+    expect(() => repository.grantWriteAuthority()).toThrow(
+      expect.objectContaining({ code: 'STORAGE_WRITE_FAILED' }),
+    )
+    expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+    expect(repository.recoveryNotice).toMatch(
+      /original version 7 bytes were restored exactly/i,
+    )
+  })
+
+  it('preserves an exact under-settled version 7 refund while allowing only the payment remainder to refund', () => {
+    const storage = new MemoryStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(legacyUnderSettledVersion7State()))
+
+    const snapshot = new MockRepository(storage).getSnapshot()
+    const claim = snapshot.claims[0]
+
+    expect(claim).toMatchObject({
+      status: 'resolved',
+      remedyState: 'refund_completed',
+      remedyBoxIds: ['box-processing-01'],
+      requiredSettlementSen: 10_600,
+      acceptedSettlementSen: 1000,
+      legacyUnderSettledRefund: true,
+    })
+    expect(claim.settlementPolicy).toBeUndefined()
+    expect(snapshot.orders.find((entry) => entry.id === 'ord-processing')?.status)
+      .toBe('processing')
+    expect(snapshot.boxes.find((entry) => entry.id === 'box-processing-01')?.status)
+      .toBe('opened')
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+
+    const activeStorage = new MemoryStorage()
+    activeStorage.seed(STORAGE_KEY, JSON.stringify(snapshot))
+    const services = new AppServices(activeStorage, () => FIXED_NOW)
+    services.auth.oneClick('admin')
+    for (const status of [
+      'packed',
+      'label_created',
+      'shipped',
+      'delivered',
+    ] as const) {
+      services.fulfilment.advance(
+        'shp-processing',
+        status,
+        `Confirmed legacy scope-owner delivery ${status}`,
+      )
+    }
+    services.auth.oneClick('customer')
+    const beforeBlockedClaim = structuredClone(services.repository.getSnapshot())
+    expect(() => services.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'damage',
+      shipmentId: 'shp-processing',
+      note: 'DEMO later damage claim cannot reuse preserved legacy scope',
+    })).toThrow(expect.objectContaining({
+      code: 'CLAIM_REMEDY_SCOPE_UNAVAILABLE',
+    }))
+    expect(services.repository.getSnapshot()).toEqual(beforeBlockedClaim)
+    services.auth.oneClick('admin')
+    const legacyAuditPrefix = structuredClone(
+      services.repository.getSnapshot().audits,
+    )
+    const beforeClaim = structuredClone(
+      services.repository.getSnapshot().claims.find((entry) => entry.id === claim.id),
+    )
+    const refund = services.payments.refund(
+      'pay-processing',
+      20_200,
+      'Attempted generic full after legacy under-settlement',
+      'req-generic-full-after-legacy-under-settlement',
+    )
+    const after = services.repository.getSnapshot()
+    expect(refund).toMatchObject({
+      changed: true,
+      payment: { refundedSen: 21_200, status: 'refunded' },
+    })
+    expect(after.claims.find((entry) => entry.id === claim.id)).toEqual(beforeClaim)
+    expect(after.audits.slice(0, legacyAuditPrefix.length))
+      .toEqual(legacyAuditPrefix)
+    expect(after.audits.at(-1)?.after).toMatchObject({
+      amountSen: 20_200,
+      preservedCompletedClaimIds: [claim.id],
+      refundedSen: 21_200,
+    })
+    expect(() => validateDemoState(after)).not.toThrow()
+  })
+
+  it.each([
+    ['missing legacy marker', (state: DemoState) => {
+      delete state.claims[0].legacyUnderSettledRefund
+    }],
+    ['unexpected settlement policy', (state: DemoState) => {
+      state.claims[0].settlementPolicy = 'exact_scope'
+    }],
+    ['accepted amount at requirement', (state: DemoState) => {
+      state.claims[0].acceptedSettlementSen =
+        state.claims[0].requiredSettlementSen
+    }],
+    ['wrong resolution reference', (state: DemoState) => {
+      state.claims[0].resolutionReference = 'evt-wrong-legacy-reference'
+    }],
+    ['altered exact payment audit', (state: DemoState) => {
+      state.audits.find((audit) =>
+        audit.eventId === state.claims[0].linkedRefundEventId &&
+        audit.targetType === 'payment')!.reason =
+          'Altered legacy payment audit'
+    }],
+    ['altered exact claim-link audit', (state: DemoState) => {
+      const audit = state.audits.find((entry) =>
+        entry.action === 'claim.refund_linked' &&
+        entry.targetId === state.claims[0].id)!
+      ;(audit.after as Record<string, unknown>).claimId =
+        'clm-wrong-legacy-link'
+    }],
+    ['altered exact final resolution audit', (state: DemoState) => {
+      state.audits.find((entry) =>
+        entry.action === 'claim.resolve' &&
+        entry.targetId === state.claims[0].id)!.reason =
+          'Altered legacy final audit'
+    }],
+    ['altered exact final history', (state: DemoState) => {
+      state.claims[0].history.at(-1)!.note =
+        'Altered legacy final history'
+    }],
+  ] as Array<[string, (state: DemoState) => void]>)(
+    'fails closed for malformed preserved legacy history: %s',
+    (_label, corrupt) => {
+      const storage = new MemoryStorage()
+      storage.seed(
+        STORAGE_KEY,
+        JSON.stringify(legacyUnderSettledVersion7State()),
+      )
+      const valid = new MockRepository(storage).getSnapshot()
+      expect(claimHasPreservedLegacyUnderSettledHistory(
+        valid,
+        valid.claims[0],
+      )).toBe(true)
+
+      const malformed = structuredClone(valid)
+      corrupt(malformed)
+      expect(claimHasPreservedLegacyUnderSettledHistory(
+        malformed,
+        malformed.claims[0],
+      )).toBe(false)
+      expect(() => validateDemoState(malformed)).toThrow()
+    },
+  )
+
+  it('allows a customer-won dispute to refund only the exact preserved legacy payment remainder', () => {
+    const migrationStorage = new MemoryStorage()
+    migrationStorage.seed(
+      STORAGE_KEY,
+      JSON.stringify(legacyUnderSettledVersion7State()),
+    )
+    const migrated = new MockRepository(migrationStorage).getSnapshot()
+    const storage = new MemoryStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(migrated))
+    const services = new AppServices(storage, () => FIXED_NOW)
+    services.auth.oneClick('admin')
+    const claim = services.repository.getSnapshot().claims[0]
+    const claimBefore = structuredClone(claim)
+    const legacyAuditPrefix = structuredClone(
+      services.repository.getSnapshot().audits,
+    )
+    services.payments.dispute(
+      'pay-processing',
+      'Confirmed preserved legacy customer dispute',
+      'evt-preserved-legacy-dispute',
+    )
+    const result = services.payments.resolveDispute(
+      'pay-processing',
+      'refund',
+      'Confirmed preserved legacy customer-won refund',
+      'evt-preserved-legacy-dispute-refund',
+    )
+    const after = services.repository.getSnapshot()
+    const refundEvent = result.payment.events.find((event) =>
+      event.id === 'evt-preserved-legacy-dispute-refund')!
+    const refundAudit = after.audits.find((audit) =>
+      audit.eventId === refundEvent.id)!
+
+    expect(refundEvent.refundIntent).toMatchObject({
+      amountSen: 20_200,
+      paymentId: 'pay-processing',
+    })
+    expect(result.payment).toMatchObject({
+      refundedSen: 21_200,
+      status: 'refunded',
+    })
+    expect(after.claims[0]).toEqual(claimBefore)
+    expect(after.audits.slice(0, legacyAuditPrefix.length))
+      .toEqual(legacyAuditPrefix)
+    expect(refundAudit.after).toMatchObject({
+      amountSen: 20_200,
+      orderStatus: 'refunded',
+      preservedCompletedClaimIds: [claim.id],
+      refundedSen: 21_200,
+    })
+    expect(() => validateDemoState(after)).not.toThrow()
+  })
+
+  it('protects a forged current-schema legacy refund settled above its requirement', () => {
+    const migrationStorage = new MemoryStorage()
+    migrationStorage.seed(
+      STORAGE_KEY,
+      JSON.stringify(legacyUnderSettledVersion7State()),
+    )
+    const forged = structuredClone(
+      new MockRepository(migrationStorage).getSnapshot(),
+    )
+    const claim = forged.claims[0]
+    const payment = forged.payments.find((entry) =>
+      entry.id === 'pay-processing')!
+    const event = payment.events.find((entry) =>
+      entry.id === claim.linkedRefundEventId)!
+    const acceptedSettlementSen = claim.requiredSettlementSen + 1
+    claim.acceptedSettlementSen = acceptedSettlementSen
+    event.refundIntent!.amountSen = acceptedSettlementSen
+    payment.refundedSen = acceptedSettlementSen
+    const paymentAudit = forged.audits.find((audit) =>
+      audit.eventId === event.id && audit.targetType === 'payment')!
+    ;(paymentAudit.after as Record<string, unknown>).refundedSen =
+      acceptedSettlementSen
+
+    expect(forged.schemaVersion).toBe(9)
+    expect(() => validateDemoState(forged)).toThrow(
+      /strictly under-settled/i,
+    )
+
+    const raw = JSON.stringify(forged)
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, raw)
+    const repository = new MockRepository(storage)
+
+    expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+    expect(storage.writes).toBe(0)
+    expect(repository.recoveryNotice).toMatch(
+      /version 9.+failed the safety checks.+exact original browser bytes/i,
+    )
+    expect(() => repository.update(() => undefined)).toThrow(
+      expect.objectContaining({ code: 'CONFIRMED_RESET_REQUIRED' }),
+    )
+  })
+
+  it('maps a financially cancelled version 6 digital shipment to canonical digital cancelled without fabricating delivery', () => {
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    services.auth.oneClick('admin')
+    services.payments.refund(
+      'pay-processing',
+      21_200,
+      'Confirmed legacy digital financial stop fixture',
+      'req-legacy-digital-stop',
+    )
+    const legacy = toVersion6(services.repository.exportForTest())
+    const storage = new MemoryStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(legacy))
+
+    const snapshot = new MockRepository(storage).getSnapshot()
+    const digital = snapshot.shipments.find((entry) => entry.id === 'shp-digital')!
+
+    expect(digital.status).toBe('cancelled')
+    expect(digital.timeline.at(-1)).toMatchObject({
+      status: 'cancelled',
+      financialHold: 'refunded',
+    })
+    expect(digital.timeline.some((entry) => entry.status === 'failed')).toBe(false)
+    expect(digital.timeline.some((entry) => entry.status === 'delivered')).toBe(false)
+    expect(digital).toMatchObject({
+      carrier: 'Digital Vault',
+      trackingNumber: 'DEMO-DIGITAL',
+    })
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+  })
+
+  it('migrates valid custom version 5 business data through versions 6, 7, and 8 once and then loads version 9 without writes', () => {
+    const customServices = servicesWithClaim('damage')
+    customServices.auth.oneClick('admin')
+    customServices.admin.copyPublishedToDraft()
+    const custom = customServices.repository.exportForTest()
+    custom.revision = 42
+    custom.sessionUserId = 'usr-demo-customer'
+    custom.cart[0].quantity = 3
+    custom.audits[0].reason = 'Loaded preserved custom fictional demo records'
+    const legacy = toVersion5(custom)
+    const raw = JSON.stringify(legacy)
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, raw)
+
+    const migrated = new MockRepository(storage)
+    const snapshot = migrated.getSnapshot()
+
+    expect(snapshot.schemaVersion).toBe(9)
+    expect(snapshot.revision).toBe(legacy.revision)
+    expect(snapshot.users).toEqual(legacy.users)
+    expect(ordersWithoutValueFloor(snapshot.orders)).toEqual(legacy.orders)
+    expect(snapshot.orders.every((order) =>
+      order.snapshot.valueFloorSen === VALUE_FLOOR_SEN)).toBe(true)
+    expect(seriesWithoutOdds(snapshot.series)).toEqual(seriesWithoutOdds(legacy.series!))
+    for (const series of snapshot.series) {
+      for (const prize of [
+        ...(series.publishedPrizes ?? []),
+        ...(series.draftPrizes ?? []),
+      ]) {
+        expect(prize.odds).toBe(exactOddsLabel(prize.allocation, series.allocationTotal))
+      }
+      expect((series.publishedPrizes ?? series.draftPrizes)
+        ?.find((prize) => prize.id === 'iphone17')?.odds).toBe('3 in 10,000')
+    }
+    expect(legacy.series?.every((series) =>
+      (series.publishedPrizes ?? series.draftPrizes)
+        ?.find((prize) => prize.id === 'iphone17')?.odds === '1 in 3,333'))
+      .toBe(true)
+    expect(snapshot.payments).toEqual(legacy.payments)
+    expect(snapshot.boxes).toEqual(legacy.boxes)
+    expect(snapshot.shipments).toEqual(legacy.shipments)
+    expect(claimsWithoutV8Snapshot(snapshot.claims)).toEqual(legacy.claims)
+    expect(snapshot.cart).toEqual(legacy.cart)
+    expect(snapshot.audits.map(auditBusinessFields)).toEqual(legacy.audits)
+    expect(snapshot.claims).toHaveLength(1)
+    expect(snapshot.claims[0]).toMatchObject({
+      remedyBoxIds: ['box-delivered-01'],
+      requiredSettlementSen: 11_200,
+    })
+    expect(snapshot.audits.map((audit) => audit.sequence)).toEqual(
+      snapshot.audits.map((_, index) => index + 1),
+    )
+    expect(snapshot.audits.every((audit) => audit.outcome === 'applied')).toBe(true)
+    expect(snapshot.audits.slice(1).every((audit, index) =>
+      audit.previousId === snapshot.audits[index].id)).toBe(true)
+    expect(snapshot.auditCount).toBe(snapshot.audits.length)
+    expect(snapshot.auditHeadId).toBe(snapshot.audits.at(-1)?.id)
+    expect(storage.writes).toBe(1)
+    expect(migrated.recoveryNotice).toMatch(
+      /version 5 through version 6, version 7, and version 8 to version 9/i,
+    )
+
+    const persistedAfterMigration = storage.getItem(STORAGE_KEY)
+    const loadedAgain = new MockRepository(storage)
+    expect(storage.writes).toBe(1)
+    expect(storage.getItem(STORAGE_KEY)).toBe(persistedAfterMigration)
+    expect(loadedAgain.getSnapshot()).toEqual(snapshot)
+    expect(loadedAgain.recoveryNotice).toBeNull()
+  })
+
+  it('migrates valid version 5 business data with empty audit history using one deterministic anchor', () => {
+    const custom = createDemoState()
+    custom.revision = 73
+    custom.sessionUserId = 'usr-demo-customer'
+    custom.cart[0].quantity = 4
+    const legacy = toVersion5(custom)
+    legacy.audits = []
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(legacy))
+
+    const repository = new MockRepository(storage)
+    const snapshot = repository.getSnapshot()
+
+    expect(snapshot).toMatchObject({
+      schemaVersion: 9,
+      revision: 73,
+      sessionUserId: 'usr-demo-customer',
+      cart: [{ quantity: 4 }],
+      auditCount: 18,
+      auditHeadId: 'audit-migration-v9-pay-refunded-evt-ord-refunded-refund-refund',
+    })
+    expect(snapshot.users).toEqual(legacy.users)
+    expect(ordersWithoutValueFloor(snapshot.orders)).toEqual(legacy.orders)
+    expect(snapshot.orders.every((order) =>
+      order.snapshot.valueFloorSen === VALUE_FLOOR_SEN)).toBe(true)
+    expect(seriesWithoutOdds(snapshot.series)).toEqual(seriesWithoutOdds(legacy.series!))
+    expect(snapshot.payments).toEqual(legacy.payments)
+    expect(snapshot.boxes).toEqual(legacy.boxes)
+    expect(snapshot.shipments).toEqual(legacy.shipments)
+    expect(claimsWithoutV8Snapshot(snapshot.claims)).toEqual(legacy.claims)
+    expect(snapshot.audits[0]).toEqual({
+      id: 'audit-migration-v5-empty-anchor',
+      sequence: 1,
+      outcome: 'applied',
+      actorId: 'system',
+      actorRole: 'super_admin',
+      action: 'migration.v5.audit_anchor',
+      targetType: 'demo_state',
+      targetId: 'state-v5',
+      reason: 'Created a deterministic audit anchor while upgrading empty version 5 history',
+      at: '1970-01-01T00:00:00.000Z',
+      before: { auditCount: 0, schemaVersion: 5 },
+      after: { auditCount: 1, schemaVersion: 6 },
+      requestId: 'migration-v5-empty-audit-anchor',
+    })
+    expect(snapshot.audits.slice(1).every((audit) =>
+      audit.action === 'shipment.transitioned' ||
+      audit.action === 'payment.refunded')).toBe(true)
+    expect(storage.writes).toBe(1)
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+
+    const persisted = storage.getItem(STORAGE_KEY)
+    const loadedAgain = new MockRepository(storage)
+    expect(storage.writes).toBe(1)
+    expect(storage.getItem(STORAGE_KEY)).toBe(persisted)
+    expect(loadedAgain.getSnapshot()).toEqual(snapshot)
+  })
+
+  it('migrates valid version 6 linked-refund business data through versions 7 and 8 to version 9 without editing audit history', () => {
+    const current = stateWithLinkedRefundClaim(true)
+    current.revision = 87
+    current.cart[0].quantity = 2
+    const legacy = toVersion6(current)
+    const legacyAudits = structuredClone(legacy.audits)
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(legacy))
+
+    const repository = new MockRepository(storage)
+    const snapshot = repository.getSnapshot()
+
+    expect(snapshot.schemaVersion).toBe(9)
+    expect(snapshot.revision).toBe(87)
+    expect(snapshot.cart[0].quantity).toBe(2)
+    expect(snapshot.shipments.every((shipment) => shipment.purpose === 'original')).toBe(true)
+    expect(snapshot.claims[0]).toMatchObject({
+      status: 'resolved',
+      remedyState: 'refund_completed',
+      linkedRefundEventId: current.claims[0].linkedRefundEventId,
+      resolutionReference: current.claims[0].resolutionReference,
+      remedyBoxIds: ['box-delivered-01'],
+      requiredSettlementSen: 11_200,
+      acceptedSettlementSen: 11_200,
+      settlementPolicy: 'exact_scope',
+    })
+    expect(snapshot.audits.slice(0, legacyAudits.length)).toEqual(legacyAudits)
+    expect(snapshot.audits).toEqual(legacyAudits)
+    expect(snapshot.auditCount).toBe(current.auditCount)
+    expect(snapshot.auditHeadId).toBe(current.auditHeadId)
+    expect(storage.writes).toBe(1)
+    expect(repository.recoveryNotice).toMatch(
+      /version 6 through version 7 and version 8 to version 9/i,
+    )
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+
+    const persisted = storage.getItem(STORAGE_KEY)
+    const loadedAgain = new MockRepository(storage)
+    expect(storage.writes).toBe(1)
+    expect(storage.getItem(STORAGE_KEY)).toBe(persisted)
+    expect(loadedAgain.getSnapshot()).toEqual(snapshot)
+    expect(loadedAgain.recoveryNotice).toBeNull()
+  })
+
+  it('deterministically maps a valid version 6 digital physical-style retry history to terminal failed', () => {
+    const current = createDemoState()
+    const digital = current.shipments.find((shipment) => shipment.id === 'shp-digital')!
+    digital.carrier = 'Demo Legacy Digital Courier'
+    digital.trackingNumber = 'DEMO-LEGACY-DIGITAL-EDIT'
+    digital.status = 'delivered'
+    digital.timeline = [
+      'unfulfilled',
+      'picking',
+      'packed',
+      'label_created',
+      'shipped',
+      'failed_delivery',
+      'shipped',
+      'delivered',
+    ].map((status, index) => ({
+      id: `legacy-digital-${index}`,
+      status: status as DemoState['shipments'][number]['status'],
+      label: `Legacy digital ${status}`,
+      at: `2026-07-22T${String(index + 2).padStart(2, '0')}:00:00.000Z`,
+    }))
+    current.boxes.find((box) => box.id === 'box-processing-02')!.status = 'on_hold'
+    const storage = new MemoryStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(toVersion6(current)))
+
+    const snapshot = new MockRepository(storage).getSnapshot()
+    const migrated = snapshot.shipments.find((shipment) => shipment.id === digital.id)!
+
+    expect(migrated.status).toBe('failed')
+    expect(migrated.carrier).toBe('Digital Vault')
+    expect(migrated.trackingNumber).toBe('DEMO-DIGITAL')
+    expect(migrated.timeline.map((entry) => entry.status)).toEqual([
+      'unfulfilled',
+      'issued',
+      'issued',
+      'sent',
+      'sent',
+      'failed',
+      'failed',
+      'failed',
+    ])
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+  })
+
+  it('deterministically keeps a retried version 6 physical original as terminal failed evidence', () => {
+    const current = createDemoState()
+    const original = current.shipments.find((shipment) => shipment.id === 'shp-failed')!
+    original.timeline.push(
+      {
+        id: 'legacy-physical-retry',
+        status: 'shipped',
+        label: 'Legacy physical retry on the original row',
+        at: '2026-07-28T03:00:00.000Z',
+      },
+      {
+        id: 'legacy-physical-redelivery',
+        status: 'delivered',
+        label: 'Legacy physical delivery on the original row',
+        at: '2026-07-28T04:00:00.000Z',
+      },
+    )
+    original.status = 'delivered'
+    const order = current.orders.find((entry) => entry.id === original.orderId)!
+    order.status = 'fulfilled'
+    order.updatedAt = FIXED_NOW
+    order.timeline.push({
+      id: 'legacy-physical-order-fulfilled',
+      status: 'fulfilled',
+      label: 'Legacy physical original marked fulfilled',
+      at: FIXED_NOW,
+    })
+    current.boxes.find((box) => box.id === 'box-failed-01')!.status = 'fulfilled'
+    const legacy = toVersion6(current)
+    const legacyAudits = structuredClone(legacy.audits)
+    const storage = new MemoryStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(legacy))
+
+    const snapshot = new MockRepository(storage).getSnapshot()
+    const migrated = snapshot.shipments.find((shipment) => shipment.id === original.id)!
+
+    expect(migrated.purpose).toBe('original')
+    expect(migrated.status).toBe('failed_delivery')
+    expect(migrated.timeline.slice(-3).map((entry) => entry.status)).toEqual([
+      'failed_delivery',
+      'failed_delivery',
+      'failed_delivery',
+    ])
+    expect(snapshot.orders.find((entry) => entry.id === order.id)?.status).toBe('processing')
+    expect(snapshot.boxes.find((box) => box.id === 'box-failed-01')?.status).toBe('on_hold')
+    expect(snapshot.audits.slice(0, legacyAudits.length)).toEqual(legacyAudits)
+    expect(snapshot.audits.slice(legacyAudits.length).map((audit) => audit.action))
+      .toEqual(['shipment.transitioned', 'shipment.transitioned'])
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+  })
+
+  it('preserves exact immutable version 6 typed-resolution history without treating it as a completed new remedy', () => {
+    const services = servicesWithClaim('damage')
+    const claim = services.repository.getSnapshot().claims[0]
+    services.auth.oneClick('admin')
+    services.claims.review(claim.id, 'acknowledge', 'Confirmed legacy typed acknowledgement')
+    services.claims.review(claim.id, 'approve', 'Confirmed legacy typed approval')
+    services.claims.review(
+      claim.id,
+      'resolve',
+      'Confirmed sufficiently descriptive legacy typed resolution',
+      { outcome: 'no_remedy', reference: 'DEMO-LEGACY-TYPED-01' },
+    )
+    const current = services.repository.exportForTest()
+    const resolved = current.claims[0]
+    resolved.resolutionOutcome = 'replacement_authorized'
+    resolved.remedyState = 'none'
+    const resolveAudit = current.audits.find((audit) => audit.action === 'claim.resolve')!
+    ;(resolveAudit.after as Record<string, unknown>).resolutionOutcome = 'replacement_authorized'
+    const storage = new MemoryStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(toVersion6(current)))
+
+    const snapshot = new MockRepository(storage).getSnapshot()
+
+    expect(snapshot.claims[0]).toMatchObject({
+      status: 'resolved',
+      remedyState: 'none',
+      resolutionOutcome: 'replacement_authorized',
+      legacyTypedResolution: true,
+    })
+    expect(snapshot.shipments.filter((shipment) => shipment.purpose === 'replacement')).toHaveLength(0)
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+
+    const activeStorage = new MemoryStorage()
+    activeStorage.seed(STORAGE_KEY, JSON.stringify(snapshot))
+    const migratedServices = new AppServices(activeStorage, () => FIXED_NOW)
+    migratedServices.auth.oneClick('admin')
+    const before = structuredClone(migratedServices.repository.getSnapshot())
+    expect(() => migratedServices.payments.refund(
+      'pay-delivered',
+      11_200,
+      'Attempted generic full with grandfathered entitlement',
+      'req-generic-full-grandfathered-entitlement',
+    )).toThrow(expect.objectContaining({
+      code: FULL_REFUND_REMEDY_CONFLICT_CODE,
+      message: expect.stringContaining(snapshot.claims[0].id),
+    }))
+    expect(migratedServices.repository.getSnapshot()).toEqual(before)
+  })
+
+  it('rejects persisted overlapping remedy entitlement holders across distinct claim kinds', () => {
+    const services = servicesWithClaim('damage', incrementingClock())
+    services.auth.oneClick('customer')
+    const valueFloor = services.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'value_floor',
+      boxId: 'box-delivered-01',
+      note: 'DEMO overlapping persisted value-floor complaint',
+    }).data
+    const damage = services.repository.getSnapshot().claims
+      .find((claim) => claim.kind === 'damage')!
+    services.auth.oneClick('admin')
+    for (const claim of [damage, valueFloor]) {
+      services.claims.review(
+        claim.id,
+        'acknowledge',
+        'Confirmed persisted overlap acknowledgement',
+      )
+      services.claims.review(
+        claim.id,
+        'approve',
+        'Confirmed persisted overlap approval',
+      )
+    }
+    services.claims.createRma(
+      damage.id,
+      'DEMO-RMA-PERSISTED-OVERLAP',
+      'Confirmed persisted overlap RMA creation',
+    )
+    services.claims.recordRmaReceived(
+      damage.id,
+      'DEMO-RMA-PERSISTED-OVERLAP',
+      'Confirmed persisted overlap RMA receipt',
+    )
+    services.claims.recordRmaInspected(
+      damage.id,
+      'DEMO-RMA-PERSISTED-OVERLAP',
+      'Confirmed persisted overlap RMA inspection',
+    )
+    services.claims.authorizeReplacement(
+      damage.id,
+      'Confirmed persisted damage replacement authorization',
+    )
+    services.claims.review(
+      valueFloor.id,
+      'resolve',
+      'Confirmed second complaint closed without another remedy',
+      { outcome: 'no_remedy', reference: 'DEMO-NO-OVERLAP-SECOND' },
+    )
+    const corrupt = services.repository.exportForTest()
+    const grandfathered = corrupt.claims.find((claim) =>
+      claim.id === valueFloor.id)!
+    grandfathered.remedyState = 'none'
+    grandfathered.resolutionOutcome = 'replacement_authorized'
+    grandfathered.legacyTypedResolution = true
+    const resolutionAudit = corrupt.audits.find((audit) =>
+      audit.action === 'claim.resolve' &&
+      audit.targetId === grandfathered.id)!
+    ;(resolutionAudit.after as Record<string, unknown>).resolutionOutcome =
+      'replacement_authorized'
+
+    expect(() => validateDemoState(corrupt)).toThrow(
+      expect.objectContaining({ code: 'REMEDY_SCOPE_CONFLICT' }),
+    )
+
+    const raw = JSON.stringify(corrupt)
+    const storage = new MemoryStorage()
+    storage.seed(STORAGE_KEY, raw)
+    const repository = new MockRepository(storage)
+    expect(repository.recoveryNotice).toMatch(
+      /stored version 9 demo data failed the safety checks/i,
+    )
+    expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+  })
+
+  it('keeps original version 6 bytes when migration persistence fails', () => {
+    const legacy = toVersion6(createDemoState())
+    const raw = JSON.stringify(legacy)
+    const storage = new FaultStorage()
+    storage.seed(STORAGE_KEY, raw)
+    storage.failNextWrites = 1
+
+    const repository = new MockRepository(storage)
+
+    expect(repository.getSnapshot().schemaVersion).toBe(9)
+    expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+    expect(storage.successfulWrites).toBe(0)
+    expect(repository.recoveryNotice).toMatch(
+      /could not save the upgrade.+original version 6 data was left unchanged.+memory only/i,
+    )
+  })
+
+  it('keeps original version 5 bytes when migration persistence fails and continues with frozen version 9 memory', () => {
+    const custom = createDemoState()
+    custom.revision = 17
+    custom.cart[0].quantity = 2
+    const raw = JSON.stringify(toVersion5(custom))
+    const storage = new FaultStorage()
+    storage.seed(STORAGE_KEY, raw)
+    storage.failNextWrites = 1
+
+    const repository = new MockRepository(storage)
+
+    expect(repository.getSnapshot()).toMatchObject({
+      schemaVersion: 9,
+      revision: 17,
+      cart: [{ quantity: 2 }],
+    })
+    expect(Object.isFrozen(repository.getSnapshot().orders[0].snapshot.address)).toBe(true)
+    expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+    expect(storage.successfulWrites).toBe(0)
+    expect(repository.recoveryNotice).toMatch(
+      /could not save the upgrade.+original version 5 data was left unchanged.+memory only/i,
+    )
+
+    repository.update((state) => { state.sessionUserId = 'usr-demo-customer' })
+    expect(repository.getSnapshot().sessionUserId).toBe('usr-demo-customer')
+    expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+  })
+
+  it('blocks a stale writer before its mutator and lets it sync once before succeeding', () => {
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const writerA = new MockRepository(storage)
+    const writerB = new MockRepository(storage)
+    const staleIdentity = writerB.getSnapshot()
+    const mutator = vi.fn((state: DemoState) => {
+      state.sessionUserId = 'usr-demo-admin'
+    })
+    const listener = vi.fn()
+    writerB.subscribe(listener)
+
+    writerA.update((state) => { state.sessionUserId = 'usr-demo-customer' })
+    const persistedA = storage.getItem(STORAGE_KEY)
+    const exactA = structuredClone(writerA.getSnapshot())
+
+    expect(() => writerB.update(mutator)).toThrow(
+      expect.objectContaining({ code: 'STATE_CONFLICT' }),
+    )
+    expect(mutator).not.toHaveBeenCalled()
+    expect(writerB.getSnapshot()).toBe(staleIdentity)
+    expect(writerB.getSnapshot().revision).toBe(1)
+    expect(storage.getItem(STORAGE_KEY)).toBe(persistedA)
+    expect(JSON.parse(storage.getItem(STORAGE_KEY)!)).toEqual(exactA)
+    expect(listener).not.toHaveBeenCalled()
+
+    expect(writerB.syncFromStorage()).toBe(true)
+    expect(writerB.getSnapshot()).toEqual(exactA)
+    expect(writerB.getSnapshot()).not.toBe(staleIdentity)
+    expect(listener).toHaveBeenCalledOnce()
+    expect(writerB.syncFromStorage()).toBe(false)
+    expect(listener).toHaveBeenCalledOnce()
+
+    writerB.update(mutator)
+    expect(mutator).toHaveBeenCalledOnce()
+    expect(writerB.getSnapshot()).toMatchObject({
+      revision: exactA.revision + 1,
+      sessionUserId: 'usr-demo-admin',
+    })
+    expect(JSON.parse(storage.getItem(STORAGE_KEY)!)).toEqual(writerB.getSnapshot())
+  })
+
+  it('lets a stale authorized repository reset above storage and a current repository sync it', () => {
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const current = new MockRepository(storage)
+    const staleResetter = new MockRepository(storage)
+    const currentListener = vi.fn()
+    current.subscribe(currentListener)
+
+    current.update((state) => {
+      state.sessionUserId = 'usr-demo-customer'
+      state.cart[0].quantity = 4
+    })
+    expect(current.getSnapshot().revision).toBe(2)
+    expect(staleResetter.getSnapshot().revision).toBe(1)
+
+    staleResetter.reset()
+
+    expect(staleResetter.getSnapshot()).toMatchObject({
+      revision: 3,
+      sessionUserId: null,
+      cart: [{ quantity: 1 }],
+    })
+    expect(JSON.parse(storage.getItem(STORAGE_KEY)!)).toEqual(staleResetter.getSnapshot())
+
+    expect(current.syncFromStorage()).toBe(true)
+    expect(current.getSnapshot()).toEqual(staleResetter.getSnapshot())
+    expect(currentListener).toHaveBeenCalledTimes(2)
+
+    current.update((state) => {
+      state.sessionUserId = 'usr-demo-admin'
+    })
+    expect(current.getSnapshot()).toMatchObject({
+      revision: 4,
+      sessionUserId: 'usr-demo-admin',
+      cart: [{ quantity: 1 }],
+    })
+  })
+
+  it('rejects older and invalid storage during sync without changing the published snapshot', () => {
+    const storage = new MemoryStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const repository = new MockRepository(storage)
+    repository.update((state) => { state.sessionUserId = 'usr-demo-customer' })
+    const published = repository.getSnapshot()
+    const listener = vi.fn()
+    repository.subscribe(listener)
+
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    expect(() => repository.syncFromStorage()).toThrow(
+      expect.objectContaining({ code: 'STATE_SYNC_REJECTED' }),
+    )
+    expect(repository.getSnapshot()).toBe(published)
+    expect(listener).not.toHaveBeenCalled()
+
+    storage.seed(STORAGE_KEY, '{invalid-json')
+    expect(() => repository.syncFromStorage()).toThrow(
+      expect.objectContaining({ code: 'STORED_STATE_INVALID' }),
+    )
+    expect(repository.getSnapshot()).toBe(published)
+    expect(listener).not.toHaveBeenCalled()
+  })
+
+  it('publishes recursively frozen stable snapshots that cannot mutate state or storage', () => {
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const repository = new MockRepository(storage)
+    const snapshot = repository.getSnapshot()
+    const storedBefore = storage.getItem(STORAGE_KEY)
+    const revisionBefore = snapshot.revision
+    const auditsBefore = structuredClone(snapshot.audits)
+
+    expect(repository.getSnapshot()).toBe(snapshot)
+    expect(Object.isFrozen(snapshot)).toBe(true)
+    expect(Object.isFrozen(snapshot.orders[0].snapshot.address)).toBe(true)
+    expect(() => {
+      snapshot.orders[0].snapshot.address.city = 'Changed outside repository'
+    }).toThrow(TypeError)
+    expect(() => {
+      snapshot.audits.push(structuredClone(snapshot.audits[0]))
+    }).toThrow(TypeError)
+
+    expect(repository.getSnapshot()).toBe(snapshot)
+    expect(repository.getSnapshot().orders[0].snapshot.address.city).toBe('Kuala Lumpur')
+    expect(repository.getSnapshot().revision).toBe(revisionBefore)
+    expect(repository.getSnapshot().audits).toEqual(auditsBefore)
+    expect(storage.getItem(STORAGE_KEY)).toBe(storedBefore)
+    expect(storage.writes).toBe(0)
+  })
+
+  it.each([
+    ['edit', (state: DemoState) => {
+      state.audits[0].reason = 'Edited old audit evidence'
+    }],
+    ['delete', (state: DemoState) => {
+      state.audits.shift()
+      state.auditCount = state.audits.length
+      state.auditHeadId = state.audits.at(-1)!.id
+    }],
+    ['reorder', (state: DemoState) => {
+      const first = state.audits[0]
+      state.audits[0] = state.audits[1]
+      state.audits[1] = first
+    }],
+    ['replace', (state: DemoState) => {
+      state.audits[0] = {
+        ...state.audits[0],
+        requestId: 'replacement-request-id',
+      }
+    }],
+    ['recount inconsistently', (state: DemoState) => {
+      state.auditCount += 1
+    }],
+  ] as const)('rejects an audit-history %s atomically before publication', (_label, mutate) => {
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(stateWithTwoAudits()))
+    const repository = new MockRepository(storage)
+    const published = repository.getSnapshot()
+    const storedBefore = storage.getItem(STORAGE_KEY)
+    const listener = vi.fn()
+    repository.subscribe(listener)
+
+    expect(() => repository.update((state) => {
+      state.cart = []
+      mutate(state)
+    })).toThrow(expect.objectContaining({ code: 'AUDIT_HISTORY_MUTATED' }))
+
+    expect(repository.getSnapshot()).toBe(published)
+    expect(repository.getSnapshot().revision).toBe(published.revision)
+    expect(repository.getSnapshot().cart).toEqual(published.cart)
+    expect(storage.getItem(STORAGE_KEY)).toBe(storedBefore)
+    expect(storage.writes).toBe(0)
+    expect(listener).not.toHaveBeenCalled()
   })
 
   it('persists updates and resets to deterministic fixtures', () => {
@@ -183,12 +4050,8 @@ describe('MockRepository recovery and persistence', () => {
     expect(listener).toHaveBeenCalledOnce()
   })
 
-  it.each([
-    ['missing', undefined],
-    ['corrupt', '{not-json'],
-  ])('survives a throwing initial write for %s data and keeps safe fixtures in memory', (_label, seeded) => {
+  it('survives a throwing initial write for missing data and keeps safe fixtures in memory', () => {
     const storage = new FaultStorage()
-    if (seeded) storage.seed(STORAGE_KEY, seeded)
     storage.throwOnWrite = true
     const repository = new MockRepository(storage)
     expect(repository.getSnapshot()).toEqual(createDemoState())
@@ -234,7 +4097,38 @@ describe('MockRepository recovery and persistence', () => {
     expect(listener).toHaveBeenCalledOnce()
   })
 
-  it('keeps failed startup reservation cleanup atomic, visible, and retryable on the same storage', () => {
+  it('restores exact browser bytes when an update write mutates storage and then throws', () => {
+    const storage = new MutateThenFailOnceStorage()
+    const raw = JSON.stringify(createDemoState())
+    storage.seed(STORAGE_KEY, raw)
+    const repository = new MockRepository(storage)
+    const published = repository.getSnapshot()
+    const listener = vi.fn()
+    repository.subscribe(listener)
+    storage.failAfterNextWrite = true
+
+    expect(() => repository.update((state) => {
+      state.sessionUserId = 'usr-demo-customer'
+    })).toThrow(expect.objectContaining({
+      code: 'STORAGE_WRITE_FAILED',
+      message: expect.stringMatching(/previous browser data was restored exactly.+nothing changed/i),
+    }))
+
+    expect(repository.getSnapshot()).toBe(published)
+    expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+    expect(repository.hasWriteAuthority()).toBe(true)
+    expect(listener).not.toHaveBeenCalled()
+
+    repository.update((state) => {
+      state.sessionUserId = 'usr-demo-customer'
+    })
+    expect(repository.getSnapshot()).toMatchObject({
+      revision: published.revision + 1,
+      sessionUserId: 'usr-demo-customer',
+    })
+  })
+
+  it('leaves reservation expiry to the guarded action and keeps a failed action retryable', () => {
     const preparedStorage = new MemoryStorage()
     const prepared = new AppServices(preparedStorage, () => '2026-07-28T03:00:00.000Z')
     prepared.auth.oneClick('customer')
@@ -260,12 +4154,21 @@ describe('MockRepository recovery and persistence', () => {
     expect(services.repository.getSnapshot()).toEqual(stateBefore)
     expect(services.repository.getSnapshot().revision).toBe(stateBefore.revision)
     expect(storage.getItem(STORAGE_KEY)).toBe(storedBefore)
+    expect(storage.writeAttempts).toBe(0)
+    expect(storage.successfulWrites).toBe(0)
+    expect(listener).not.toHaveBeenCalled()
+    expect(services.repository.recoveryNotice).toBeNull()
+    expect(services.repository.getSnapshot().orders.find((order) => order.id === dueOrder.id)?.status)
+      .toBe('pending_payment')
+
+    expect(() => services.orders.expireReservations()).toThrow(
+      expect.objectContaining({ code: 'STORAGE_WRITE_FAILED' }),
+    )
+    expect(services.repository.getSnapshot()).toEqual(stateBefore)
+    expect(storage.getItem(STORAGE_KEY)).toBe(storedBefore)
     expect(storage.writeAttempts).toBe(1)
     expect(storage.successfulWrites).toBe(0)
     expect(listener).not.toHaveBeenCalled()
-    expect(services.repository.recoveryNotice).toMatch(
-      /automatic cleanup was not saved.+nothing changed.+safe to retry or refresh/i,
-    )
 
     const retried = services.orders.expireReservations()
     expect(retried).toMatchObject({ changed: true, count: 1, orderIds: [dueOrder.id] })
@@ -277,12 +4180,14 @@ describe('MockRepository recovery and persistence', () => {
     expect(listener).toHaveBeenCalledOnce()
   })
 
-  it('rethrows invalid clocks and unexpected startup failures', () => {
-    expect(() => new AppServices(new MemoryStorage(), () => 'not-an-iso-time')).toThrow(
+  it('defers invalid clocks and clock failures until a guarded action needs time', () => {
+    const invalidClock = new AppServices(new MemoryStorage(), () => 'not-an-iso-time')
+    expect(() => invalidClock.orders.expireReservations()).toThrow(
       expect.objectContaining({ code: 'INVALID_TIME' }),
     )
     const unexpected = new Error('unexpected clock failure')
-    expect(() => new AppServices(new MemoryStorage(), () => { throw unexpected })).toThrow(unexpected)
+    const throwingClock = new AppServices(new MemoryStorage(), () => { throw unexpected })
+    expect(() => throwingClock.orders.expireReservations()).toThrow(unexpected)
   })
 
   it('rolls back a failed reset write and keeps storage active for a successful retry', () => {
@@ -309,12 +4214,43 @@ describe('MockRepository recovery and persistence', () => {
     expect(listener).not.toHaveBeenCalled()
 
     repository.reset()
-    expect(repository.getSnapshot()).toEqual(createDemoState())
-    expect(JSON.parse(storage.getItem(STORAGE_KEY)!)).toEqual(createDemoState())
+    expect(repository.getSnapshot()).toEqual({
+      ...createDemoState(),
+      revision: before.revision + 1,
+    })
+    expect(JSON.parse(storage.getItem(STORAGE_KEY)!)).toEqual(repository.getSnapshot())
     expect(listener).toHaveBeenCalledOnce()
   })
 
-  it('rolls back serialization failure before touching storage or listeners', () => {
+  it('restores exact browser bytes when a reset write mutates storage and then throws', () => {
+    const storage = new MutateThenFailOnceStorage()
+    const repository = new MockRepository(storage)
+    repository.update((state) => {
+      state.cart[0].quantity = 4
+    })
+    const published = repository.getSnapshot()
+    const raw = storage.getItem(STORAGE_KEY)
+    const listener = vi.fn()
+    repository.subscribe(listener)
+    storage.failAfterNextWrite = true
+
+    expect(() => repository.reset()).toThrow(
+      expect.objectContaining({ code: 'STORAGE_WRITE_FAILED' }),
+    )
+
+    expect(repository.getSnapshot()).toBe(published)
+    expect(storage.getItem(STORAGE_KEY)).toBe(raw)
+    expect(repository.hasWriteAuthority()).toBe(true)
+    expect(listener).not.toHaveBeenCalled()
+
+    repository.reset()
+    expect(repository.getSnapshot()).toMatchObject({
+      revision: published.revision + 1,
+      cart: [{ quantity: 1 }],
+    })
+  })
+
+  it('rolls back cyclic tampering with an old audit before touching storage or listeners', () => {
     const storage = new FaultStorage()
     const repository = new MockRepository(storage)
     const before = repository.exportForTest()
@@ -323,8 +4259,8 @@ describe('MockRepository recovery and persistence', () => {
     repository.subscribe(listener)
 
     expect(() => repository.update((state) => {
-      state.audits[0].after = state
-    })).toThrow(expect.objectContaining({ code: 'STORAGE_WRITE_FAILED' }))
+      state.audits[0].after = state as never
+    })).toThrow(expect.objectContaining({ code: 'AUDIT_HISTORY_MUTATED' }))
 
     expect(repository.getSnapshot()).toEqual(before)
     expect(storage.getItem(STORAGE_KEY)).toBe(storedBefore)
@@ -333,6 +4269,33 @@ describe('MockRepository recovery and persistence', () => {
     repository.update((state) => { state.sessionUserId = 'usr-demo-customer' })
     expect(repository.getSnapshot().revision).toBe(before.revision + 1)
     expect(listener).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    ['non-canonical object keys', (state: DemoState) => {
+      state.audits[0].after = JSON.parse('{"z":1,"a":2}')
+    }],
+    ['dangerous object keys', (state: DemoState) => {
+      state.audits[0].after = JSON.parse('{"__proto__":"unsafe"}')
+    }],
+    ['oversized evidence', (state: DemoState) => {
+      state.audits[0].after = 'x'.repeat(AUDIT_EVIDENCE_MAX_BYTES + 1)
+    }],
+  ] as const)('rejects persisted %s and uses an unsaved memory-only fixture', (_label, tamper) => {
+    const state = createDemoState()
+    tamper(state)
+    expect(() => validateDemoState(state)).toThrow(/audit/i)
+
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(state))
+    const repository = new MockRepository(storage)
+
+    expect(repository.getSnapshot()).toEqual(createDemoState())
+    expect(repository.recoveryNotice).toMatch(
+      /exact original browser bytes.+left unchanged.+memory only.+not saved.+explicit confirmed reset/i,
+    )
+    expect(storage.writes).toBe(0)
+    expect(storage.getItem(STORAGE_KEY)).toBe(JSON.stringify(state))
   })
 
   it('updates and resets normally when storage was intentionally omitted', () => {
@@ -344,7 +4307,10 @@ describe('MockRepository recovery and persistence', () => {
     expect(repository.getSnapshot().cart).toEqual([])
     repository.reset()
 
-    expect(repository.getSnapshot()).toEqual(createDemoState())
+    expect(repository.getSnapshot()).toEqual({
+      ...createDemoState(),
+      revision: 3,
+    })
     expect(listener).toHaveBeenCalledTimes(2)
   })
 
@@ -363,7 +4329,7 @@ describe('MockRepository recovery and persistence', () => {
   it('uses the deterministic tracking convention for shipped fixtures', () => {
     const repository = new MockRepository(new MemoryStorage())
     const shipment = repository.getSnapshot().shipments.find((entry) => entry.id === 'shp-shipped')
-    expect(shipment?.trackingNumber).toBe('DEMO-P-SHIPPED')
+    expect(shipment?.trackingNumber).toBe('DEMO-SHIPPED')
   })
 
   it('keeps seeded paid boxes, timelines, shipments and order fulfilment coherent', () => {
@@ -373,6 +4339,54 @@ describe('MockRepository recovery and persistence', () => {
     expect(state.boxes.find((box) => box.id === 'box-failed-01')?.status).toBe('on_hold')
     expect(state.orders.find((order) => order.id === 'ord-shipped')?.status).toBe('processing')
     expect(state.shipments.every((shipment) => shipment.timeline.at(-1)?.status === shipment.status)).toBe(true)
+  })
+
+  it.each([
+    ['missing audit collection contents', (state: DemoState) => {
+      state.audits = []
+      state.auditCount = 0
+      state.auditHeadId = ''
+    }],
+    ['truncated audit collection', (state: DemoState) => {
+      state.audits.pop()
+    }],
+    ['wrong audit count', (state: DemoState) => {
+      state.auditCount += 1
+    }],
+    ['wrong audit head', (state: DemoState) => {
+      state.auditHeadId = 'audit-not-the-head'
+    }],
+    ['noncontiguous audit sequence', (state: DemoState) => {
+      state.audits[1].sequence += 1
+    }],
+    ['missing audit previous link', (state: DemoState) => {
+      delete state.audits[1].previousId
+    }],
+    ['invalid audit outcome', (state: DemoState) => {
+      state.audits[1].outcome = 'unknown' as never
+    }],
+    ['malformed normalized audit fields', (state: DemoState) => {
+      const audit = state.audits[1]
+      audit.actorId = ' actor '
+      audit.action = ''
+      audit.targetType = '<payment>'
+      audit.targetId = 'target'.repeat(30)
+      audit.reason = ' reason with extra space '
+      audit.requestId = ''
+      audit.eventId = '<event>'
+    }],
+  ] as const)('rejects %s and uses an unsaved memory-only fixture', (_label, mutate) => {
+    const malformed = stateWithTwoAudits()
+    mutate(malformed)
+    expect(() => validateDemoState(malformed)).toThrow()
+
+    const storage = new MemoryStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(malformed))
+    const repository = new MockRepository(storage)
+    expect(repository.recoveryNotice).toMatch(
+      /exact original browser bytes.+left unchanged.+memory only.+not saved.+explicit confirmed reset/i,
+    )
+    expect(repository.getSnapshot()).toEqual(createDemoState())
   })
 
   it('rejects an order timeline whose creation row is not pending payment', () => {
@@ -415,6 +4429,27 @@ describe('MockRepository recovery and persistence', () => {
 
     expect(order.snapshot.quantity).toBe(MAX_CART_QUANTITY)
     expect(() => validateDemoState(services.repository.getSnapshot())).not.toThrow()
+  })
+
+  it('accepts a different positive historical value-floor snapshot', () => {
+    const state = createDemoState()
+    state.orders[0].snapshot.valueFloorSen = 12_500
+
+    expect(() => validateDemoState(state)).not.toThrow()
+  })
+
+  it.each([
+    ['zero', 0],
+    ['negative', -1],
+    ['fractional', 12_500.5],
+    ['unsafe and too large', Number.MAX_SAFE_INTEGER + 1],
+  ] as const)('rejects a %s order value-floor snapshot', (_label, valueFloorSen) => {
+    const state = createDemoState()
+    state.orders[0].snapshot.valueFloorSen = valueFloorSen
+
+    expect(() => validateDemoState(state)).toThrow(
+      /positive bounded safe integer-sen amount/i,
+    )
   })
 
   it.each(['oddsVersion', 'policyVersion'] as const)(
@@ -477,6 +4512,21 @@ describe('MockRepository recovery and persistence', () => {
     order.updatedAt = '2026-07-22T07:00:00.000Z'
 
     expect(() => validateDemoState(state)).toThrow(/status must be partially_fulfilled/i)
+  })
+
+  it('rejects a mixed order falsely closed while every original scope remains incomplete', () => {
+    const state = createDemoState()
+    const order = state.orders.find((entry) => entry.id === 'ord-processing')!
+    order.status = 'closed'
+    order.updatedAt = FIXED_NOW
+    order.timeline.push({
+      id: 'mixed-order-false-close',
+      status: 'closed',
+      label: 'Tampered early mixed-order closure',
+      at: FIXED_NOW,
+    })
+
+    expect(() => validateDemoState(state)).toThrow(/closed/i)
   })
 
   it('rejects an illegal accepted payment event jump', () => {
@@ -551,7 +4601,9 @@ describe('MockRepository recovery and persistence', () => {
       processedAt: payment.updatedAt,
     })
 
-    expect(() => validateDemoState(state)).toThrow(/normal paid order needs one settled captured payment/i)
+    expect(() => validateDemoState(state)).toThrow(
+      /exact immutable payment audit|normal paid order needs one settled captured payment/i,
+    )
   })
 
   it.each([
@@ -605,11 +4657,13 @@ describe('MockRepository recovery and persistence', () => {
       state.claims[0].history[0].note = state.claims[0].note
       return state
     }],
-  ] as const)('recovers historically ineligible claim data: %s', (_label, makeState) => {
+  ] as const)('protects historically ineligible claim data bytes: %s', (_label, makeState) => {
     const storage = new MemoryStorage()
     storage.seed(STORAGE_KEY, JSON.stringify(makeState()))
     const repository = new MockRepository(storage)
-    expect(repository.recoveryNotice).toMatch(/replaced/i)
+    expect(repository.recoveryNotice).toMatch(
+      /exact original browser bytes.+left unchanged.+memory only.+not saved.+explicit confirmed reset/i,
+    )
     expect(repository.getSnapshot()).toEqual(createDemoState())
   })
 
@@ -665,16 +4719,20 @@ describe('MockRepository recovery and persistence', () => {
     expect(() => validateDemoState(services.repository.getSnapshot())).not.toThrow()
   })
 
-  it('accepts a fresh reship when failed-delivery evidence already existed', () => {
+  it('keeps failed original evidence immutable and still accepts its non-delivery claim', () => {
     const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
     services.auth.oneClick('admin')
-    services.fulfilment.advance('shp-failed', 'shipped', 'DEMO reship after failed delivery evidence')
+    expect(() => services.fulfilment.advance(
+      'shp-failed',
+      'shipped',
+      'DEMO forbidden rewrite after failed delivery evidence',
+    )).toThrow(expect.objectContaining({ code: 'INVALID_TRANSITION' }))
     services.auth.oneClick('customer')
     expect(() => services.claims.submit({
       orderId: 'ord-failed',
       kind: 'non_delivery',
       shipmentId: 'shp-failed',
-      note: 'DEMO failed delivery evidence before reship',
+      note: 'DEMO immutable failed delivery evidence',
     })).not.toThrow()
     expect(() => validateDemoState(services.repository.getSnapshot())).not.toThrow()
   })
@@ -695,7 +4753,9 @@ describe('MockRepository recovery and persistence', () => {
     })
     state.boxes.find((entry) => entry.id === 'box-shipped-01')!.status = 'on_hold'
 
-    expect(() => validateDemoState(state)).toThrow(/non-delivery claim requires eligible evidence at claim creation/i)
+    expect(() => validateDemoState(state)).toThrow(
+      /matching applied transition audit|non-delivery claim requires eligible evidence at claim creation/i,
+    )
   })
 
   it('rejects persisted non-delivery claims for a customer return after delivery', () => {
@@ -717,6 +4777,9 @@ describe('MockRepository recovery and persistence', () => {
       note: 'DEMO post-delivery customer return is not non-delivery',
       shipmentId: 'shp-delivered',
       status: 'submitted',
+      remedyState: 'none',
+      remedyBoxIds: ['box-delivered-01'],
+      requiredSettlementSen: 11_200,
       createdAt: FIXED_NOW,
       updatedAt: FIXED_NOW,
       history: [{
@@ -730,6 +4793,29 @@ describe('MockRepository recovery and persistence', () => {
     }
     state.claims.push(claim)
     order.claimIds.push(claim.id)
+    const previousId = state.audits.at(-1)?.id
+    state.auditCount += 1
+    state.auditHeadId = 'audit-clm-post-delivery-return-submitted'
+    state.audits.push({
+      id: state.auditHeadId,
+      sequence: state.auditCount,
+      previousId,
+      outcome: 'applied',
+      actorId: order.userId,
+      actorRole: 'customer',
+      action: 'claim.submitted',
+      targetType: 'claim',
+      targetId: claim.id,
+      reason: claim.note,
+      at: claim.createdAt,
+      requestId: claim.requestId,
+      after: {
+        kind: claim.kind,
+        refundCreated: false,
+        shipmentId: claim.shipmentId!,
+        status: 'submitted',
+      },
+    })
 
     expect(() => validateDemoState(state)).toThrow(
       /non-delivery claim requires eligible evidence at claim creation/i,
@@ -768,6 +4854,162 @@ describe('MockRepository recovery and persistence', () => {
     expect(() => validateDemoState(state)).toThrow()
   })
 
+  it('accepts an older neutral candidate snapshot when overlapping entitlement starts later', () => {
+    let now = '2026-07-28T03:00:00.000Z'
+    const services = new AppServices(new MemoryStorage(), () => now)
+    makeProcessingOrderSingleGroupedPhysicalShipment(services)
+    services.auth.oneClick('admin')
+    for (const status of ['packed', 'label_created', 'shipped', 'failed_delivery'] as const) {
+      services.fulfilment.advance(
+        'shp-processing',
+        status,
+        `Confirmed persisted as-of grouped shipment ${status}`,
+      )
+    }
+    services.auth.oneClick('customer')
+    now = '2026-07-28T04:00:00.000Z'
+    const neutral = services.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'non_delivery',
+      orderLevelDelivery: true,
+      note: 'DEMO neutral snapshot before later overlapping entitlement',
+    }).data
+    now = '2026-07-28T04:30:00.000Z'
+    const holder = services.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'value_floor',
+      boxId: 'box-processing-01',
+      note: 'DEMO later overlapping entitlement holder',
+    }).data
+    services.auth.oneClick('admin')
+    services.claims.review(
+      holder.id,
+      'acknowledge',
+      'Confirmed later holder acknowledgement',
+    )
+    services.claims.review(
+      holder.id,
+      'approve',
+      'Confirmed later holder approval',
+    )
+    now = '2026-07-28T05:00:00.000Z'
+    services.payments.refund(
+      'pay-processing',
+      holder.requiredSettlementSen,
+      'Confirmed later overlapping entitlement refund',
+      'req-later-overlapping-entitlement-refund',
+      holder.id,
+    )
+    const snapshot = services.repository.exportForTest()
+
+    expect(snapshot.claims.find((entry) => entry.id === neutral.id))
+      .toMatchObject({
+        shipmentCandidateIds: ['shp-processing'],
+        shipmentCandidateEvidenceAt: {
+          'shp-processing': '2026-07-28T04:00:00.000Z',
+        },
+      })
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+
+    const consumedBeforeEvidence = structuredClone(snapshot)
+    const moved = consumedBeforeEvidence.claims.find((entry) =>
+      entry.id === neutral.id)!
+    moved.createdAt = '2026-07-28T06:00:00.000Z'
+    moved.updatedAt = '2026-07-28T06:00:00.000Z'
+    moved.shipmentCandidateEvidenceAt = {
+      'shp-processing': '2026-07-28T06:00:00.000Z',
+    }
+    moved.history[0].at = '2026-07-28T06:00:00.000Z'
+    consumedBeforeEvidence.audits.find((audit) =>
+      audit.action === 'claim.submitted' &&
+      audit.targetId === neutral.id)!.at = '2026-07-28T06:00:00.000Z'
+
+    expect(() => validateDemoState(consumedBeforeEvidence)).toThrow(
+      /available eligible original shipment|unconsumed at its evidence time/i,
+    )
+  })
+
+  it('uses audit sequence for equal-instant neutral evidence and widens only after the later transition audit', () => {
+    const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    makeProcessingOrderTwoPhysicalShipments(services)
+    services.auth.oneClick('admin')
+    for (const status of [
+      'packed',
+      'label_created',
+      'shipped',
+      'failed_delivery',
+    ] as const) {
+      services.fulfilment.advance(
+        'shp-processing',
+        status,
+        `Confirmed same-instant first evidence ${status}`,
+      )
+    }
+    services.auth.oneClick('customer')
+    const input = {
+      orderId: 'ord-processing',
+      kind: 'non_delivery' as const,
+      orderLevelDelivery: true,
+      note: 'DEMO same-instant sequenced neutral evidence',
+    }
+    const claim = services.claims.submit(input).data
+    expect(services.repository.getSnapshot().claims.find((entry) =>
+      entry.id === claim.id)?.shipmentCandidateIds).toEqual(['shp-processing'])
+
+    services.auth.oneClick('admin')
+    for (const status of [
+      'picking',
+      'packed',
+      'label_created',
+      'shipped',
+      'failed_delivery',
+    ] as const) {
+      services.fulfilment.advance(
+        'shp-digital',
+        status,
+        `Confirmed same-instant later evidence ${status}`,
+      )
+    }
+    const beforeWidening = services.repository.exportForTest()
+    expect(beforeWidening.claims.find((entry) =>
+      entry.id === claim.id)?.shipmentCandidateIds).toEqual(['shp-processing'])
+    expect(() => validateDemoState(beforeWidening)).not.toThrow()
+
+    services.auth.oneClick('customer')
+    expect(services.claims.submit(input)).toMatchObject({
+      changed: true,
+      data: { id: claim.id },
+    })
+    const widened = services.repository.exportForTest()
+    expect(widened.claims.find((entry) =>
+      entry.id === claim.id)?.shipmentCandidateIds)
+      .toEqual(['shp-digital', 'shp-processing'])
+    expect(availableClaimShipmentIdsAt(
+      widened,
+      claim.orderId,
+      'non_delivery',
+      FIXED_NOW,
+      claim.id,
+    )).toEqual(['shp-digital', 'shp-processing'])
+    expect(() => validateDemoState(widened)).not.toThrow()
+  })
+
+  it('compares equivalent ISO precision numerically while retaining audit sequence', () => {
+    const state = stateWithSealedMultiShipmentClaim()
+    const claim = state.claims[0]
+    const submission = state.audits.find((audit) =>
+      audit.action === 'claim.submitted' &&
+      audit.targetId === claim.id)!
+    submission.at = submission.at.replace('.000Z', 'Z')
+    const transition = state.audits.find((audit) =>
+      audit.action === 'shipment.transitioned' &&
+      audit.targetId === claim.shipmentCandidateIds![0])!
+    transition.at = transition.at.replace('.000Z', 'Z')
+
+    expect(Date.parse(submission.at)).toBe(Date.parse(claim.createdAt))
+    expect(() => validateDemoState(state)).not.toThrow()
+  })
+
   it.each([
     ['blank name', (state: DemoState) => {
       state.series.find((entry) => entry.status === 'draft')!.draftPrizes![0].name = '   '
@@ -778,6 +5020,9 @@ describe('MockRepository recovery and persistence', () => {
     ['blank odds', (state: DemoState) => {
       state.series.find((entry) => entry.status === 'draft')!.draftPrizes![0].odds = ''
     }],
+    ['odds drift from allocation truth', (state: DemoState) => {
+      state.series.find((entry) => entry.status === 'draft')!.draftPrizes![0].odds = '1 in 4'
+    }],
     ['invalid tier', (state: DemoState) => {
       state.series.find((entry) => entry.status === 'draft')!.draftPrizes![0].tier = 'Ultra' as never
     }],
@@ -787,7 +5032,7 @@ describe('MockRepository recovery and persistence', () => {
     ['invalid insurance flag', (state: DemoState) => {
       state.series.find((entry) => entry.status === 'draft')!.draftPrizes![0].insured = 'yes' as never
     }],
-  ] as const)('recovers corrupted persisted draft prize definition: %s', (_label, mutate) => {
+  ] as const)('protects corrupted persisted draft prize bytes: %s', (_label, mutate) => {
     const services = new AppServices(new MemoryStorage(), () => FIXED_NOW)
     services.auth.oneClick('admin')
     services.admin.copyPublishedToDraft()
@@ -798,8 +5043,26 @@ describe('MockRepository recovery and persistence', () => {
 
     const repository = new MockRepository(storage)
 
-    expect(repository.recoveryNotice).toMatch(/replaced/i)
+    expect(repository.recoveryNotice).toMatch(
+      /exact original browser bytes.+left unchanged.+memory only.+not saved.+explicit confirmed reset/i,
+    )
     expect(repository.getSnapshot()).toEqual(createDemoState())
+  })
+
+  it('protects persisted published odds that drift from allocation truth', () => {
+    const malformed = createDemoState()
+    malformed.series[0].publishedPrizes!
+      .find((prize) => prize.id === 'iphone17')!.odds = '1 in 3,333'
+    const storage = new MemoryStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(malformed))
+
+    const repository = new MockRepository(storage)
+
+    expect(repository.recoveryNotice).toMatch(
+      /exact original browser bytes.+left unchanged.+memory only.+not saved.+explicit confirmed reset/i,
+    )
+    expect(repository.getSnapshot().series[0].publishedPrizes!
+      .find((prize) => prize.id === 'iphone17')?.odds).toBe('3 in 10,000')
   })
 
   it.each([
@@ -842,6 +5105,57 @@ describe('MockRepository recovery and persistence', () => {
     expect(() => validateDemoState(state)).toThrow()
   })
 
+  it('pairs two same-time widening audits bijectively with two distinct customer history rows', () => {
+    const fixture = stateWithTwoSameTimeWidenings()
+    const claim = fixture.state.claims.find((entry) =>
+      entry.id === fixture.claimId)!
+    const audits = fixture.state.audits.filter((audit) =>
+      audit.action === 'claim.order_level_evidence_widened' &&
+      audit.targetId === claim.id)
+    const histories = claim.history.filter((entry) =>
+      entry.note === CLAIM_EVIDENCE_WIDENING_NOTE)
+
+    expect(audits).toHaveLength(2)
+    expect(histories).toHaveLength(2)
+    expect(new Set(histories.map((entry) => entry.id)).size).toBe(2)
+    expect(audits.map((audit) => audit.at)).toEqual([
+      '2026-07-28T08:00:00.000Z',
+      '2026-07-28T08:00:00.000Z',
+    ])
+    expect(histories.map((entry) => entry.at)).toEqual([
+      '2026-07-28T08:00:00.000Z',
+      '2026-07-28T08:00:00.000Z',
+    ])
+    expect(() => validateDemoState(fixture.state)).not.toThrow()
+
+    const missing = structuredClone(fixture.state)
+    const missingClaim = missing.claims.find((entry) =>
+      entry.id === fixture.claimId)!
+    const missingIndex = missingClaim.history.findIndex((entry) =>
+      entry.note === CLAIM_EVIDENCE_WIDENING_NOTE)
+    missingClaim.history.splice(missingIndex, 1)
+    expect(() => validateDemoState(missing)).toThrow(/exact pair/i)
+
+    const extra = structuredClone(fixture.state)
+    const extraClaim = extra.claims.find((entry) =>
+      entry.id === fixture.claimId)!
+    const extraHistory = structuredClone(extraClaim.history.find((entry) =>
+      entry.note === CLAIM_EVIDENCE_WIDENING_NOTE)!)
+    extraHistory.id = `${extraHistory.id}-orphan`
+    extraClaim.history.push(extraHistory)
+    expect(() => validateDemoState(extra)).toThrow(/exact pair/i)
+
+    const retimestamped = structuredClone(fixture.state)
+    const retimestampedClaim = retimestamped.claims.find((entry) =>
+      entry.id === fixture.claimId)!
+    retimestampedClaim.history.find((entry) =>
+      entry.note === CLAIM_EVIDENCE_WIDENING_NOTE)!.at =
+        '2026-07-28T07:59:59.999Z'
+    expect(() => validateDemoState(retimestamped)).toThrow(
+      /distinct same-actor, same-time/i,
+    )
+  })
+
   it('rejects mapped evidence widened after a claim was approved', () => {
     const state = stateWithWidenedSealedClaim()
     const claim = state.claims[0]
@@ -849,6 +5163,12 @@ describe('MockRepository recovery and persistence', () => {
       entry.note !== CLAIM_EVIDENCE_WIDENING_NOTE)
     state.audits = state.audits.filter((audit) =>
       audit.action !== 'claim.order_level_evidence_widened')
+    state.audits.forEach((audit, index) => {
+      audit.sequence = index + 1
+      audit.previousId = index === 0 ? undefined : state.audits[index - 1].id
+    })
+    state.auditCount = state.audits.length
+    state.auditHeadId = state.audits.at(-1)!.id
     claim.shipmentCandidateEvidenceAt!['shp-digital'] =
       '2026-07-28T11:00:00.000Z'
     claim.status = 'approved'
@@ -881,6 +5201,9 @@ describe('MockRepository recovery and persistence', () => {
     )
     state.audits.push({
       id: 'audit-approved-evidence-freeze-corrupt',
+      sequence: state.auditCount + 1,
+      previousId: state.auditHeadId,
+      outcome: 'applied',
       actorId: claim.userId,
       actorRole: 'customer',
       action: 'claim.order_level_evidence_widened',
@@ -890,12 +5213,14 @@ describe('MockRepository recovery and persistence', () => {
       at: '2026-07-28T11:00:00.000Z',
       requestId: 'req-approved-evidence-freeze-corrupt',
       before: { shipmentCandidateIds: ['shp-processing'] },
-      after: {
-        shipmentCandidateIds: ['shp-digital', 'shp-processing'],
-        shipmentCandidateEvidenceAt: claim.shipmentCandidateEvidenceAt,
+      after: canonicalizeAuditEvidence({
         refundCreated: false,
-      },
+        shipmentCandidateEvidenceAt: claim.shipmentCandidateEvidenceAt!,
+        shipmentCandidateIds: ['shp-digital', 'shp-processing'],
+      }, 'Test audit after evidence'),
     })
+    state.auditCount += 1
+    state.auditHeadId = 'audit-approved-evidence-freeze-corrupt'
 
     expect(() => validateDemoState(state)).toThrow(/unchanged-status customer history/i)
   })
@@ -928,6 +5253,19 @@ describe('MockRepository recovery and persistence', () => {
     ['missing order snapshot', (state) => { delete (state.orders[0] as Partial<DemoState['orders'][number]>).snapshot }],
     ['missing order totals', (state) => { delete (state.orders[0].snapshot as Partial<DemoState['orders'][number]['snapshot']>).totals }],
     ['missing order address', (state) => { delete (state.orders[0].snapshot as Partial<DemoState['orders'][number]['snapshot']>).address }],
+    ['missing order value-floor snapshot', (state) => {
+      delete (state.orders[0].snapshot as Partial<DemoState['orders'][number]['snapshot']>)
+        .valueFloorSen
+    }],
+    ['zero order value-floor snapshot', (state) => {
+      state.orders[0].snapshot.valueFloorSen = 0
+    }],
+    ['fractional order value-floor snapshot', (state) => {
+      state.orders[0].snapshot.valueFloorSen = VALUE_FLOOR_SEN + 0.5
+    }],
+    ['published prize odds drift', (state) => {
+      state.series[0].publishedPrizes![0].odds = '1 in 4'
+    }],
     ['non-fictional order address', (state) => { state.orders[0].snapshot.address.line1 = '12 Real Street' }],
     ['non-fictional order phone', (state) => { state.orders[0].snapshot.address.phone = '010-123-4567' }],
     ['unnormalized order address', (state) => { state.orders[0].snapshot.address.city = '  Kuala Lumpur  ' }],
@@ -1043,8 +5381,11 @@ describe('MockRepository recovery and persistence', () => {
         userId: order.userId,
         kind: 'damage',
         note: 'DEMO chronology claim',
-        shipmentId: 'shp-delivered',
-        status: 'reviewing',
+      shipmentId: 'shp-delivered',
+      status: 'reviewing',
+      remedyState: 'none',
+        remedyBoxIds: ['box-delivered-01'],
+        requiredSettlementSen: 11_200,
         createdAt: '2026-07-28T01:00:00.000Z',
         updatedAt: '2026-07-28T02:00:00.000Z',
         history: [
@@ -1096,13 +5437,15 @@ describe('MockRepository recovery and persistence', () => {
     }],
   ]
 
-  it.each(malformedCases)('recovers current-schema corruption: %s', (_label, mutate) => {
+  it.each(malformedCases)('protects current-schema corruption bytes: %s', (_label, mutate) => {
     const storage = new MemoryStorage()
     const malformed = createDemoState()
     mutate(malformed)
     storage.seed(STORAGE_KEY, JSON.stringify(malformed))
     const repository = new MockRepository(storage)
-    expect(repository.recoveryNotice).toMatch(/replaced/i)
+    expect(repository.recoveryNotice).toMatch(
+      /exact original browser bytes.+left unchanged.+memory only.+not saved.+explicit confirmed reset/i,
+    )
     expect(repository.getSnapshot()).toEqual(createDemoState())
   })
 
@@ -1123,7 +5466,7 @@ describe('MockRepository recovery and persistence', () => {
       claim.resolutionOutcome = 'refund_recorded'
       claim.resolutionReference = 'evt-ord-refunded-refund'
     }],
-  ] as const)('recovers current-schema claim resolution corruption: %s', (_label, mutate) => {
+  ] as const)('protects current-schema claim resolution corruption bytes: %s', (_label, mutate) => {
     const services = servicesWithClaim('damage')
     const claim = services.repository.getSnapshot().claims[0]
     services.auth.oneClick('admin')
@@ -1132,15 +5475,17 @@ describe('MockRepository recovery and persistence', () => {
     services.claims.review(
       claim.id,
       'resolve',
-      'Confirmed sufficiently descriptive fictional replacement resolution',
-      { outcome: 'replacement_authorized', reference: `DEMO-${claim.id.toUpperCase()}` },
+      'Confirmed sufficiently descriptive fictional no-remedy resolution',
+      { outcome: 'no_remedy', reference: `DEMO-${claim.id.toUpperCase()}` },
     )
     const malformed = services.repository.exportForTest()
     mutate(malformed.claims[0])
     const storage = new MemoryStorage()
     storage.seed(STORAGE_KEY, JSON.stringify(malformed))
     const repository = new MockRepository(storage)
-    expect(repository.recoveryNotice).toMatch(/replaced/i)
+    expect(repository.recoveryNotice).toMatch(
+      /exact original browser bytes.+left unchanged.+memory only.+not saved.+explicit confirmed reset/i,
+    )
     expect(repository.getSnapshot()).toEqual(createDemoState())
   })
 })

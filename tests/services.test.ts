@@ -1,19 +1,68 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { BOX_PRICE_SEN, DEMO_ADMIN_ID, PRIZES, type AdminSection } from '../src/domain/constants'
-import type { Role } from '../src/domain/types'
+import {
+  BOX_PRICE_SEN,
+  DEMO_ADMIN_ID,
+  PRIZES,
+  VALUE_FLOOR_SEN,
+  type AdminSection,
+} from '../src/domain/constants'
+import { AUDIT_EVIDENCE_MAX_BYTES } from '../src/domain/auditEvidence'
+import { exactOddsLabel } from '../src/domain/odds'
+import { sealedCustomerTimeline } from '../src/domain/orderTimeline'
+import { FULL_REFUND_REMEDY_CONFLICT_CODE } from '../src/domain/remedyPolicy'
+import {
+  isActionableInTransitShipment,
+  shipmentDeliveryActionEligibility,
+} from '../src/domain/shipmentPolicy'
+import type { DemoState, Role } from '../src/domain/types'
 import { createDemoState, DEMO_ADDRESS } from '../src/data/fixtures'
-import { STORAGE_KEY } from '../src/data/MockRepository'
+import {
+  type MockRepository,
+  STORAGE_KEY,
+} from '../src/data/MockRepository'
 import { validateDemoState } from '../src/data/StateValidator'
 import { AppServices } from '../src/services/AppServices'
+import { AuditService } from '../src/services/AuditService'
+import { ClaimService } from '../src/services/ClaimService'
 import {
   CountingStorage,
   MemoryStorage,
   FIXED_NOW,
+  incrementingClock,
+  makeProcessingOrderSingleGroupedPhysicalShipment,
   makeProcessingOrderTwoPhysicalShipments,
 } from './helpers'
 
 let checkoutSequence = 0
 const nextCheckoutRequestId = () => `checkout_f${(++checkoutSequence).toString(16).padStart(31, '0')}`
+
+class FailNextWriteStorage extends MemoryStorage {
+  failNextWrite = false
+
+  setItem(key: string, value: string) {
+    if (this.failNextWrite) {
+      this.failNextWrite = false
+      throw new Error('write blocked for atomic service test')
+    }
+    super.setItem(key, value)
+  }
+}
+
+class TransactionTestRepository {
+  updateCalls = 0
+
+  constructor(private state: DemoState) {}
+
+  getSnapshot = () => this.state
+
+  update<T>(mutator: (draft: DemoState) => T) {
+    this.updateCalls += 1
+    const draft = structuredClone(this.state)
+    const result = mutator(draft)
+    this.state = draft
+    return result
+  }
+}
 
 function checkout(services: AppServices, quantity = 1, requestId = nextCheckoutRequestId()) {
   services.auth.oneClick('customer')
@@ -86,7 +135,7 @@ function neutralClaimWideningScenario() {
     orderId: 'ord-processing',
     kind: 'non_delivery',
     orderLevelDelivery: true,
-    note: 'DEMO resubmitted after another delivery became eligible',
+    note: 'DEMO first neutral order-level delivery evidence',
   })
 
   return {
@@ -97,6 +146,299 @@ function neutralClaimWideningScenario() {
     resubmit,
   }
 }
+
+function approveClaim(services: AppServices, claimId: string) {
+  services.auth.oneClick('admin')
+  services.claims.review(
+    claimId,
+    'acknowledge',
+    'Confirmed exact remedy test acknowledgement',
+  )
+  services.claims.review(
+    claimId,
+    'approve',
+    'Confirmed exact remedy test approval',
+  )
+}
+
+function overlappingCrossKindClaims() {
+  const services = new AppServices(new MemoryStorage(), incrementingClock())
+  services.auth.oneClick('customer')
+  const damage = services.claims.submit({
+    orderId: 'ord-delivered',
+    kind: 'damage',
+    shipmentId: 'shp-delivered',
+    note: 'DEMO overlapping delivered physical damage complaint',
+  }).data
+  const valueFloor = services.claims.submit({
+    orderId: 'ord-delivered',
+    kind: 'value_floor',
+    boxId: 'box-delivered-01',
+    note: 'DEMO overlapping revealed value-floor complaint',
+  }).data
+  return { services, damage, valueFloor }
+}
+
+function rmaReferenceKind(kind: 'damage' | 'value_floor') {
+  return kind.replaceAll('_', '-').toUpperCase()
+}
+
+function completeRmaForReplacement(
+  services: AppServices,
+  claimId: string,
+  kind: 'damage' | 'value_floor',
+) {
+  const reference = `DEMO-RMA-${rmaReferenceKind(kind)}-${claimId.toUpperCase()}`
+  services.claims.createRma(
+    claimId,
+    reference,
+    `Confirmed ${kind} replacement RMA creation`,
+  )
+  services.claims.recordRmaReceived(
+    claimId,
+    reference,
+    `Confirmed ${kind} replacement RMA receipt`,
+  )
+  services.claims.recordRmaInspected(
+    claimId,
+    reference,
+    `Confirmed ${kind} replacement RMA inspection`,
+  )
+}
+
+function typedRemedyFinancialHoldScenario(
+  hold: 'cancelled' | 'refunded' | 'disputed',
+  rmaProgress: 'none' | 'created' | 'received',
+) {
+  const setup = new AppServices(new MemoryStorage(), incrementingClock())
+  setup.auth.oneClick('customer')
+  const claim = setup.claims.submit({
+    orderId: 'ord-delivered',
+    kind: 'damage',
+    shipmentId: 'shp-delivered',
+    note: `DEMO ${hold} typed remedy guard evidence`,
+  }).data
+  approveClaim(setup, claim.id)
+  if (rmaProgress !== 'none') {
+    setup.claims.createRma(
+      claim.id,
+      `DEMO-RMA-${hold.toUpperCase()}-HOLD`,
+      `Confirmed ${hold} hold RMA creation evidence`,
+    )
+  }
+  if (rmaProgress === 'received') {
+    setup.claims.recordRmaReceived(
+      claim.id,
+      `DEMO-RMA-${hold.toUpperCase()}-HOLD`,
+      `Confirmed ${hold} hold RMA receipt evidence`,
+    )
+  }
+
+  const state = structuredClone(setup.repository.getSnapshot())
+  state.orders.find((order) => order.id === claim.orderId)!.status = hold
+  const repository = new TransactionTestRepository(state)
+  const claims = new ClaimService(
+    repository as unknown as MockRepository,
+    new AuditService(),
+    () => '2026-07-28T06:00:00.000Z',
+  )
+  return {
+    claim,
+    claims,
+    reference: `DEMO-RMA-${hold.toUpperCase()}-HOLD`,
+    repository,
+  }
+}
+
+function physicalReplacementScenario(
+  status:
+    | 'unfulfilled'
+    | 'picking'
+    | 'packed'
+    | 'label_created'
+    | 'shipped'
+    | 'failed_delivery'
+    | 'lost'
+    | 'returned'
+    | 'cancelled'
+    | 'delivered',
+  storage: MemoryStorage = new MemoryStorage(),
+) {
+  const isolated = new AppServices(storage, () => FIXED_NOW)
+  isolated.auth.oneClick('customer')
+  const claim = isolated.claims.submit({
+    orderId: 'ord-failed',
+    kind: 'non_delivery',
+    shipmentId: 'shp-failed',
+    note: `DEMO physical replacement ${status} fallback evidence`,
+  }).data
+  approveClaim(isolated, claim.id)
+  const replacement = isolated.claims.authorizeReplacement(
+    claim.id,
+    `Confirmed physical replacement ${status} authorization`,
+  ).data
+  const paths = {
+    unfulfilled: [],
+    picking: ['picking'],
+    packed: ['picking', 'packed'],
+    label_created: ['picking', 'packed', 'label_created'],
+    shipped: ['picking', 'packed', 'label_created', 'shipped'],
+    failed_delivery: ['picking', 'packed', 'label_created', 'shipped', 'failed_delivery'],
+    lost: ['picking', 'packed', 'label_created', 'shipped', 'lost'],
+    returned: ['picking', 'packed', 'label_created', 'shipped', 'returned'],
+    cancelled: ['cancelled'],
+    delivered: ['picking', 'packed', 'label_created', 'shipped', 'delivered'],
+  } as const
+  for (const next of paths[status]) {
+    isolated.fulfilment.advance(
+      replacement.id,
+      next,
+      `Confirmed physical replacement ${status} ${next}`,
+    )
+  }
+  return { services: isolated, claim, replacement }
+}
+
+function lateOriginalScenario(
+  status: 'shipped' | 'lost' | 'returned' | 'cancelled' | 'delivered',
+) {
+  const isolated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+  isolated.auth.oneClick('customer')
+  const claim = isolated.claims.submit({
+    orderId: 'ord-shipped',
+    kind: 'non_delivery',
+    shipmentId: 'shp-shipped',
+    note: `DEMO late original with replacement ${status}`,
+  }).data
+  approveClaim(isolated, claim.id)
+  const replacement = isolated.claims.authorizeReplacement(
+    claim.id,
+    `Confirmed late-original replacement ${status} authorization`,
+  ).data
+  const paths = {
+    shipped: ['picking', 'packed', 'label_created', 'shipped'],
+    lost: ['picking', 'packed', 'label_created', 'shipped', 'lost'],
+    returned: ['picking', 'packed', 'label_created', 'shipped', 'returned'],
+    cancelled: ['cancelled'],
+    delivered: ['picking', 'packed', 'label_created', 'shipped', 'delivered'],
+  } as const
+  for (const next of paths[status]) {
+    isolated.fulfilment.advance(
+      replacement.id,
+      next,
+      `Confirmed late-original replacement ${status} ${next}`,
+    )
+  }
+  return { services: isolated, claim, replacement }
+}
+
+function failedDigitalReplacementScenario(
+  storage: MemoryStorage = new MemoryStorage(),
+) {
+  const isolated = new AppServices(storage, () => FIXED_NOW)
+  isolated.auth.oneClick('customer')
+  isolated.openBox('box-processing-02')
+  isolated.auth.oneClick('admin')
+  for (const next of ['issued', 'sent', 'failed'] as const) {
+    isolated.fulfilment.advance(
+      'shp-digital',
+      next,
+      `Confirmed digital fallback original ${next}`,
+    )
+  }
+  isolated.auth.oneClick('customer')
+  const claim = isolated.claims.submit({
+    orderId: 'ord-processing',
+    kind: 'non_delivery',
+    shipmentId: 'shp-digital',
+    note: 'DEMO failed digital replacement refund fallback evidence',
+  }).data
+  approveClaim(isolated, claim.id)
+  const replacement = isolated.claims.authorizeReplacement(
+    claim.id,
+    'Confirmed failed digital replacement authorization',
+  ).data
+  for (const next of ['issued', 'sent', 'failed'] as const) {
+    isolated.fulfilment.advance(
+      replacement.id,
+      next,
+      `Confirmed digital fallback replacement ${next}`,
+    )
+  }
+  return { services: isolated, claim, replacement }
+}
+
+function digitalReissueScenario() {
+  let now = FIXED_NOW
+  const isolated = new AppServices(new MemoryStorage(), () => now)
+  isolated.auth.oneClick('customer')
+  isolated.openBox('box-processing-02')
+  isolated.auth.oneClick('admin')
+  isolated.fulfilment.advance(
+    'shp-digital',
+    'issued',
+    'Confirmed overdue digital original issued',
+  )
+  isolated.fulfilment.advance(
+    'shp-digital',
+    'sent',
+    'Confirmed overdue digital original sent',
+  )
+  now = '2026-08-01T04:00:00.000Z'
+  isolated.auth.oneClick('customer')
+  const claim = isolated.claims.submit({
+    orderId: 'ord-processing',
+    kind: 'non_delivery',
+    shipmentId: 'shp-digital',
+    note: 'DEMO overdue digital original reissue entitlement evidence',
+  }).data
+  approveClaim(isolated, claim.id)
+  const replacement = isolated.claims.authorizeReplacement(
+    claim.id,
+    'Confirmed overdue digital reissue authorization',
+  ).data
+  isolated.fulfilment.advance(
+    replacement.id,
+    'issued',
+    'Confirmed overdue digital reissue issued',
+  )
+  isolated.fulfilment.advance(
+    replacement.id,
+    'sent',
+    'Confirmed overdue digital reissue sent',
+  )
+  now = '2026-08-01T05:00:00.000Z'
+  return { services: isolated, claim, replacement }
+}
+
+const INVALID_AUDIT_EVIDENCE_CASES: Array<[string, () => unknown, string]> = [
+  ['supplied undefined', (): unknown => undefined, 'AUDIT_EVIDENCE_INVALID'],
+  ['bigint', (): unknown => 1n, 'AUDIT_EVIDENCE_INVALID'],
+  ['function', (): unknown => () => 'unsupported', 'AUDIT_EVIDENCE_INVALID'],
+  ['symbol', (): unknown => Symbol('unsupported'), 'AUDIT_EVIDENCE_INVALID'],
+  ['cycle', (): unknown => {
+    const evidence: Record<string, unknown> = {}
+    evidence.self = evidence
+    return evidence
+  }, 'AUDIT_EVIDENCE_INVALID'],
+  ['non-finite number', (): unknown => Number.POSITIVE_INFINITY, 'AUDIT_EVIDENCE_INVALID'],
+  ['sparse array', (): unknown => Array(2), 'AUDIT_EVIDENCE_INVALID'],
+  [
+    'custom class',
+    (): unknown => new (class Evidence { value = 1 })(),
+    'AUDIT_EVIDENCE_INVALID',
+  ],
+  [
+    'dangerous key',
+    (): unknown => JSON.parse('{"constructor":"unsafe"}'),
+    'AUDIT_EVIDENCE_INVALID',
+  ],
+  [
+    'oversized value',
+    (): unknown => 'x'.repeat(AUDIT_EVIDENCE_MAX_BYTES + 1),
+    'AUDIT_EVIDENCE_TOO_LARGE',
+  ],
+]
 
 describe('customer, payment, allocation and admin services', () => {
   let services: AppServices
@@ -112,10 +454,111 @@ describe('customer, payment, allocation and admin services', () => {
       shippingSen: 1200,
       totalSen: 21_200,
     })
+    expect(order.snapshot.valueFloorSen).toBe(VALUE_FLOOR_SEN)
+    expect(createDemoState().orders.every((fixtureOrder) =>
+      fixtureOrder.snapshot.valueFloorSen === VALUE_FLOOR_SEN)).toBe(true)
     expect(order.boxIds).toHaveLength(2)
     expect(services.repository.getSnapshot().series[0].reservedBoxes).toBe(2)
     expect(services.repository.getSnapshot().cart).toHaveLength(0)
   })
+
+  it('persists the checkout value-floor snapshot as integer sen', () => {
+    const storage = new MemoryStorage()
+    const isolated = new AppServices(storage, () => FIXED_NOW)
+    const order = checkout(isolated)
+    const persisted = JSON.parse(storage.getItem(STORAGE_KEY)!) as {
+      orders: Array<{ id: string; snapshot: { valueFloorSen: number } }>
+    }
+
+    expect(persisted.orders.find((entry) => entry.id === order.id)?.snapshot.valueFloorSen)
+      .toBe(VALUE_FLOOR_SEN)
+  })
+
+  it('stores deterministic, cloned, JSON-round-trip-safe audit evidence', () => {
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const isolated = new AppServices(storage, () => FIXED_NOW)
+    const before = {
+      z: 'last',
+      nested: { z: 2, a: 1 },
+      a: 'first',
+    }
+    const after: unknown[] = [-0, null, true, { z: 'last', a: 'first' }]
+
+    isolated.repository.update((state) => {
+      isolated.audit.append(state, {
+        actorId: 'system',
+        actorRole: 'super_admin',
+        action: 'audit.evidence_test',
+        targetType: 'demo_state',
+        targetId: 'evidence-test',
+        reason: 'Confirmed deterministic fictional evidence',
+        at: FIXED_NOW,
+        before,
+        after,
+        requestId: 'audit-evidence-accepted',
+      })
+    })
+
+    const stored = isolated.repository.getSnapshot().audits.at(-1)!
+    before.a = 'changed after append'
+    after[3] = { changed: 'outside stored evidence' }
+
+    expect(Object.keys(stored.before as object)).toEqual(['a', 'nested', 'z'])
+    expect(Object.keys((stored.before as Record<string, unknown>).nested as object)).toEqual([
+      'a',
+      'z',
+    ])
+    expect(stored.before).toEqual({
+      a: 'first',
+      nested: { a: 1, z: 2 },
+      z: 'last',
+    })
+    expect(stored.after).toEqual([0, null, true, { a: 'first', z: 'last' }])
+    expect(JSON.parse(JSON.stringify(stored.before))).toEqual(stored.before)
+    expect(JSON.parse(JSON.stringify(stored.after))).toEqual(stored.after)
+    expect(storage.writes).toBe(1)
+    expect(() => validateDemoState(isolated.repository.getSnapshot())).not.toThrow()
+  })
+
+  it.each(INVALID_AUDIT_EVIDENCE_CASES)(
+    'rejects %s audit evidence with a fully atomic failed write',
+    (
+    _label,
+    evidence,
+    code,
+  ) => {
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const isolated = new AppServices(storage, () => FIXED_NOW)
+    const published = isolated.repository.getSnapshot()
+    const storedBefore = storage.getItem(STORAGE_KEY)
+    const listener = vi.fn()
+    isolated.repository.subscribe(listener)
+
+    expect(() => isolated.repository.update((state) => {
+      state.cart = []
+      isolated.audit.append(state, {
+        actorId: 'system',
+        actorRole: 'super_admin',
+        action: 'audit.evidence_rejected',
+        targetType: 'demo_state',
+        targetId: 'evidence-test',
+        reason: 'Confirmed rejected fictional evidence',
+        at: FIXED_NOW,
+        before: evidence(),
+        requestId: 'audit-evidence-rejected',
+      })
+    })).toThrow(expect.objectContaining({ code }))
+
+    expect(isolated.repository.getSnapshot()).toBe(published)
+    expect(isolated.repository.getSnapshot().revision).toBe(published.revision)
+    expect(isolated.repository.getSnapshot().audits).toEqual(published.audits)
+    expect(storage.getItem(STORAGE_KEY)).toBe(storedBefore)
+    expect(storage.writes).toBe(0)
+    expect(listener).not.toHaveBeenCalled()
+    },
+  )
 
   it('rejects a tampered displayed total before creating anything', () => {
     services.auth.oneClick('customer')
@@ -249,6 +692,225 @@ describe('customer, payment, allocation and admin services', () => {
     expect(listenerCalls).toBe(0)
   })
 
+  it('replays an exact durably ignored admin event without a write, listener, or revision change', () => {
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const isolated = new AppServices(storage, () => FIXED_NOW)
+    isolated.auth.oneClick('admin')
+    const eventId = 'evt-admin-out-of-order-ignored'
+    const before = isolated.repository.getSnapshot()
+    const writesBefore = storage.writes
+
+    const ignored = isolated.payments.processEvent(
+      'pay-unopened',
+      eventId,
+      'failed',
+      'admin_reconcile',
+      'Confirmed fictional out-of-order finance event',
+    )
+    const afterIgnored = isolated.repository.getSnapshot()
+    const event = afterIgnored.payments
+      .find((payment) => payment.id === 'pay-unopened')!
+      .events.find((entry) => entry.id === eventId)
+    const audit = afterIgnored.audits.find((entry) => entry.eventId === eventId)
+
+    expect(ignored).toMatchObject({ changed: false })
+    expect(event).toMatchObject({
+      type: 'failed',
+      source: 'admin_reconcile',
+      ignoredReason: expect.stringMatching(/out-of-order/i),
+      ignoredOutcome: 'out_of_order',
+      ignoredPriorStatus: 'succeeded',
+      ignoredRoute: 'generic',
+      ignoredInputReason: 'Confirmed fictional out-of-order finance event',
+    })
+    expect(audit).toMatchObject({
+      outcome: 'ignored',
+      action: 'payment.event_ignored',
+      targetType: 'payment',
+      targetId: 'pay-unopened',
+      requestId: event?.requestId,
+      eventId,
+      before: { status: 'succeeded' },
+      after: {
+        status: 'succeeded',
+        attemptedStatus: 'failed',
+        ignoredReason: event?.ignoredReason,
+        ignoredOutcome: 'out_of_order',
+        ignoredRoute: 'generic',
+        ignoredInputReason: 'Confirmed fictional out-of-order finance event',
+      },
+    })
+    expect(afterIgnored.auditCount).toBe(before.auditCount + 1)
+    expect(afterIgnored.auditHeadId).toBe(audit?.id)
+    expect(afterIgnored.revision).toBe(before.revision + 1)
+    expect(storage.writes).toBe(writesBefore + 1)
+    expect(() => validateDemoState(afterIgnored)).not.toThrow()
+
+    const writesAfterIgnored = storage.writes
+    const revisionAfterIgnored = afterIgnored.revision
+    const auditsAfterIgnored = structuredClone(afterIgnored.audits)
+    const listener = vi.fn()
+    isolated.repository.subscribe(listener)
+    expect(isolated.payments.processEvent(
+      'pay-unopened',
+      eventId,
+      'failed',
+      'admin_reconcile',
+      'Confirmed fictional out-of-order finance event',
+    )).toEqual(ignored)
+    expect(isolated.repository.getSnapshot()).toBe(afterIgnored)
+    expect(isolated.repository.getSnapshot().revision).toBe(revisionAfterIgnored)
+    expect(isolated.repository.getSnapshot().audits).toEqual(auditsAfterIgnored)
+    expect(storage.writes).toBe(writesAfterIgnored)
+    expect(listener).not.toHaveBeenCalled()
+
+    const expectConflictWithoutChange = (operation: () => unknown) => {
+      listener.mockClear()
+      expect(operation).toThrow(
+        expect.objectContaining({ code: 'IDEMPOTENCY_CONFLICT' }),
+      )
+      expect(isolated.repository.getSnapshot()).toBe(afterIgnored)
+      expect(isolated.repository.getSnapshot().revision).toBe(
+        revisionAfterIgnored,
+      )
+      expect(isolated.repository.getSnapshot().audits).toEqual(
+        auditsAfterIgnored,
+      )
+      expect(storage.writes).toBe(writesAfterIgnored)
+      expect(listener).not.toHaveBeenCalled()
+    }
+
+    expectConflictWithoutChange(() => isolated.payments.processEvent(
+      'pay-unopened',
+      eventId,
+      'failed',
+      'admin_reconcile',
+      'Confirmed changed fictional out-of-order finance event',
+    ))
+    expectConflictWithoutChange(() => isolated.payments.processEvent(
+      'pay-unopened',
+      eventId,
+      'created',
+      'admin_reconcile',
+      'Confirmed fictional out-of-order finance event',
+    ))
+    expectConflictWithoutChange(() => isolated.payments.processEvent(
+      'pay-delivered',
+      eventId,
+      'failed',
+      'admin_reconcile',
+      'Confirmed fictional out-of-order finance event',
+    ))
+    expectConflictWithoutChange(() => isolated.payments.processEvent(
+      'pay-unopened',
+      eventId,
+      'failed',
+      'admin_reconcile',
+      'Confirmed fictional out-of-order finance event',
+      undefined,
+      'dispute',
+    ))
+    isolated.auth.oneClick('customer')
+    const afterRoleChange = isolated.repository.getSnapshot()
+    const writesAfterRoleChange = storage.writes
+    listener.mockClear()
+    expect(() => isolated.payments.processEvent(
+      'pay-unopened',
+      eventId,
+      'failed',
+      'mock_webhook',
+      'Confirmed fictional out-of-order finance event',
+    )).toThrow(expect.objectContaining({ code: 'IDEMPOTENCY_CONFLICT' }))
+    expect(isolated.repository.getSnapshot()).toBe(afterRoleChange)
+    expect(storage.writes).toBe(writesAfterRoleChange)
+    expect(listener).not.toHaveBeenCalled()
+  })
+
+  it('keeps an ignored dispute identity bound to its protected route', () => {
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const isolated = new AppServices(storage, () => FIXED_NOW)
+    isolated.auth.oneClick('admin')
+    const reason = 'Confirmed ignored dispute against a terminal payment'
+    const eventId = 'evt-ignored-dispute-route-bound'
+
+    const first = isolated.payments.dispute('pay-refunded', reason, eventId)
+    const after = isolated.repository.getSnapshot()
+    const writes = storage.writes
+    const listener = vi.fn()
+    isolated.repository.subscribe(listener)
+
+    expect(first).toMatchObject({
+      changed: false,
+      message: 'Out-of-order event was recorded without changing payment status.',
+    })
+    expect(isolated.payments.dispute(
+      'pay-refunded',
+      reason,
+      eventId,
+    )).toEqual(first)
+    expect(isolated.repository.getSnapshot()).toBe(after)
+    expect(storage.writes).toBe(writes)
+    expect(listener).not.toHaveBeenCalled()
+
+    expect(() => isolated.payments.processEvent(
+      'pay-refunded',
+      eventId,
+      'disputed',
+      'admin_reconcile',
+      reason,
+    )).toThrow(expect.objectContaining({ code: 'IDEMPOTENCY_CONFLICT' }))
+    expect(() => isolated.payments.resolveDispute(
+      'pay-refunded',
+      'refund',
+      reason,
+      eventId,
+    )).toThrow(expect.objectContaining({ code: 'IDEMPOTENCY_CONFLICT' }))
+    expect(isolated.repository.getSnapshot()).toBe(after)
+    expect(storage.writes).toBe(writes)
+    expect(listener).not.toHaveBeenCalled()
+  })
+
+  it('replays a generic ignored event from its stored route after a later dispute', () => {
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const isolated = new AppServices(storage, () => FIXED_NOW)
+    isolated.auth.oneClick('admin')
+    const eventId = 'evt-ignored-before-later-dispute'
+    const first = isolated.payments.processEvent(
+      'pay-unopened',
+      eventId,
+      'failed',
+      'admin_reconcile',
+      'x',
+    )
+    isolated.payments.dispute(
+      'pay-unopened',
+      'Confirmed later dispute after ignored event',
+      'evt-later-dispute-after-ignored',
+    )
+    const afterDispute = isolated.repository.getSnapshot()
+    const writes = storage.writes
+    const listener = vi.fn()
+    isolated.repository.subscribe(listener)
+
+    expect(isolated.payments.processEvent(
+      'pay-unopened',
+      eventId,
+      'failed',
+      'admin_reconcile',
+      'x',
+    )).toMatchObject({
+      changed: false,
+      message: first.message,
+      payment: { status: 'disputed' },
+    })
+    expect(isolated.repository.getSnapshot()).toBe(afterDispute)
+    expect(storage.writes).toBe(writes)
+    expect(listener).not.toHaveBeenCalled()
+  })
+
   it('rejects changed event intent, changed source, and cross-payment reuse without writes or listeners', () => {
     const storage = new CountingStorage()
     storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
@@ -319,6 +981,314 @@ describe('customer, payment, allocation and admin services', () => {
     expect(storage.writes).toBe(writesBefore)
     expect(listener).not.toHaveBeenCalled()
     snapshot.mockRestore()
+  })
+
+  it('returns a concurrent exact ignored-event retry as a write-free stored result', () => {
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const isolated = new AppServices(storage, () => FIXED_NOW)
+    isolated.auth.oneClick('admin')
+    const eventId = 'evt-concurrent-ignored-replay'
+    const reason = 'Confirmed concurrent ignored finance event'
+    const first = isolated.payments.processEvent(
+      'pay-unopened',
+      eventId,
+      'failed',
+      'admin_reconcile',
+      reason,
+    )
+    const actual = isolated.repository.getSnapshot()
+    const stale = structuredClone(actual)
+    stale.payments.find((payment) =>
+      payment.id === 'pay-unopened')!.events =
+        stale.payments.find((payment) =>
+          payment.id === 'pay-unopened')!.events.filter((event) =>
+          event.id !== eventId)
+    const snapshot = vi.spyOn(isolated.repository, 'getSnapshot')
+    const listener = vi.fn()
+    isolated.repository.subscribe(listener)
+    const writesBefore = storage.writes
+
+    snapshot.mockReturnValueOnce(stale)
+    expect(isolated.payments.processEvent(
+      'pay-unopened',
+      eventId,
+      'failed',
+      'admin_reconcile',
+      reason,
+    )).toEqual(first)
+    expect(isolated.repository.getSnapshot()).toEqual(actual)
+    expect(storage.writes).toBe(writesBefore)
+    expect(listener).not.toHaveBeenCalled()
+
+    snapshot.mockReturnValueOnce(stale)
+    expect(() => isolated.payments.processEvent(
+      'pay-unopened',
+      eventId,
+      'failed',
+      'admin_reconcile',
+      'Confirmed changed concurrent ignored finance event',
+    )).toThrow(expect.objectContaining({ code: 'IDEMPOTENCY_CONFLICT' }))
+    expect(isolated.repository.getSnapshot()).toEqual(actual)
+    expect(storage.writes).toBe(writesBefore)
+    expect(listener).not.toHaveBeenCalled()
+    snapshot.mockRestore()
+  })
+
+  it('binds protected dispute reasons before duplicate lookup, including concurrent replay', () => {
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const isolated = new AppServices(storage, () => FIXED_NOW)
+    isolated.auth.oneClick('admin')
+    const listener = vi.fn()
+    isolated.repository.subscribe(listener)
+    const disputeReason = 'Confirmed immutable dispute initiation reason'
+    const disputeEventId = 'evt-protected-reason-disputed'
+    const beforeDispute = structuredClone(isolated.repository.getSnapshot())
+
+    isolated.payments.dispute(
+      'pay-unopened',
+      disputeReason,
+      disputeEventId,
+    )
+    let accepted = structuredClone(isolated.repository.getSnapshot())
+    let writesBefore = storage.writes
+    listener.mockClear()
+    expect(isolated.payments.dispute(
+      'pay-unopened',
+      disputeReason,
+      disputeEventId,
+    )).toMatchObject({ changed: false })
+    expect(isolated.repository.getSnapshot()).toEqual(accepted)
+    expect(storage.writes).toBe(writesBefore)
+    expect(listener).not.toHaveBeenCalled()
+    expect(() => isolated.payments.dispute(
+      'pay-unopened',
+      'Confirmed changed dispute initiation reason',
+      disputeEventId,
+    )).toThrow(expect.objectContaining({ code: 'IDEMPOTENCY_CONFLICT' }))
+    expect(() => isolated.payments.dispute(
+      'pay-unopened',
+      '<b>Unsafe dispute initiation reason</b>',
+      disputeEventId,
+    )).toThrow(expect.objectContaining({ code: 'PAYMENT_EVENT_REASON_INVALID' }))
+    expect(() => isolated.payments.dispute(
+      'pay-unopened',
+      'D'.repeat(241),
+      disputeEventId,
+    )).toThrow(expect.objectContaining({ code: 'PAYMENT_EVENT_REASON_INVALID' }))
+    expect(isolated.repository.getSnapshot()).toEqual(accepted)
+    expect(storage.writes).toBe(writesBefore)
+
+    let snapshot = vi.spyOn(isolated.repository, 'getSnapshot')
+    snapshot.mockReturnValueOnce(beforeDispute)
+    expect(isolated.payments.dispute(
+      'pay-unopened',
+      disputeReason,
+      disputeEventId,
+    )).toMatchObject({ changed: false })
+    snapshot.mockRestore()
+    expect(isolated.repository.getSnapshot()).toEqual(accepted)
+    expect(storage.writes).toBe(writesBefore)
+
+    const refundReason = 'Confirmed immutable customer-won refund reason'
+    const refundEventId = 'evt-protected-reason-refunded'
+    const beforeRefund = structuredClone(isolated.repository.getSnapshot())
+    isolated.payments.resolveDispute(
+      'pay-unopened',
+      'refund',
+      refundReason,
+      refundEventId,
+    )
+    accepted = structuredClone(isolated.repository.getSnapshot())
+    writesBefore = storage.writes
+    listener.mockClear()
+    expect(isolated.payments.resolveDispute(
+      'pay-unopened',
+      'refund',
+      refundReason,
+      refundEventId,
+    )).toMatchObject({ changed: false })
+    expect(isolated.repository.getSnapshot()).toEqual(accepted)
+    expect(storage.writes).toBe(writesBefore)
+    expect(listener).not.toHaveBeenCalled()
+    expect(() => isolated.payments.resolveDispute(
+      'pay-unopened',
+      'refund',
+      'Confirmed changed customer-won refund reason',
+      refundEventId,
+    )).toThrow(expect.objectContaining({ code: 'IDEMPOTENCY_CONFLICT' }))
+    expect(() => isolated.payments.resolveDispute(
+      'pay-unopened',
+      'refund',
+      'Unsafe <refund> reason',
+      refundEventId,
+    )).toThrow(expect.objectContaining({ code: 'PAYMENT_EVENT_REASON_INVALID' }))
+    expect(() => isolated.payments.resolveDispute(
+      'pay-unopened',
+      'refund',
+      'R'.repeat(241),
+      refundEventId,
+    )).toThrow(expect.objectContaining({ code: 'PAYMENT_EVENT_REASON_INVALID' }))
+    expect(isolated.repository.getSnapshot()).toEqual(accepted)
+    expect(storage.writes).toBe(writesBefore)
+
+    snapshot = vi.spyOn(isolated.repository, 'getSnapshot')
+    snapshot.mockReturnValueOnce(beforeRefund)
+    expect(isolated.payments.resolveDispute(
+      'pay-unopened',
+      'refund',
+      refundReason,
+      refundEventId,
+    )).toMatchObject({ changed: false })
+    snapshot.mockRestore()
+    expect(isolated.repository.getSnapshot()).toEqual(accepted)
+    expect(storage.writes).toBe(writesBefore)
+  })
+
+  it.each([
+    ['partial', 1000, 'merchant_won'],
+    ['full', 11_200, 'refund'],
+  ] as const)(
+    'rejects a generic %s refund event reused as a dispute-resolution identity without writes or listeners',
+    (_kind, amountSen, outcome) => {
+      const storage = new CountingStorage()
+      storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+      const isolated = new AppServices(storage, () => FIXED_NOW)
+      isolated.auth.oneClick('admin')
+      const reason = `Confirmed generic ${_kind} route-bound refund`
+      const result = isolated.payments.refund(
+        'pay-unopened',
+        amountSen,
+        reason,
+        `req-generic-${_kind}-route-collision`,
+      )
+      const event = result.payment.events.find((entry) =>
+        entry.requestId === `req-generic-${_kind}-route-collision`)!
+      const before = isolated.repository.getSnapshot()
+      const writesBefore = storage.writes
+      const listener = vi.fn()
+      isolated.repository.subscribe(listener)
+
+      expect(() => isolated.payments.resolveDispute(
+        'pay-unopened',
+        outcome,
+        reason,
+        event.id,
+      )).toThrow(expect.objectContaining({ code: 'IDEMPOTENCY_CONFLICT' }))
+      expect(isolated.repository.getSnapshot()).toBe(before)
+      expect(storage.writes).toBe(writesBefore)
+      expect(listener).not.toHaveBeenCalled()
+    },
+  )
+
+  it('rejects a concurrent generic refund event reused by stale dispute resolution', () => {
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const isolated = new AppServices(storage, () => FIXED_NOW)
+    isolated.auth.oneClick('admin')
+    const stale = structuredClone(isolated.repository.getSnapshot())
+    const reason = 'Confirmed concurrent generic route-bound refund'
+    const result = isolated.payments.refund(
+      'pay-unopened',
+      1000,
+      reason,
+      'req-concurrent-generic-route-collision',
+    )
+    const event = result.payment.events.find((entry) =>
+      entry.requestId === 'req-concurrent-generic-route-collision')!
+    const stalePayment = stale.payments.find((entry) =>
+      entry.id === 'pay-unopened')!
+    stalePayment.status = 'disputed'
+    stalePayment.refundedSen = 1000
+    const accepted = isolated.repository.getSnapshot()
+    const writesBefore = storage.writes
+    const listener = vi.fn()
+    isolated.repository.subscribe(listener)
+    const snapshot = vi.spyOn(isolated.repository, 'getSnapshot')
+    snapshot.mockReturnValueOnce(stale)
+
+    expect(() => isolated.payments.resolveDispute(
+      'pay-unopened',
+      'merchant_won',
+      reason,
+      event.id,
+    )).toThrow(expect.objectContaining({ code: 'IDEMPOTENCY_CONFLICT' }))
+    snapshot.mockRestore()
+    expect(isolated.repository.getSnapshot()).toBe(accepted)
+    expect(storage.writes).toBe(writesBefore)
+    expect(listener).not.toHaveBeenCalled()
+  })
+
+  it('rejects customer-won request reuse by the generic refund route, including stale concurrent reuse', () => {
+    const runCustomerWin = (isolated: AppServices, suffix: string) => {
+      isolated.auth.oneClick('admin')
+      isolated.payments.dispute(
+        'pay-unopened',
+        `Confirmed ${suffix} route-bound dispute`,
+        `evt-${suffix}-route-bound-dispute`,
+      )
+      const beforeResolution = structuredClone(
+        isolated.repository.getSnapshot(),
+      )
+      const reason = `Confirmed ${suffix} route-bound customer refund`
+      const result = isolated.payments.resolveDispute(
+        'pay-unopened',
+        'refund',
+        reason,
+        `evt-${suffix}-route-bound-customer-refund`,
+      )
+      const event = result.payment.events.find((entry) =>
+        entry.id === `evt-${suffix}-route-bound-customer-refund`)!
+      return { beforeResolution, event, reason }
+    }
+
+    const directStorage = new CountingStorage()
+    directStorage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const direct = new AppServices(directStorage, () => FIXED_NOW)
+    const directWin = runCustomerWin(direct, 'direct')
+    const directAccepted = direct.repository.getSnapshot()
+    const directWrites = directStorage.writes
+    const directListener = vi.fn()
+    direct.repository.subscribe(directListener)
+
+    expect(() => direct.payments.refund(
+      'pay-unopened',
+      directWin.event.refundIntent!.amountSen,
+      directWin.reason,
+      directWin.event.requestId,
+    )).toThrow(expect.objectContaining({ code: 'IDEMPOTENCY_CONFLICT' }))
+    expect(() => direct.payments.resolveDispute(
+      'pay-unopened',
+      'refund',
+      directWin.reason,
+      'evt-direct-fresh-resolution-after-close',
+    )).toThrow(expect.objectContaining({ code: 'DISPUTE_NOT_ACTIVE' }))
+    expect(direct.repository.getSnapshot()).toBe(directAccepted)
+    expect(directStorage.writes).toBe(directWrites)
+    expect(directListener).not.toHaveBeenCalled()
+
+    const concurrentStorage = new CountingStorage()
+    concurrentStorage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const concurrent = new AppServices(concurrentStorage, () => FIXED_NOW)
+    const concurrentWin = runCustomerWin(concurrent, 'concurrent')
+    const concurrentAccepted = concurrent.repository.getSnapshot()
+    const concurrentWrites = concurrentStorage.writes
+    const concurrentListener = vi.fn()
+    concurrent.repository.subscribe(concurrentListener)
+    const snapshot = vi.spyOn(concurrent.repository, 'getSnapshot')
+    snapshot.mockReturnValueOnce(concurrentWin.beforeResolution)
+
+    expect(() => concurrent.payments.refund(
+      'pay-unopened',
+      concurrentWin.event.refundIntent!.amountSen,
+      concurrentWin.reason,
+      concurrentWin.event.requestId,
+    )).toThrow(expect.objectContaining({ code: 'IDEMPOTENCY_CONFLICT' }))
+    snapshot.mockRestore()
+    expect(concurrent.repository.getSnapshot()).toBe(concurrentAccepted)
+    expect(concurrentStorage.writes).toBe(concurrentWrites)
+    expect(concurrentListener).not.toHaveBeenCalled()
   })
 
   it('rejects concurrent changed-source and cross-payment event reuse without side effects', () => {
@@ -428,6 +1398,40 @@ describe('customer, payment, allocation and admin services', () => {
     services.payments.act(retryAfterCancel.id, 'expire')
     expect(services.repository.getSnapshot().payments.find((entry) => entry.id === retryAfterCancel.id)?.status).toBe('expired')
     expect(services.repository.getSnapshot().orders.find((entry) => entry.id === failureOrder.id)?.status).toBe('pending_payment')
+  })
+
+  it('renews one unpaid reservation repeatedly at the same instant without reusing identities', () => {
+    const repeated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    const order = checkout(
+      repeated,
+      1,
+      'checkout_0000000000000000000000000000abce',
+    )
+    const first = repeated.payments.createAttempt(order.id)
+    repeated.payments.act(first.id, 'cancel')
+    const second = repeated.payments.createAttempt(
+      order.id,
+      'FPX',
+      first.id,
+    )
+    repeated.payments.act(second.id, 'cancel')
+    const third = repeated.payments.createAttempt(
+      order.id,
+      'FPX',
+      second.id,
+    )
+
+    const snapshot = repeated.repository.getSnapshot()
+    const renewAudits = snapshot.audits.filter((audit) =>
+      audit.action === 'order.reservation_renewed' &&
+      audit.targetId === order.id)
+    const timelineIds = snapshot.orders.find((entry) =>
+      entry.id === order.id)!.timeline.map((entry) => entry.id)
+    expect(third.attempt).toBe(3)
+    expect(renewAudits).toHaveLength(2)
+    expect(new Set(renewAudits.map((audit) => audit.requestId)).size).toBe(2)
+    expect(new Set(timelineIds).size).toBe(timelineIds.length)
+    expect(() => validateDemoState(snapshot)).not.toThrow()
   })
 
   it('releases one reservation once across distinct repeated terminal events and late old events', () => {
@@ -584,8 +1588,81 @@ describe('customer, payment, allocation and admin services', () => {
     expect(after.boxes.filter((box) => order.boxIds.includes(box.id))).toEqual(before.boxes.filter((box) => order.boxIds.includes(box.id)))
     expect(after.shipments.filter((shipment) => shipment.orderId === order.id)).toEqual(before.shipments.filter((shipment) => shipment.orderId === order.id))
     expect(after.series[0].inventory).toEqual(before.series[0].inventory)
-    expect(after.audits).toEqual(before.audits)
+    expect(after.audits.slice(0, before.audits.length)).toEqual(before.audits)
+    expect(after.audits).toHaveLength(before.audits.length + 1)
+    expect(after.audits.at(-1)).toMatchObject({
+      action: 'payment.event_ignored',
+      actorId: 'mock-hitpay',
+      actorRole: 'finance',
+      eventId: 'evt-attempt-one-forced-success',
+      outcome: 'ignored',
+      targetId: first.id,
+      after: {
+        attemptedStatus: 'succeeded',
+        ignoredInputReason: 'Processed one idempotent demo payment event',
+        ignoredOutcome: 'other_payment_captured',
+        ignoredReason: expect.stringMatching(/already captured/i),
+        ignoredRelatedPaymentId: second.id,
+        ignoredRoute: 'generic',
+        status: 'failed',
+      },
+    })
     expect(after.payments.filter((payment) => payment.orderId === order.id && payment.events.some((event) => event.type === 'succeeded' && !event.ignoredReason))).toHaveLength(1)
+
+    const listener = vi.fn()
+    services.repository.subscribe(listener)
+    expect(services.payments.processEvent(
+      first.id,
+      'evt-attempt-one-forced-success',
+      'succeeded',
+    )).toEqual(forced)
+    expect(services.repository.getSnapshot()).toBe(after)
+    expect(listener).not.toHaveBeenCalled()
+  })
+
+  it('keeps same-instant active-conflict evidence stable when the related attempt later succeeds', () => {
+    const isolated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    const order = checkout(
+      isolated,
+      1,
+      'checkout_000000000000000000000000000000ab',
+    )
+    const stale = isolated.payments.createAttempt(order.id)
+    isolated.payments.act(stale.id, 'decline')
+    const active = isolated.payments.createAttempt(order.id)
+    const ignoredEventId = 'evt-same-instant-stale-success'
+
+    const ignored = isolated.payments.processEvent(
+      stale.id,
+      ignoredEventId,
+      'succeeded',
+    )
+    const ignoredAudit = isolated.repository.getSnapshot().audits.find((audit) =>
+      audit.eventId === ignoredEventId)!
+    const success = isolated.payments.processEvent(
+      active.id,
+      'evt-same-instant-current-success',
+      'succeeded',
+    )
+    const after = isolated.repository.getSnapshot()
+    const successAudit = after.audits.find((audit) =>
+      audit.eventId === 'evt-same-instant-current-success')!
+
+    expect(ignored).toMatchObject({
+      changed: false,
+      message: 'Conflicting success event was recorded and ignored safely.',
+    })
+    expect(success.changed).toBe(true)
+    expect(after.payments.find((payment) =>
+      payment.id === active.id)?.status).toBe('succeeded')
+    expect(after.payments.find((payment) =>
+      payment.id === stale.id)?.events.find((event) =>
+      event.id === ignoredEventId)).toMatchObject({
+      ignoredOutcome: 'other_payment_active',
+      ignoredRelatedPaymentId: active.id,
+    })
+    expect(ignoredAudit.sequence).toBeLessThan(successAudit.sequence)
+    expect(() => validateDemoState(after)).not.toThrow()
   })
 
   it('opens exactly once and refresh-equivalent reads return the immutable reveal', () => {
@@ -643,7 +1720,7 @@ describe('customer, payment, allocation and admin services', () => {
       orderId: 'ord-shipped',
       kind: 'non_delivery',
       shipmentId: 'shp-shipped',
-      note: 'DEMO second note returns the open claim',
+      note: 'DEMO first idempotent claim record',
     })
     expect(duplicateClaim).toMatchObject({ changed: false, data: { id: claim.data.id } })
     expect(guarded.repository.getSnapshot()).toEqual(beforeClaim)
@@ -713,6 +1790,192 @@ describe('customer, payment, allocation and admin services', () => {
     expect(listener).not.toHaveBeenCalled()
   })
 
+  it('returns a concurrent exact refund replay as an audited no-op', () => {
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const isolated = new AppServices(storage, () => FIXED_NOW)
+    isolated.auth.oneClick('admin')
+    const stale = structuredClone(isolated.repository.getSnapshot())
+    isolated.payments.refund(
+      'pay-unopened',
+      1000,
+      'Confirmed concurrent exact refund replay',
+      'req-concurrent-exact-refund',
+    )
+    const accepted = structuredClone(isolated.repository.getSnapshot())
+    const writesBefore = storage.writes
+    const listener = vi.fn()
+    isolated.repository.subscribe(listener)
+    const snapshot = vi.spyOn(isolated.repository, 'getSnapshot')
+    snapshot.mockReturnValueOnce(stale)
+
+    expect(isolated.payments.refund(
+      'pay-unopened',
+      1000,
+      'Confirmed concurrent exact refund replay',
+      'req-concurrent-exact-refund',
+    )).toMatchObject({
+      changed: false,
+      payment: { id: 'pay-unopened', refundedSen: 1000 },
+    })
+    snapshot.mockRestore()
+    expect(isolated.repository.getSnapshot()).toEqual(accepted)
+    expect(storage.writes).toBe(writesBefore)
+    expect(listener).not.toHaveBeenCalled()
+  })
+
+  it('checks exact claim replay before remedy availability for exact, value-floor, and sole neutral evidence', () => {
+    const assertReplayNoOp = (
+      isolated: AppServices,
+      storage: CountingStorage,
+      input: Parameters<AppServices['claims']['submit']>[0],
+      expected: ReturnType<AppServices['claims']['listMine']>[number],
+    ) => {
+      const listener = vi.fn()
+      isolated.repository.subscribe(listener)
+      const before = structuredClone(isolated.repository.getSnapshot())
+      const writesBefore = storage.writes
+
+      expect(isolated.claims.submit(input)).toEqual({
+        changed: false,
+        data: expected,
+        message: 'Exact claim replay returned the original result.',
+      })
+      expect(isolated.repository.getSnapshot()).toEqual(before)
+      expect(storage.writes).toBe(writesBefore)
+      expect(listener).not.toHaveBeenCalled()
+    }
+
+    const exactStorage = new CountingStorage()
+    exactStorage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const exact = new AppServices(exactStorage, () => FIXED_NOW)
+    exact.auth.oneClick('customer')
+    const exactInput = {
+      orderId: 'ord-failed',
+      kind: 'non_delivery' as const,
+      shipmentId: 'shp-failed',
+      note: 'DEMO exact replay after replacement starts',
+    }
+    const exactClaim = exact.claims.submit(exactInput).data
+    approveClaim(exact, exactClaim.id)
+    exact.claims.authorizeReplacement(
+      exactClaim.id,
+      'Confirmed exact replay replacement authorization',
+    )
+    exact.auth.oneClick('customer')
+    expect(exact.claims.eligibleLinks('ord-failed', 'non_delivery').shipments
+      .map((shipment) => shipment.id)).toContain('shp-failed')
+    const exactExpected = exact.claims.listMine().find((claim) =>
+      claim.id === exactClaim.id)!
+    assertReplayNoOp(exact, exactStorage, exactInput, exactExpected)
+
+    const valueStorage = new CountingStorage()
+    valueStorage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const value = new AppServices(valueStorage, () => FIXED_NOW)
+    value.auth.oneClick('customer')
+    const valueInput = {
+      orderId: 'ord-processing',
+      kind: 'value_floor' as const,
+      boxId: 'box-processing-01',
+      note: 'DEMO value-floor replay after exact refund resolution',
+    }
+    const valueClaim = value.claims.submit(valueInput).data
+    approveClaim(value, valueClaim.id)
+    value.payments.refund(
+      'pay-processing',
+      valueClaim.requiredSettlementSen,
+      'Confirmed value-floor replay linked refund',
+      'req-value-replay-linked-refund',
+      valueClaim.id,
+    )
+    const linkedEventId = value.repository.getSnapshot().claims.find((claim) =>
+      claim.id === valueClaim.id)!.linkedRefundEventId!
+    value.claims.review(
+      valueClaim.id,
+      'resolve',
+      'Confirmed value-floor replay final refund audit',
+      { outcome: 'refund_recorded', reference: linkedEventId },
+    )
+    value.auth.oneClick('customer')
+    expect(value.claims.eligibleLinks('ord-processing', 'value_floor').boxes
+      .map((box) => box.id)).toContain('box-processing-01')
+    const valueExpected = value.claims.listMine().find((claim) =>
+      claim.id === valueClaim.id)!
+    assertReplayNoOp(value, valueStorage, valueInput, valueExpected)
+
+    const neutralStorage = new CountingStorage()
+    neutralStorage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const neutral = new AppServices(neutralStorage, () => FIXED_NOW)
+    neutral.repository.update((state) => {
+      state.boxes.find((box) => box.id === 'box-shipped-01')!.revealedAt = undefined
+    })
+    neutral.auth.oneClick('customer')
+    const neutralInput = {
+      orderId: 'ord-shipped',
+      kind: 'non_delivery' as const,
+      orderLevelDelivery: true,
+      note: 'DEMO sole neutral replay after final no-remedy audit',
+    }
+    const neutralClaim = neutral.claims.submit(neutralInput).data
+    approveClaim(neutral, neutralClaim.id)
+    neutral.claims.review(
+      neutralClaim.id,
+      'resolve',
+      'Confirmed sole neutral replay no-remedy resolution',
+      { outcome: 'no_remedy', reference: 'DEMO-NEUTRAL-REPLAY-NONE' },
+    )
+    neutral.auth.oneClick('customer')
+    expect(neutral.claims.eligibleLinks('ord-shipped', 'non_delivery')
+      .orderLevelEligible).toBe(true)
+    const neutralExpected = neutral.claims.listMine().find((claim) =>
+      claim.id === neutralClaim.id)!
+    assertReplayNoOp(neutral, neutralStorage, neutralInput, neutralExpected)
+  })
+
+  it('rejects a changed neutral replay note before widening and leaves the repository untouched', () => {
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const isolated = new AppServices(storage, () => FIXED_NOW)
+    isolated.repository.update((state) => {
+      state.boxes.find((box) => box.id === 'box-shipped-01')!.revealedAt = undefined
+    })
+    isolated.auth.oneClick('customer')
+    const claim = isolated.claims.submit({
+      orderId: 'ord-shipped',
+      kind: 'non_delivery',
+      orderLevelDelivery: true,
+      note: 'DEMO original neutral replay note',
+    }).data
+    const before = structuredClone(isolated.repository.getSnapshot())
+    const writesBefore = storage.writes
+
+    expect(() => isolated.claims.submit({
+      orderId: 'ord-shipped',
+      kind: 'non_delivery',
+      orderLevelDelivery: true,
+      note: 'DEMO changed neutral replay note',
+    })).toThrow(expect.objectContaining({ code: 'IDEMPOTENCY_CONFLICT' }))
+    expect(isolated.repository.getSnapshot()).toEqual(before)
+    expect(storage.writes).toBe(writesBefore)
+
+    approveClaim(isolated, claim.id)
+    isolated.claims.authorizeReplacement(
+      claim.id,
+      'Confirmed neutral changed-note replacement authorization',
+    )
+    isolated.auth.oneClick('customer')
+    const afterRemedy = structuredClone(isolated.repository.getSnapshot())
+    const writesAfterRemedy = storage.writes
+    expect(() => isolated.claims.submit({
+      orderId: 'ord-shipped',
+      kind: 'non_delivery',
+      orderLevelDelivery: true,
+      note: 'DEMO changed neutral replay after remedy starts',
+    })).toThrow(expect.objectContaining({ code: 'IDEMPOTENCY_CONFLICT' }))
+    expect(isolated.repository.getSnapshot()).toEqual(afterRemedy)
+    expect(storage.writes).toBe(writesAfterRemedy)
+  })
+
   it('keeps reveal exactly-once and shipment state intact when one box opens before delivery and one after', () => {
     const order = checkout(services, 2)
     const payment = services.payments.createAttempt(order.id)
@@ -764,36 +2027,699 @@ describe('customer, payment, allocation and admin services', () => {
     }
   })
 
-  it('keeps repeated legal shipment cycles collision-proof with a fixed clock', () => {
+  it('blocks failed-original redelivery cycles without rewriting immutable evidence', () => {
     services.auth.oneClick('admin')
     services.fulfilment.advance('shp-shipped', 'failed_delivery', 'Confirmed first fixed-clock delivery exception')
-    services.fulfilment.advance('shp-shipped', 'shipped', 'Confirmed fixed-clock delivery retry')
-    services.fulfilment.advance('shp-shipped', 'failed_delivery', 'Confirmed repeated fixed-clock delivery exception')
+    const beforeBlockedRetry = structuredClone(services.repository.getSnapshot())
+    expect(() => services.fulfilment.advance(
+      'shp-shipped',
+      'shipped',
+      'Confirmed forbidden fixed-clock original retry',
+    )).toThrow(expect.objectContaining({ code: 'INVALID_TRANSITION' }))
 
     const snapshot = services.repository.getSnapshot()
     const shipment = snapshot.shipments.find((entry) => entry.id === 'shp-shipped')!
     const order = snapshot.orders.find((entry) => entry.id === shipment.orderId)!
-    expect(shipment.timeline.slice(-3).map((entry) => entry.status)).toEqual(['failed_delivery', 'shipped', 'failed_delivery'])
+    expect(snapshot).toEqual(beforeBlockedRetry)
+    expect(shipment.timeline.at(-1)?.status).toBe('failed_delivery')
     expect(new Set(shipment.timeline.map((entry) => entry.id)).size).toBe(shipment.timeline.length)
     expect(new Set(order.timeline.map((entry) => entry.id)).size).toBe(order.timeline.length)
-    expect(snapshot.nextSequence).toBe(1003)
     expect(() => validateDemoState(snapshot)).not.toThrow()
   })
 
-  it('accepts failed_delivery to shipped to delivered and derives fulfilment exactly', () => {
+  it('delivers a separately linked replacement without changing the failed original', () => {
+    services.auth.oneClick('customer')
+    const claim = services.claims.submit({
+      orderId: 'ord-failed',
+      kind: 'non_delivery',
+      shipmentId: 'shp-failed',
+      note: 'DEMO failed original needs a separate replacement',
+    }).data
     services.auth.oneClick('admin')
-    services.fulfilment.advance('shp-failed', 'shipped', 'Confirmed redelivery after failed delivery')
-    services.fulfilment.advance('shp-failed', 'delivered', 'Confirmed successful redelivery completion')
+    services.claims.review(claim.id, 'acknowledge', 'Confirmed replacement review acknowledgement')
+    services.claims.review(claim.id, 'approve', 'Confirmed replacement review approval')
+    expect(() => services.claims.createRma(
+      claim.id,
+      'DEMO-RMA-NOT-DELIVERED',
+      'Attempted RMA for an undelivered original',
+    )).toThrow(expect.objectContaining({ code: 'RMA_PHYSICAL_DELIVERY_REQUIRED' }))
+    const replacement = services.claims.authorizeReplacement(
+      claim.id,
+      'Confirmed exact-scope replacement authorization',
+    ).data
+    for (const status of ['picking', 'packed', 'label_created', 'shipped', 'delivered'] as const) {
+      services.fulfilment.advance(
+        replacement.id,
+        status,
+        `Confirmed replacement ${status} evidence`,
+      )
+    }
 
     const snapshot = services.repository.getSnapshot()
-    expect(snapshot.shipments.find((entry) => entry.id === 'shp-failed')?.timeline.slice(-3).map((entry) => entry.status)).toEqual([
-      'failed_delivery',
-      'shipped',
-      'delivered',
-    ])
+    expect(snapshot.shipments.find((entry) => entry.id === 'shp-failed')?.status).toBe('failed_delivery')
+    expect(snapshot.shipments.find((entry) => entry.id === replacement.id)).toMatchObject({
+      purpose: 'replacement',
+      sourceClaimId: claim.id,
+      replacementForShipmentId: 'shp-failed',
+      status: 'delivered',
+    })
+    expect(snapshot.claims.find((entry) => entry.id === claim.id)).toMatchObject({
+      status: 'resolved',
+      remedyState: 'replacement_delivered',
+      replacementShipmentId: replacement.id,
+      resolutionReference: replacement.id,
+    })
     expect(snapshot.orders.find((entry) => entry.id === 'ord-failed')?.status).toBe('fulfilled')
-    expect(snapshot.boxes.find((entry) => entry.id === 'box-failed-01')?.status).toBe('fulfilled')
+    expect(snapshot.boxes.find((entry) => entry.id === 'box-failed-01')).toMatchObject({
+      status: 'fulfilled',
+      shipmentId: 'shp-failed',
+    })
     expect(() => validateDemoState(snapshot)).not.toThrow()
+  })
+
+  it('preserves a replacement through a dispute stop and resumes it before delivery', () => {
+    const isolated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    isolated.auth.oneClick('customer')
+    const claim = isolated.claims.submit({
+      orderId: 'ord-failed',
+      kind: 'non_delivery',
+      shipmentId: 'shp-failed',
+      note: 'DEMO disputed replacement keeps immutable original evidence',
+    }).data
+    isolated.auth.oneClick('admin')
+    isolated.claims.review(claim.id, 'acknowledge', 'Confirmed disputed replacement acknowledgement')
+    isolated.claims.review(claim.id, 'approve', 'Confirmed disputed replacement approval')
+    const replacement = isolated.claims.authorizeReplacement(
+      claim.id,
+      'Confirmed disputed replacement authorization',
+    ).data
+
+    isolated.payments.dispute(
+      'pay-failed',
+      'Confirmed replacement financial dispute stop',
+      'evt-replacement-dispute-stop',
+    )
+    expect(isolated.repository.getSnapshot().shipments
+      .find((entry) => entry.id === replacement.id)?.status).toBe('cancelled')
+    expect(isolated.repository.getSnapshot().orders
+      .find((entry) => entry.id === 'ord-failed')?.status).toBe('disputed')
+
+    isolated.payments.resolveDispute(
+      'pay-failed',
+      'merchant_won',
+      'Confirmed replacement financial dispute resume',
+      'evt-replacement-dispute-resume',
+    )
+    expect(isolated.repository.getSnapshot().shipments
+      .find((entry) => entry.id === replacement.id)?.status).toBe('unfulfilled')
+    for (const status of ['picking', 'packed', 'label_created', 'shipped', 'delivered'] as const) {
+      isolated.fulfilment.advance(
+        replacement.id,
+        status,
+        `Confirmed resumed replacement ${status}`,
+      )
+    }
+    const snapshot = isolated.repository.getSnapshot()
+    expect(snapshot.shipments.find((entry) => entry.id === 'shp-failed')?.status)
+      .toBe('failed_delivery')
+    expect(snapshot.claims.find((entry) => entry.id === claim.id)).toMatchObject({
+      status: 'resolved',
+      remedyState: 'replacement_delivered',
+    })
+    expect(snapshot.orders.find((entry) => entry.id === 'ord-failed')?.status)
+      .toBe('fulfilled')
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+  })
+
+  it('keeps a shipped replacement and its claim immutable during a dispute hold, then delivers after merchant win', () => {
+    const { services: isolated, claim, replacement } =
+      physicalReplacementScenario('shipped')
+
+    isolated.payments.dispute(
+      'pay-failed',
+      'Confirmed dispute after the authorized replacement shipped',
+      'evt-shipped-replacement-dispute-stop',
+    )
+    const beforeBlockedDelivery = structuredClone(
+      isolated.repository.getSnapshot(),
+    )
+    expect(beforeBlockedDelivery.shipments
+      .find((entry) => entry.id === replacement.id)?.status).toBe('shipped')
+    expect(beforeBlockedDelivery.claims
+      .find((entry) => entry.id === claim.id)).toMatchObject({
+        status: 'approved',
+        remedyState: 'replacement_authorized',
+      })
+
+    expect(() => isolated.fulfilment.advance(
+      replacement.id,
+      'delivered',
+      'Attempted replacement delivery during the dispute hold',
+    )).toThrow(expect.objectContaining({ code: 'FINANCIAL_HOLD' }))
+
+    const afterBlockedDelivery = isolated.repository.getSnapshot()
+    const heldOrder = beforeBlockedDelivery.orders
+      .find((entry) => entry.id === claim.orderId)!
+    const heldPayment = beforeBlockedDelivery.payments
+      .find((entry) => entry.id === 'pay-failed')!
+    expect(afterBlockedDelivery.shipments
+      .find((entry) => entry.id === replacement.id)).toEqual(
+      beforeBlockedDelivery.shipments.find((entry) => entry.id === replacement.id),
+    )
+    expect(afterBlockedDelivery.claims
+      .find((entry) => entry.id === claim.id)).toEqual(
+      beforeBlockedDelivery.claims.find((entry) => entry.id === claim.id),
+    )
+    expect(afterBlockedDelivery.orders
+      .find((entry) => entry.id === heldOrder.id)).toEqual(heldOrder)
+    expect(afterBlockedDelivery.payments
+      .find((entry) => entry.id === heldPayment.id)).toEqual(heldPayment)
+    expect(afterBlockedDelivery.boxes
+      .filter((entry) => heldOrder.boxIds.includes(entry.id))).toEqual(
+      beforeBlockedDelivery.boxes
+        .filter((entry) => heldOrder.boxIds.includes(entry.id)),
+    )
+    expect(afterBlockedDelivery.audits).toEqual(beforeBlockedDelivery.audits)
+    expect(afterBlockedDelivery).toEqual(beforeBlockedDelivery)
+
+    isolated.payments.resolveDispute(
+      heldPayment.id,
+      'merchant_won',
+      'Confirmed merchant win clearing the replacement delivery hold',
+      'evt-shipped-replacement-dispute-resume',
+    )
+    isolated.fulfilment.advance(
+      replacement.id,
+      'delivered',
+      'Confirmed replacement delivery after the hold cleared',
+    )
+
+    const completed = isolated.repository.getSnapshot()
+    expect(completed.shipments
+      .find((entry) => entry.id === replacement.id)?.status).toBe('delivered')
+    expect(completed.claims.find((entry) => entry.id === claim.id)).toMatchObject({
+      status: 'resolved',
+      remedyState: 'replacement_delivered',
+      replacementShipmentId: replacement.id,
+      resolutionReference: replacement.id,
+    })
+    expect(completed.orders
+      .find((entry) => entry.id === claim.orderId)?.status).toBe('fulfilled')
+    expect(completed.payments
+      .find((entry) => entry.id === heldPayment.id)?.status).toBe('succeeded')
+    expect(() => validateDemoState(completed)).not.toThrow()
+  })
+
+  it.each(['cancelled', 'refunded', 'disputed'] as const)(
+    'rejects every new typed remedy mutation on a %s claim order without changing one byte',
+    (hold) => {
+      const attempts = [
+        {
+          progress: 'none' as const,
+          run: (
+            scenario: ReturnType<typeof typedRemedyFinancialHoldScenario>,
+          ) => scenario.claims.createRma(
+            scenario.claim.id,
+            scenario.reference,
+            `Attempted ${hold} hold RMA creation evidence`,
+          ),
+        },
+        {
+          progress: 'created' as const,
+          run: (
+            scenario: ReturnType<typeof typedRemedyFinancialHoldScenario>,
+          ) => scenario.claims.recordRmaReceived(
+            scenario.claim.id,
+            scenario.reference,
+            `Attempted ${hold} hold RMA receipt evidence`,
+          ),
+        },
+        {
+          progress: 'received' as const,
+          run: (
+            scenario: ReturnType<typeof typedRemedyFinancialHoldScenario>,
+          ) => scenario.claims.recordRmaInspected(
+            scenario.claim.id,
+            scenario.reference,
+            `Attempted ${hold} hold RMA inspection evidence`,
+          ),
+        },
+        {
+          progress: 'none' as const,
+          run: (
+            scenario: ReturnType<typeof typedRemedyFinancialHoldScenario>,
+          ) => scenario.claims.authorizeReplacement(
+            scenario.claim.id,
+            `Attempted ${hold} hold replacement authorization`,
+          ),
+        },
+      ]
+
+      for (const attempt of attempts) {
+        const scenario = typedRemedyFinancialHoldScenario(
+          hold,
+          attempt.progress,
+        )
+        const before = JSON.stringify(scenario.repository.getSnapshot())
+
+        expect(() => attempt.run(scenario)).toThrow(
+          expect.objectContaining({ code: 'CLAIM_ORDER_FINANCIAL_HOLD' }),
+        )
+        expect(JSON.stringify(scenario.repository.getSnapshot())).toBe(before)
+        expect(scenario.repository.updateCalls).toBe(1)
+      }
+    },
+  )
+
+  it('records ordered RMA evidence with role guards, exact replay, and inspected completion', () => {
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    let rmaNow = FIXED_NOW
+    const isolated = new AppServices(storage, () => rmaNow)
+    isolated.auth.oneClick('customer')
+    const claim = isolated.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'damage',
+      shipmentId: 'shp-delivered',
+      note: 'DEMO damaged physical delivery needs an RMA inspection',
+    }).data
+    isolated.auth.oneClick('admin')
+    isolated.claims.review(claim.id, 'acknowledge', 'Confirmed RMA review acknowledgement')
+    isolated.claims.review(claim.id, 'approve', 'Confirmed RMA review approval')
+    rmaNow = '2026-07-28T05:00:00.000Z'
+    isolated.fulfilment.advance(
+      'shp-delivered',
+      'returned',
+      'Confirmed customer return after delivered damage evidence',
+    )
+
+    isolated.repository.update((state) => { state.sessionUserId = 'usr-fulfilment' })
+    const beforeForbidden = structuredClone(isolated.repository.getSnapshot())
+    expect(() => isolated.claims.createRma(
+      claim.id,
+      'DEMO-RMA-ORDERED-01',
+      'Confirmed ordered RMA creation evidence',
+    )).toThrow(expect.objectContaining({ code: 'FORBIDDEN' }))
+    expect(isolated.repository.getSnapshot()).toEqual(beforeForbidden)
+
+    isolated.repository.update((state) => { state.sessionUserId = 'usr-support' })
+    const created = isolated.claims.createRma(
+      claim.id,
+      'DEMO-RMA-ORDERED-01',
+      'Confirmed ordered RMA creation evidence',
+    )
+    expect(created).toMatchObject({
+      changed: true,
+      data: { status: 'approved', remedyState: 'rma_created' },
+    })
+    const writesBeforeReplay = storage.writes
+    expect(isolated.claims.createRma(
+      claim.id,
+      'DEMO-RMA-ORDERED-01',
+      'Confirmed ordered RMA creation evidence',
+    ).changed).toBe(false)
+    expect(storage.writes).toBe(writesBeforeReplay)
+    expect(() => isolated.claims.createRma(
+      claim.id,
+      'DEMO-RMA-ORDERED-01',
+      'Conflicting RMA creation evidence',
+    )).toThrow(expect.objectContaining({ code: 'IDEMPOTENCY_CONFLICT' }))
+    expect(() => isolated.claims.recordRmaInspected(
+      claim.id,
+      'DEMO-RMA-ORDERED-01',
+      'Attempted inspection before receipt evidence',
+    )).toThrow(expect.objectContaining({ code: 'RMA_ORDER_INVALID' }))
+    expect(() => isolated.claims.review(
+      claim.id,
+      'resolve',
+      'Attempted premature RMA no-remedy completion',
+      { outcome: 'no_remedy', reference: 'DEMO-NO-PREMATURE-RMA' },
+    )).toThrow(expect.objectContaining({ code: 'REMEDY_INCOMPLETE' }))
+
+    expect(isolated.claims.recordRmaReceived(
+      claim.id,
+      'DEMO-RMA-ORDERED-01',
+      'Confirmed ordered RMA receipt evidence',
+    )).toMatchObject({
+      changed: true,
+      data: { status: 'approved', remedyState: 'rma_received' },
+    })
+    expect(isolated.claims.recordRmaReceived(
+      claim.id,
+      'DEMO-RMA-ORDERED-01',
+      'Confirmed ordered RMA receipt evidence',
+    ).changed).toBe(false)
+    expect(isolated.claims.recordRmaInspected(
+      claim.id,
+      'DEMO-RMA-ORDERED-01',
+      'Confirmed ordered RMA inspection evidence',
+    )).toMatchObject({
+      changed: true,
+      data: { status: 'approved', remedyState: 'rma_inspected' },
+    })
+    expect(isolated.claims.recordRmaInspected(
+      claim.id,
+      'DEMO-RMA-ORDERED-01',
+      'Confirmed ordered RMA inspection evidence',
+    ).changed).toBe(false)
+    expect(() => isolated.claims.review(
+      claim.id,
+      'resolve',
+      'Attempted inspected RMA completion without refund or replacement',
+      { outcome: 'no_remedy', reference: 'DEMO-RMA-MISSING-OUTCOME' },
+    )).toThrow(expect.objectContaining({ code: 'REMEDY_INCOMPLETE' }))
+    isolated.repository.update((state) => { state.sessionUserId = 'usr-demo-admin' })
+    isolated.payments.refund(
+      'pay-delivered',
+      claim.requiredSettlementSen,
+      'Confirmed inspected RMA linked refund',
+      'req-inspected-rma-linked-refund',
+      claim.id,
+    )
+    const linkedRefundEventId = isolated.repository.getSnapshot().claims
+      .find((entry) => entry.id === claim.id)!.linkedRefundEventId!
+    const completed = isolated.claims.review(
+      claim.id,
+      'resolve',
+      'Confirmed inspected RMA linked refund completion',
+      { outcome: 'refund_recorded', reference: linkedRefundEventId },
+    )
+    expect(completed.data).toMatchObject({
+      status: 'resolved',
+      remedyState: 'refund_completed',
+      rma: { status: 'inspected' },
+      resolutionReference: linkedRefundEventId,
+    })
+    expect(isolated.repository.getSnapshot().shipments
+      .find((entry) => entry.id === 'shp-delivered')?.status).toBe('returned')
+    expect(isolated.repository.getSnapshot().orders
+      .find((entry) => entry.id === 'ord-delivered')?.status).toBe('refunded')
+    expect(() => validateDemoState(isolated.repository.getSnapshot())).not.toThrow()
+  })
+
+  it('completes a post-delivery return through one replacement after RMA inspection', () => {
+    let rmaNow = FIXED_NOW
+    const isolated = new AppServices(new MemoryStorage(), () => rmaNow)
+    isolated.auth.oneClick('customer')
+    const claim = isolated.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'damage',
+      shipmentId: 'shp-delivered',
+      note: 'DEMO returned damaged delivery uses inspected RMA replacement path',
+    }).data
+    isolated.auth.oneClick('admin')
+    isolated.claims.review(claim.id, 'acknowledge', 'Confirmed inspected replacement acknowledgement')
+    isolated.claims.review(claim.id, 'approve', 'Confirmed inspected replacement approval')
+    rmaNow = '2026-07-28T05:00:00.000Z'
+    const beforeDirectReplacement = structuredClone(isolated.repository.getSnapshot())
+    expect(() => isolated.claims.authorizeReplacement(
+      claim.id,
+      'Attempted replacement before completed return path',
+    )).toThrow(expect.objectContaining({
+      code: 'POST_DELIVERY_REPLACEMENT_REQUIRES_RETURN',
+    }))
+    expect(isolated.repository.getSnapshot()).toEqual(beforeDirectReplacement)
+
+    isolated.repository.update((state) => { state.sessionUserId = 'usr-support' })
+    isolated.claims.createRma(claim.id, 'DEMO-RMA-REPLACE-01', 'Confirmed replacement RMA creation')
+    isolated.claims.recordRmaReceived(
+      claim.id,
+      'DEMO-RMA-REPLACE-01',
+      'Confirmed replacement RMA receipt and atomic original return',
+    )
+    const received = isolated.repository.getSnapshot()
+    expect(received.shipments.find((entry) => entry.id === 'shp-delivered'))
+      .toMatchObject({
+        status: 'returned',
+        timeline: expect.arrayContaining([
+          expect.objectContaining({
+            label: 'Confirmed replacement RMA receipt and atomic original return',
+            status: 'returned',
+          }),
+        ]),
+      })
+    expect(received.audits.find((entry) =>
+      entry.action === 'claim.rma_received' &&
+      entry.targetId === claim.id)).toMatchObject({
+      before: {
+        originalShipmentId: 'shp-delivered',
+        originalShipmentStatus: 'delivered',
+        remedyState: 'rma_created',
+        rmaStatus: 'created',
+      },
+      after: {
+        originalShipmentId: 'shp-delivered',
+        originalShipmentStatus: 'returned',
+        remedyState: 'rma_received',
+        rmaReference: 'DEMO-RMA-REPLACE-01',
+        rmaStatus: 'received',
+      },
+    })
+    const receivedBeforeReplay = structuredClone(received)
+    expect(isolated.claims.recordRmaReceived(
+      claim.id,
+      'DEMO-RMA-REPLACE-01',
+      'Confirmed replacement RMA receipt and atomic original return',
+    )).toMatchObject({ changed: false })
+    expect(isolated.repository.getSnapshot()).toEqual(receivedBeforeReplay)
+    isolated.claims.recordRmaInspected(claim.id, 'DEMO-RMA-REPLACE-01', 'Confirmed replacement RMA inspection')
+    expect(() => isolated.claims.authorizeReplacement(
+      claim.id,
+      'Confirmed inspected replacement authorization',
+    )).toThrow(expect.objectContaining({ code: 'FORBIDDEN' }))
+
+    isolated.repository.update((state) => { state.sessionUserId = 'usr-fulfilment' })
+    const authorized = isolated.claims.authorizeReplacement(
+      claim.id,
+      'Confirmed inspected replacement authorization',
+    )
+    expect(authorized).toMatchObject({
+      changed: true,
+      data: {
+        purpose: 'replacement',
+        sourceClaimId: claim.id,
+        replacementForShipmentId: 'shp-delivered',
+        status: 'unfulfilled',
+      },
+    })
+    expect(isolated.repository.getSnapshot().claims.find((entry) => entry.id === claim.id))
+      .toMatchObject({ status: 'approved', remedyState: 'replacement_authorized' })
+    const beforeReplay = structuredClone(isolated.repository.getSnapshot())
+    expect(isolated.claims.authorizeReplacement(
+      claim.id,
+      'Confirmed inspected replacement authorization',
+    )).toMatchObject({ changed: false, data: { id: authorized.data.id } })
+    expect(isolated.repository.getSnapshot()).toEqual(beforeReplay)
+    expect(() => isolated.claims.authorizeReplacement(
+      claim.id,
+      'Conflicting inspected replacement authorization',
+    )).toThrow(expect.objectContaining({ code: 'IDEMPOTENCY_CONFLICT' }))
+    for (const status of ['picking', 'packed', 'label_created', 'shipped', 'delivered'] as const) {
+      isolated.fulfilment.advance(
+        authorized.data.id,
+        status,
+        `Confirmed inspected RMA replacement ${status}`,
+      )
+    }
+    const completed = isolated.repository.getSnapshot()
+    expect(completed.shipments.find((entry) => entry.id === 'shp-delivered')?.status)
+      .toBe('returned')
+    expect(completed.claims.find((entry) => entry.id === claim.id)).toMatchObject({
+      status: 'resolved',
+      remedyState: 'replacement_delivered',
+      replacementShipmentId: authorized.data.id,
+      resolutionReference: authorized.data.id,
+    })
+    expect(completed.orders.find((entry) => entry.id === 'ord-delivered')?.status)
+      .toBe('fulfilled')
+    expect(() => validateDemoState(completed)).not.toThrow()
+  })
+
+  it('uses the digital issued-sent path for a replacement and never mutates its failed original', () => {
+    services.auth.oneClick('customer')
+    services.openBox('box-processing-02')
+    services.auth.oneClick('admin')
+    services.fulfilment.advance('shp-digital', 'issued', 'Confirmed original digital issue evidence')
+    services.fulfilment.advance('shp-digital', 'sent', 'Confirmed original digital send evidence')
+    services.fulfilment.advance('shp-digital', 'failed', 'Confirmed original digital failure evidence')
+    services.auth.oneClick('customer')
+    expect(() => services.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'damage',
+      shipmentId: 'shp-digital',
+      note: 'DEMO digital delivery cannot have physical damage',
+    })).toThrow(/digital fulfilment cannot have physical damage/i)
+    const claim = services.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'non_delivery',
+      shipmentId: 'shp-digital',
+      note: 'DEMO failed digital original needs a digital replacement',
+    }).data
+    services.auth.oneClick('admin')
+    services.claims.review(claim.id, 'acknowledge', 'Confirmed digital replacement acknowledgement')
+    services.claims.review(claim.id, 'approve', 'Confirmed digital replacement approval')
+    expect(() => services.claims.createRma(
+      claim.id,
+      'DEMO-RMA-DIGITAL-FORBIDDEN',
+      'Attempted RMA for a failed digital original',
+    )).toThrow(expect.objectContaining({ code: 'RMA_PHYSICAL_DELIVERY_REQUIRED' }))
+    const replacement = services.claims.authorizeReplacement(
+      claim.id,
+      'Confirmed digital replacement authorization',
+    ).data
+    expect(replacement).toMatchObject({
+      kind: 'DIGITAL',
+      purpose: 'replacement',
+      boxIds: ['box-processing-02'],
+      insured: false,
+      signatureRequired: false,
+    })
+    expect(() => services.fulfilment.setTracking(
+      replacement.id,
+      'Digital Vault',
+      'DEMO-DIGITAL-REPLACEMENT-EDIT',
+      'Attempted digital replacement tracking edit',
+    )).toThrow(expect.objectContaining({ code: 'DIGITAL_TRACKING_FORBIDDEN' }))
+    services.fulfilment.advance(replacement.id, 'issued', 'Confirmed replacement digital issued')
+    services.fulfilment.advance(replacement.id, 'sent', 'Confirmed replacement digital sent')
+    expect(services.repository.getSnapshot().claims.find((entry) => entry.id === claim.id))
+      .toMatchObject({ status: 'approved', remedyState: 'replacement_authorized' })
+    services.fulfilment.advance(replacement.id, 'delivered', 'Confirmed replacement digital delivered')
+
+    const snapshot = services.repository.getSnapshot()
+    expect(snapshot.shipments.find((entry) => entry.id === 'shp-digital')).toMatchObject({
+      purpose: 'original',
+      status: 'failed',
+    })
+    expect(snapshot.shipments.find((entry) => entry.id === replacement.id)?.timeline
+      .map((entry) => entry.status)).toEqual(['unfulfilled', 'issued', 'sent', 'delivered'])
+    expect(snapshot.claims.find((entry) => entry.id === claim.id)).toMatchObject({
+      status: 'resolved',
+      remedyState: 'replacement_delivered',
+      resolutionReference: replacement.id,
+    })
+    expect(snapshot.orders.find((entry) => entry.id === 'ord-processing')?.status)
+      .toBe('partially_fulfilled')
+    expect(snapshot.boxes.find((entry) => entry.id === 'box-processing-02')).toMatchObject({
+      status: 'fulfilled',
+      shipmentId: 'shp-digital',
+    })
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+  })
+
+  it('completes a failed original scope only after its exact linked refund resolves', () => {
+    services.auth.oneClick('customer')
+    const claim = services.claims.submit({
+      orderId: 'ord-failed',
+      kind: 'non_delivery',
+      shipmentId: 'shp-failed',
+      note: 'DEMO failed original uses exact linked refund completion',
+    }).data
+    services.auth.oneClick('admin')
+    services.claims.review(claim.id, 'acknowledge', 'Confirmed failed-scope refund acknowledgement')
+    services.claims.review(claim.id, 'approve', 'Confirmed failed-scope refund approval')
+    services.payments.refund(
+      'pay-failed',
+      claim.requiredSettlementSen,
+      'Confirmed exact failed-scope linked refund',
+      'req-failed-scope-linked-refund',
+      claim.id,
+    )
+    let snapshot = services.repository.getSnapshot()
+    const linked = snapshot.claims.find((entry) => entry.id === claim.id)!.linkedRefundEventId!
+    expect(snapshot.orders.find((entry) => entry.id === 'ord-failed')?.status).toBe('refunded')
+    expect(snapshot.claims.find((entry) => entry.id === claim.id)).toMatchObject({
+      status: 'approved',
+      remedyState: 'refund_linked',
+    })
+
+    services.claims.review(
+      claim.id,
+      'resolve',
+      'Confirmed exact failed-scope refund completion',
+      { outcome: 'refund_recorded', reference: linked },
+    )
+    snapshot = services.repository.getSnapshot()
+    expect(snapshot.shipments.find((entry) => entry.id === 'shp-failed')?.status)
+      .toBe('failed_delivery')
+    expect(snapshot.claims.find((entry) => entry.id === claim.id)).toMatchObject({
+      status: 'resolved',
+      remedyState: 'refund_completed',
+      resolutionReference: linked,
+    })
+    expect(snapshot.orders.find((entry) => entry.id === 'ord-failed')?.status).toBe('refunded')
+    expect(snapshot.boxes.find((entry) => entry.id === 'box-failed-01')).toMatchObject({
+      status: 'on_hold',
+      shipmentId: 'shp-failed',
+    })
+    expect(() => services.admin.changeOrderStatus(
+      'ord-failed',
+      'closed',
+      'Confirmed close after exact failed-scope remedy',
+    )).toThrow()
+    expect(() => validateDemoState(services.repository.getSnapshot())).not.toThrow()
+  })
+
+  it('rolls back failed RMA and replacement writes and permits safe retries', () => {
+    const storage = new FailNextWriteStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    let rmaNow = FIXED_NOW
+    const isolated = new AppServices(storage, () => rmaNow)
+    isolated.auth.oneClick('customer')
+    const claim = isolated.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'damage',
+      shipmentId: 'shp-delivered',
+      note: 'DEMO atomic remedy storage failure claim',
+    }).data
+    isolated.auth.oneClick('admin')
+    isolated.claims.review(claim.id, 'acknowledge', 'Confirmed atomic remedy acknowledgement')
+    isolated.claims.review(claim.id, 'approve', 'Confirmed atomic remedy approval')
+    rmaNow = '2026-07-28T05:00:00.000Z'
+    isolated.fulfilment.advance(
+      'shp-delivered',
+      'returned',
+      'Confirmed atomic post-delivery return evidence',
+    )
+    const beforeRma = structuredClone(isolated.repository.getSnapshot())
+    const rawBeforeRma = storage.getItem(STORAGE_KEY)
+    storage.failNextWrite = true
+    expect(() => isolated.claims.createRma(
+      claim.id,
+      'DEMO-RMA-ATOMIC-01',
+      'Confirmed atomic RMA creation evidence',
+    )).toThrow(expect.objectContaining({ code: 'STORAGE_WRITE_FAILED' }))
+    expect(isolated.repository.getSnapshot()).toEqual(beforeRma)
+    expect(storage.getItem(STORAGE_KEY)).toBe(rawBeforeRma)
+
+    isolated.claims.createRma(
+      claim.id,
+      'DEMO-RMA-ATOMIC-01',
+      'Confirmed atomic RMA creation evidence',
+    )
+    isolated.claims.recordRmaReceived(
+      claim.id,
+      'DEMO-RMA-ATOMIC-01',
+      'Confirmed atomic RMA receipt evidence',
+    )
+    isolated.claims.recordRmaInspected(
+      claim.id,
+      'DEMO-RMA-ATOMIC-01',
+      'Confirmed atomic RMA inspection evidence',
+    )
+    const beforeReplacement = structuredClone(isolated.repository.getSnapshot())
+    const rawBeforeReplacement = storage.getItem(STORAGE_KEY)
+    storage.failNextWrite = true
+    expect(() => isolated.claims.authorizeReplacement(
+      claim.id,
+      'Confirmed atomic replacement authorization',
+    )).toThrow(expect.objectContaining({ code: 'STORAGE_WRITE_FAILED' }))
+    expect(isolated.repository.getSnapshot()).toEqual(beforeReplacement)
+    expect(storage.getItem(STORAGE_KEY)).toBe(rawBeforeReplacement)
+    expect(isolated.claims.authorizeReplacement(
+      claim.id,
+      'Confirmed atomic replacement authorization',
+    )).toMatchObject({ changed: true, data: { purpose: 'replacement' } })
   })
 
   it('records a post-delivery return and reopens a fulfilled order without money or claim side effects', () => {
@@ -813,16 +2739,25 @@ describe('customer, payment, allocation and admin services', () => {
 
   it('derives a mixed delivered and returned order as partially fulfilled', () => {
     services.auth.oneClick('admin')
-    for (const shipmentId of ['shp-processing', 'shp-digital']) {
-      const shipment = services.repository.getSnapshot().shipments.find((entry) => entry.id === shipmentId)!
-      const path = shipment.status === 'picking'
-        ? ['packed', 'label_created', 'shipped', 'delivered'] as const
-        : ['picking', 'packed', 'label_created', 'shipped', 'delivered'] as const
-      for (const status of path) {
-        services.fulfilment.advance(shipmentId, status, `Confirmed mixed-order ${status}`)
-      }
+    for (const status of ['packed', 'label_created', 'shipped', 'delivered'] as const) {
+      services.fulfilment.advance('shp-processing', status, `Confirmed mixed physical ${status}`)
+    }
+    expect(services.repository.getSnapshot().orders
+      .find((entry) => entry.id === 'ord-processing')?.status).toBe('partially_fulfilled')
+    expect(() => services.admin.changeOrderStatus(
+      'ord-processing',
+      'closed',
+      'Attempted close before digital scope completion',
+    )).toThrow()
+    for (const status of ['issued', 'sent', 'delivered'] as const) {
+      services.fulfilment.advance('shp-digital', status, `Confirmed mixed digital ${status}`)
     }
     expect(services.repository.getSnapshot().orders.find((entry) => entry.id === 'ord-processing')?.status).toBe('fulfilled')
+    services.admin.changeOrderStatus(
+      'ord-processing',
+      'closed',
+      'Confirmed close after both original scopes completed',
+    )
     services.fulfilment.advance('shp-processing', 'returned', 'Confirmed one mixed shipment returned')
     const snapshot = services.repository.getSnapshot()
     expect(snapshot.orders.find((entry) => entry.id === 'ord-processing')?.status).toBe('partially_fulfilled')
@@ -911,7 +2846,7 @@ describe('customer, payment, allocation and admin services', () => {
     const resolved = services.payments.resolveDispute(
       'pay-unopened',
       'merchant_won',
-      'Confirmed merchant win restarting fulfilment',
+      'Confirmed merchant win for Air fryer PARCEL via Demo Express, physical not digital, box-unopened-01',
       'evt-single-picking-dispute-win',
     )
     snapshot = services.repository.getSnapshot()
@@ -920,6 +2855,23 @@ describe('customer, payment, allocation and admin services', () => {
     expect(snapshot.orders.find((entry) => entry.id === 'ord-unopened')?.status).toBe('confirmed')
     expect(snapshot.shipments.find((entry) => entry.id === 'shp-unopened')?.status).toBe('unfulfilled')
     expect(snapshot.boxes.find((entry) => entry.id === 'box-unopened-01')?.status).toBe('paid_unopened')
+    const storedTimeline = structuredClone(
+      snapshot.orders.find((entry) => entry.id === 'ord-unopened')!.timeline,
+    )
+    const visibleTimeline = sealedCustomerTimeline(
+      snapshot.orders.find((entry) => entry.id === 'ord-unopened')!,
+    )
+    expect(visibleTimeline.map((entry) => entry.label)).toEqual([
+      'Demo order created',
+      'Mock payment confirmed',
+      'Demo order placed on disputed financial hold',
+      'Demo financial hold resolved',
+    ])
+    expect(JSON.stringify(visibleTimeline)).not.toMatch(
+      /Air fryer|PARCEL|Demo Express|physical|digital|box-unopened|merchant win/i,
+    )
+    expect(snapshot.orders.find((entry) => entry.id === 'ord-unopened')!.timeline)
+      .toEqual(storedTimeline)
     expect(() => validateDemoState(snapshot)).not.toThrow()
   })
 
@@ -985,7 +2937,7 @@ describe('customer, payment, allocation and admin services', () => {
   )
 
   it.each(['refund', 'dispute'] as const)(
-    'allows failed-delivery reship and delivery evidence during a %s hold without reopening finance or boxes',
+    'blocks rewriting a failed original during a %s hold without changing finance or boxes',
     (hold) => {
       const held = new AppServices(new MemoryStorage(), () => FIXED_NOW)
       held.repository.update((state) => {
@@ -1013,23 +2965,14 @@ describe('customer, payment, allocation and admin services', () => {
       const stoppedPayment = stopped.payments.find((entry) => entry.id === payment.id)!
       const stoppedBoxes = stopped.boxes.filter((box) => stoppedOrder.boxIds.includes(box.id))
 
-      held.fulfilment.advance(
+      expect(() => held.fulfilment.advance(
         'shp-failed',
         'shipped',
-        'Carrier retried the failed fictional delivery',
-      )
-      held.fulfilment.advance(
-        'shp-failed',
-        'delivered',
-        'Carrier completed the retried fictional delivery',
-      )
+        'Attempted rewrite of the failed fictional original',
+      )).toThrow(/graph-legal physical carrier evidence/i)
 
       const snapshot = held.repository.getSnapshot()
-      expect(snapshot.shipments.find((entry) => entry.id === 'shp-failed')?.timeline.slice(-3).map((entry) => entry.status)).toEqual([
-        'failed_delivery',
-        'shipped',
-        'delivered',
-      ])
+      expect(snapshot.shipments.find((entry) => entry.id === 'shp-failed')?.status).toBe('failed_delivery')
       expect(snapshot.orders.find((entry) => entry.id === stoppedOrder.id)).toEqual(stoppedOrder)
       expect(snapshot.payments.find((entry) => entry.id === stoppedPayment.id)).toEqual(stoppedPayment)
       expect(snapshot.boxes.filter((box) => stoppedOrder.boxIds.includes(box.id))).toEqual(stoppedBoxes)
@@ -1071,21 +3014,18 @@ describe('customer, payment, allocation and admin services', () => {
     )).toThrow(/financial hold/i)
     expect(held.repository.getSnapshot()).toEqual(before)
 
-    held.fulfilment.advance('shp-failed', 'shipped', 'Carrier retried the held delivery')
-    held.fulfilment.advance('shp-failed', 'delivered', 'Carrier delivered the held retry')
-    const delivered = structuredClone(held.repository.getSnapshot())
     expect(() => held.fulfilment.advance(
       'shp-failed',
-      'lost',
-      'Attempted impossible post-delivery loss',
+      'shipped',
+      'Attempted held original redelivery rewrite',
     )).toThrow(/graph-legal physical carrier evidence/i)
-    expect(held.repository.getSnapshot()).toEqual(delivered)
+    expect(held.repository.getSnapshot()).toEqual(before)
   })
 
   it('does not treat digital fulfilment as physical carrier evidence during a financial hold', () => {
     const held = new AppServices(new MemoryStorage(), () => FIXED_NOW)
     held.auth.oneClick('admin')
-    for (const status of ['picking', 'packed', 'label_created', 'shipped'] as const) {
+    for (const status of ['issued', 'sent'] as const) {
       held.fulfilment.advance('shp-digital', status, `Confirmed digital hold setup ${status}`)
     }
     held.payments.dispute(
@@ -1103,6 +3043,7 @@ describe('customer, payment, allocation and admin services', () => {
   })
 
   it('resumes only shipments stopped by that dispute and keeps earlier cancellations held', () => {
+    makeProcessingOrderTwoPhysicalShipments(services)
     services.auth.oneClick('admin')
     services.fulfilment.advance('shp-digital', 'cancelled', 'Cancelled earlier for an unrelated fulfilment reason')
     services.payments.dispute(
@@ -1125,6 +3066,75 @@ describe('customer, payment, allocation and admin services', () => {
     expect(snapshot.shipments.find((entry) => entry.id === 'shp-processing')?.status).toBe('unfulfilled')
     expect(snapshot.shipments.find((entry) => entry.id === 'shp-digital')?.status).toBe('cancelled')
     expect(snapshot.boxes.find((entry) => entry.id === 'box-processing-02')?.status).toBe('on_hold')
+  })
+
+  it('keeps repeated same-instant dispute cycles valid when the stoppable shipment scope changes', () => {
+    const repeated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    repeated.auth.oneClick('admin')
+    const disputeReason = 'Confirmed repeated changed-scope dispute cycle'
+    const resumeReason =
+      'Confirmed repeated changed-scope merchant win'
+
+    repeated.payments.dispute(
+      'pay-processing',
+      disputeReason,
+      'evt-changed-scope-first-dispute',
+    )
+    repeated.payments.resolveDispute(
+      'pay-processing',
+      'merchant_won',
+      resumeReason,
+      'evt-changed-scope-first-win',
+    )
+    repeated.fulfilment.advance(
+      'shp-digital',
+      'issued',
+      'Confirmed digital work after first merchant win',
+    )
+    repeated.fulfilment.advance(
+      'shp-digital',
+      'sent',
+      'Confirmed digital send before second dispute',
+    )
+    repeated.payments.dispute(
+      'pay-processing',
+      disputeReason,
+      'evt-changed-scope-second-dispute',
+    )
+    repeated.payments.resolveDispute(
+      'pay-processing',
+      'merchant_won',
+      resumeReason,
+      'evt-changed-scope-second-win',
+    )
+
+    const snapshot = repeated.repository.getSnapshot()
+    const stopAudits = snapshot.audits.filter((audit) =>
+      audit.action === 'order.financial_hold_disputed' &&
+      audit.targetId === 'ord-processing' &&
+      audit.reason === disputeReason)
+    const resumeAudits = snapshot.audits.filter((audit) =>
+      audit.action === 'order.dispute_resolved' &&
+      audit.targetId === 'ord-processing' &&
+      audit.reason === resumeReason)
+    expect(stopAudits.map((audit) =>
+      (audit.after as Record<string, unknown>).stoppedShipmentIds)).toEqual([
+      ['shp-digital', 'shp-processing'],
+      ['shp-processing'],
+    ])
+    expect(resumeAudits.map((audit) =>
+      (audit.after as Record<string, unknown>).resumedShipmentIds)).toEqual([
+      ['shp-digital', 'shp-processing'],
+      ['shp-processing'],
+    ])
+    expect(snapshot.shipments.find((entry) =>
+      entry.id === 'shp-processing')?.status).toBe('unfulfilled')
+    expect(snapshot.shipments.find((entry) =>
+      entry.id === 'shp-digital')?.status).toBe('sent')
+    const timelineIds = snapshot.shipments.flatMap((shipment) =>
+      shipment.timeline.map((entry) => entry.id))
+    expect(new Set(timelineIds).size).toBe(timelineIds.length)
+    expect(() => validateDemoState(snapshot)).not.toThrow()
   })
 
   it('preserves an earlier partial refund when a later dispute is resolved for the merchant', () => {
@@ -1220,6 +3230,84 @@ describe('customer, payment, allocation and admin services', () => {
     expect(snapshot.boxes.find((entry) => entry.id === 'box-delivered-01')?.revealedAt).toBeTruthy()
   })
 
+  it('closes the same fulfilled order twice at one instant after an exact RMA replacement cycle', () => {
+    const repeated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    const closeReason = 'Confirmed repeated fixed-time order closure'
+    repeated.auth.oneClick('admin')
+    repeated.admin.changeOrderStatus(
+      'ord-delivered',
+      'closed',
+      closeReason,
+    )
+    repeated.auth.oneClick('customer')
+    const claim = repeated.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'damage',
+      note: 'DEMO item returned with fictional damage evidence',
+      shipmentId: 'shp-delivered',
+    }).data
+    repeated.auth.oneClick('admin')
+    repeated.claims.review(
+      claim.id,
+      'acknowledge',
+      'Confirmed fictional damage claim acknowledgement',
+    )
+    repeated.claims.review(
+      claim.id,
+      'approve',
+      'Confirmed fictional damage claim approval',
+    )
+    repeated.claims.createRma(
+      claim.id,
+      'DEMO-RMA-REPEAT-CLOSE',
+      'Confirmed fictional RMA creation for repeat closure',
+    )
+    repeated.claims.recordRmaReceived(
+      claim.id,
+      'DEMO-RMA-REPEAT-CLOSE',
+      'Confirmed fictional RMA received for repeat closure',
+    )
+    repeated.claims.recordRmaInspected(
+      claim.id,
+      'DEMO-RMA-REPEAT-CLOSE',
+      'Confirmed fictional RMA inspection for repeat closure',
+    )
+    const replacement = repeated.claims.authorizeReplacement(
+      claim.id,
+      'Confirmed fictional replacement after inspected return',
+    ).data
+    for (const next of [
+      'picking',
+      'packed',
+      'label_created',
+      'shipped',
+      'delivered',
+    ] as const) {
+      repeated.fulfilment.advance(
+        replacement.id,
+        next,
+        `Confirmed replacement ${next} before repeated closure`,
+      )
+    }
+    repeated.admin.changeOrderStatus(
+      'ord-delivered',
+      'closed',
+      closeReason,
+    )
+
+    const snapshot = repeated.repository.getSnapshot()
+    const order = snapshot.orders.find((entry) =>
+      entry.id === 'ord-delivered')!
+    const closeEntries = order.timeline.filter((entry) =>
+      entry.status === 'closed' &&
+      entry.label === closeReason &&
+      entry.at === FIXED_NOW)
+    expect(order.status).toBe('closed')
+    expect(closeEntries).toHaveLength(2)
+    expect(new Set(closeEntries.map((entry) => entry.id)).size).toBe(2)
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+  })
+
   it('manual order transitions cannot bypass payment, box, reservation or shipment services', () => {
     const order = checkout(services)
     const payment = services.payments.createAttempt(order.id)
@@ -1248,7 +3336,7 @@ describe('customer, payment, allocation and admin services', () => {
       orderId: 'ord-delivered',
       kind: 'damage',
       shipmentId: 'shp-delivered',
-      note: 'DEMO duplicate delivered carton report',
+      note: 'DEMO delivered carton is damaged',
     })
     const valueFloor = services.claims.submit({
       orderId: 'ord-delivered',
@@ -1264,9 +3352,32 @@ describe('customer, payment, allocation and admin services', () => {
     })
     expect(damage.changed).toBe(true)
     expect(duplicate).toMatchObject({ changed: false, data: { id: damage.data.id } })
+    expect(valueFloor.message).toMatch(
+      /suspected RM\s*100\.00 value-floor issue.+review threshold.+eligibility does not establish a breach/i,
+    )
     expect(new Set([damage.data.id, valueFloor.data.id, nonDelivery.data.id]).size).toBe(3)
     expect(damage.data.id).toMatch(/^clm-[a-z0-9]{8}-[a-z0-9]{7}$/)
     expect(damage.data.requestId).toMatch(/^req-claim-/)
+  })
+
+  it('uses the order historical floor in the cautious value-floor submission message', () => {
+    services.repository.update((state) => {
+      state.orders.find((order) => order.id === 'ord-delivered')!
+        .snapshot.valueFloorSen = 12_500
+    })
+    services.auth.oneClick('customer')
+
+    const result = services.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'value_floor',
+      boxId: 'box-delivered-01',
+      note: 'DEMO historical value-floor evidence review',
+    })
+
+    expect(result.message).toMatch(
+      /suspected RM\s*125\.00 value-floor issue.+only a review threshold.+does not establish a breach/i,
+    )
+    expect(result.message).not.toMatch(/RM\s*100(?:\.00)?/i)
   })
 
   it('stores sealed delivery claims at order level without allowing exact shipment or sealed value-floor links', () => {
@@ -1359,11 +3470,11 @@ describe('customer, payment, allocation and admin services', () => {
     expect(() => validateDemoState(services.repository.getSnapshot())).not.toThrow()
   })
 
-  it('does not treat a returned digital fulfilment as physical non-delivery evidence', () => {
+  it('accepts digital failed as non-delivery without using any physical status', () => {
     services.auth.oneClick('customer')
     services.openBox('box-processing-02')
     services.auth.oneClick('admin')
-    for (const status of ['picking', 'packed', 'label_created', 'shipped', 'returned'] as const) {
+    for (const status of ['issued', 'sent', 'failed'] as const) {
       services.fulfilment.advance(
         'shp-digital',
         status,
@@ -1371,15 +3482,52 @@ describe('customer, payment, allocation and admin services', () => {
       )
     }
     services.auth.oneClick('customer')
-    const before = structuredClone(services.repository.getSnapshot())
-
-    expect(() => services.claims.submit({
+    const result = services.claims.submit({
       orderId: 'ord-processing',
       kind: 'non_delivery',
       shipmentId: 'shp-digital',
-      note: 'DEMO digital fulfilment cannot be a physical non-delivery',
-    })).toThrow(/digital fulfilment cannot have physical non-delivery/i)
-    expect(services.repository.getSnapshot()).toEqual(before)
+      note: 'DEMO failed digital fulfilment did not arrive',
+    })
+    expect(result).toMatchObject({
+      changed: true,
+      data: { kind: 'non_delivery', shipmentId: 'shp-digital' },
+    })
+    expect(services.repository.getSnapshot().shipments
+      .find((entry) => entry.id === 'shp-digital')?.timeline
+      .map((entry) => entry.status)).toEqual(['unfulfilled', 'issued', 'sent', 'failed'])
+  })
+
+  it('makes a sent digital original non-delivery eligible only after three demo days', () => {
+    let digitalNow = FIXED_NOW
+    const isolated = new AppServices(new MemoryStorage(), () => digitalNow)
+    isolated.auth.oneClick('customer')
+    isolated.openBox('box-processing-02')
+    isolated.auth.oneClick('admin')
+    isolated.fulfilment.advance('shp-digital', 'issued', 'Confirmed overdue digital issue evidence')
+    isolated.fulfilment.advance('shp-digital', 'sent', 'Confirmed overdue digital send evidence')
+    isolated.auth.oneClick('customer')
+    digitalNow = '2026-07-31T03:59:59.000Z'
+    expect(() => isolated.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'non_delivery',
+      shipmentId: 'shp-digital',
+      note: 'DEMO digital delivery is not yet three days overdue',
+    })).toThrow(expect.objectContaining({ code: 'CLAIM_NOT_OVERDUE' }))
+
+    digitalNow = '2026-07-31T04:00:00.000Z'
+    expect(isolated.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'non_delivery',
+      shipmentId: 'shp-digital',
+      note: 'DEMO digital delivery is now three days overdue',
+    })).toMatchObject({
+      changed: true,
+      data: {
+        kind: 'non_delivery',
+        shipmentId: 'shp-digital',
+      },
+    })
+    expect(() => validateDemoState(isolated.repository.getSnapshot())).not.toThrow()
   })
 
   it('stores every eligible sealed physical shipment canonically and keeps duplicate creation harmless', () => {
@@ -1419,7 +3567,7 @@ describe('customer, payment, allocation and admin services', () => {
       orderId: 'ord-processing',
       kind: 'non_delivery',
       orderLevelDelivery: true,
-      note: 'DEMO repeated neutral multi-shipment submission',
+      note: 'DEMO neutral multi-shipment non-delivery evidence',
     })
     const snapshot = multi.repository.getSnapshot()
 
@@ -1433,11 +3581,11 @@ describe('customer, payment, allocation and admin services', () => {
     expect(snapshot.audits.at(-1)).toMatchObject({
       action: 'claim.submitted',
       after: {
-        shipmentId: undefined,
         shipmentCandidateIds: ['shp-digital', 'shp-processing'],
         refundCreated: false,
       },
     })
+    expect(snapshot.audits.at(-1)?.after).not.toHaveProperty('shipmentId')
     expect(multi.claims.listMine().at(-1)).not.toHaveProperty('shipmentCandidateIds')
     expect(snapshot.payments.reduce((sum, payment) => sum + payment.refundedSen, 0)).toBe(refundedBefore)
     expect(() => validateDemoState(snapshot)).not.toThrow()
@@ -1447,6 +3595,10 @@ describe('customer, payment, allocation and admin services', () => {
     const scenario = neutralClaimWideningScenario()
     expect(scenario.services.repository.getSnapshot().claims.at(-1)?.shipmentCandidateIds)
       .toEqual(['shp-processing'])
+    expect(scenario.services.repository.getSnapshot().claims.at(-1)).toMatchObject({
+      remedyBoxIds: ['box-processing-01'],
+      requiredSettlementSen: 10_600,
+    })
     scenario.moveToReviewState('reviewing')
     scenario.makeSecondShipmentEligible()
 
@@ -1463,6 +3615,10 @@ describe('customer, payment, allocation and admin services', () => {
       'shp-digital': '2026-07-28T08:00:00.000Z',
       'shp-processing': '2026-07-28T06:00:00.000Z',
     })
+    expect(stored).toMatchObject({
+      remedyBoxIds: ['box-processing-01', 'box-processing-02'],
+      requiredSettlementSen: 21_200,
+    })
     expect(stored.history.at(-1)?.note).toBe(
       'Neutral order-level delivery evidence widened after customer resubmission.',
     )
@@ -1475,27 +3631,265 @@ describe('customer, payment, allocation and admin services', () => {
     expect(() => validateDemoState(snapshot)).not.toThrow()
   })
 
-  it('returns an approved neutral claim unchanged when later evidence becomes eligible', () => {
+  it('creates one new disjoint same-note claim after approval, then replays it without a write', () => {
     const scenario = neutralClaimWideningScenario()
     scenario.moveToReviewState('approved')
     scenario.makeSecondShipmentEligible()
-    const before = structuredClone(scenario.services.repository.getSnapshot())
+    const beforeSecond = structuredClone(scenario.services.repository.getSnapshot())
 
-    const result = scenario.resubmit()
+    const second = scenario.resubmit()
+    const afterSecond = structuredClone(scenario.services.repository.getSnapshot())
+    const storedFirst = afterSecond.claims.find((claim) =>
+      claim.id === scenario.first.data.id)!
+    const storedSecond = afterSecond.claims.find((claim) =>
+      claim.id === second.data.id)!
+    const revisionAfterSecond = afterSecond.revision
+    const third = scenario.resubmit()
 
-    expect(result).toMatchObject({
-      changed: false,
+    expect(second).toMatchObject({
+      changed: true,
       data: {
-        id: scenario.first.data.id,
-        status: 'approved',
+        status: 'submitted',
       },
     })
-    expect(result.data).not.toHaveProperty('shipmentCandidateIds')
-    expect(result.data).not.toHaveProperty('shipmentCandidateEvidenceAt')
-    expect(scenario.services.repository.getSnapshot()).toEqual(before)
+    expect(second.data.id).not.toBe(scenario.first.data.id)
+    expect(storedFirst).toMatchObject({
+      status: 'approved',
+      shipmentCandidateIds: ['shp-processing'],
+      remedyBoxIds: ['box-processing-01'],
+    })
+    expect(storedSecond).toMatchObject({
+      shipmentCandidateIds: ['shp-digital'],
+      remedyBoxIds: ['box-processing-02'],
+    })
+    expect(new Set([
+      ...storedFirst.remedyBoxIds,
+      ...storedSecond.remedyBoxIds,
+    ]).size).toBe(
+      storedFirst.remedyBoxIds.length + storedSecond.remedyBoxIds.length,
+    )
+    expect(third).toMatchObject({
+      changed: false,
+      data: {
+        id: second.data.id,
+        status: 'submitted',
+      },
+    })
+    expect(third.data).not.toHaveProperty('shipmentCandidateIds')
+    expect(third.data).not.toHaveProperty('shipmentCandidateEvidenceAt')
+    expect(scenario.services.repository.getSnapshot()).toEqual(afterSecond)
+    expect(scenario.services.repository.getSnapshot().revision).toBe(revisionAfterSecond)
+    expect(afterSecond.revision).toBe(beforeSecond.revision + 1)
+    expect(() => validateDemoState(afterSecond)).not.toThrow()
   })
 
-  it('returns an existing order-level claim when a later exact shipment scope overlaps it', () => {
+  it('rejects corrupt duplicate mutable same-note neutral candidates before writing', () => {
+    const scenario = neutralClaimWideningScenario()
+    const corrupt = structuredClone(scenario.services.repository.getSnapshot())
+    const first = corrupt.claims.find((claim) =>
+      claim.id === scenario.first.data.id)!
+    const duplicate = structuredClone(first)
+    duplicate.id = `${first.id}-duplicate`
+    duplicate.requestId = `${first.requestId}-duplicate`
+    corrupt.claims.push(duplicate)
+    const repository = new TransactionTestRepository(corrupt)
+    const claims = new ClaimService(
+      repository as unknown as MockRepository,
+      new AuditService(),
+      () => '2026-07-28T06:00:00.000Z',
+    )
+
+    expect(() => claims.submit({
+      orderId: 'ord-processing',
+      kind: 'non_delivery',
+      orderLevelDelivery: true,
+      note: 'DEMO first neutral order-level delivery evidence',
+    })).toThrow(expect.objectContaining({ code: 'IDEMPOTENCY_CONFLICT' }))
+    expect(repository.updateCalls).toBe(0)
+    expect(repository.getSnapshot()).toEqual(corrupt)
+  })
+
+  it('creates a second disjoint neutral claim after the first failed shipment reserves its own remedy scope', () => {
+    let now = '2026-07-28T04:00:00.000Z'
+    const isolated = new AppServices(new MemoryStorage(), () => now)
+    makeProcessingOrderTwoPhysicalShipments(isolated)
+    isolated.auth.oneClick('admin')
+    now = '2026-07-28T05:00:00.000Z'
+    for (const status of ['packed', 'label_created', 'shipped', 'failed_delivery'] as const) {
+      isolated.fulfilment.advance(
+        'shp-processing',
+        status,
+        `Confirmed first disjoint failed shipment ${status}`,
+      )
+    }
+    isolated.auth.oneClick('customer')
+    now = '2026-07-28T06:00:00.000Z'
+    const first = isolated.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'non_delivery',
+      orderLevelDelivery: true,
+      note: 'DEMO first disjoint neutral non-delivery scope',
+    }).data
+    approveClaim(isolated, first.id)
+    now = '2026-07-28T07:00:00.000Z'
+    isolated.claims.authorizeReplacement(
+      first.id,
+      'Confirmed first disjoint replacement authorization',
+    )
+
+    now = '2026-07-28T08:00:00.000Z'
+    for (const status of ['picking', 'packed', 'label_created', 'shipped', 'failed_delivery'] as const) {
+      isolated.fulfilment.advance(
+        'shp-digital',
+        status,
+        `Confirmed second disjoint failed shipment ${status}`,
+      )
+    }
+    isolated.auth.oneClick('customer')
+    now = '2026-07-28T09:00:00.000Z'
+    const second = isolated.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'non_delivery',
+      orderLevelDelivery: true,
+      note: 'DEMO second disjoint neutral non-delivery scope',
+    })
+    const snapshot = isolated.repository.getSnapshot()
+    const storedFirst = snapshot.claims.find((entry) => entry.id === first.id)!
+    const storedSecond = snapshot.claims.find((entry) => entry.id === second.data.id)!
+
+    expect(second).toMatchObject({ changed: true })
+    expect(second.data.id).not.toBe(first.id)
+    expect(storedFirst.shipmentCandidateIds).toEqual(['shp-processing'])
+    expect(storedSecond.shipmentCandidateIds).toEqual(['shp-digital'])
+    expect(storedFirst.remedyBoxIds).toEqual(['box-processing-01'])
+    expect(storedSecond.remedyBoxIds).toEqual(['box-processing-02'])
+    expect(isolated.claims.eligibleLinks(
+      'ord-processing',
+      'non_delivery',
+    ).orderLevelEligible).toBe(true)
+    expect(isolated.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'non_delivery',
+      orderLevelDelivery: true,
+      note: 'DEMO first disjoint neutral non-delivery scope',
+    })).toMatchObject({
+      changed: false,
+      data: { id: first.id },
+    })
+    expect(isolated.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'non_delivery',
+      orderLevelDelivery: true,
+      note: 'DEMO second disjoint neutral non-delivery scope',
+    })).toMatchObject({
+      changed: false,
+      data: { id: second.data.id },
+    })
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+  })
+
+  it('excludes a whole grouped shipment when any box overlaps an earlier remedy entitlement', () => {
+    let now = '2026-07-28T04:00:00.000Z'
+    const isolated = new AppServices(new MemoryStorage(), () => now)
+    makeProcessingOrderSingleGroupedPhysicalShipment(isolated)
+    isolated.auth.oneClick('customer')
+    const holder = isolated.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'value_floor',
+      boxId: 'box-processing-01',
+      note: 'DEMO grouped shipment partial-overlap entitlement holder',
+    }).data
+    approveClaim(isolated, holder.id)
+    now = '2026-07-28T05:00:00.000Z'
+    isolated.payments.refund(
+      'pay-processing',
+      holder.requiredSettlementSen,
+      'Confirmed grouped shipment overlap holder refund link',
+      'req-grouped-overlap-holder-refund',
+      holder.id,
+    )
+    for (const status of ['packed', 'label_created', 'shipped', 'failed_delivery'] as const) {
+      isolated.fulfilment.advance(
+        'shp-processing',
+        status,
+        `Confirmed grouped shipment partial-overlap ${status}`,
+      )
+    }
+    isolated.auth.oneClick('customer')
+    now = '2026-07-28T06:00:00.000Z'
+    const before = structuredClone(isolated.repository.getSnapshot())
+
+    expect(() => isolated.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'non_delivery',
+      orderLevelDelivery: true,
+      note: 'DEMO grouped shipment must be excluded for any overlap',
+    })).toThrow(expect.objectContaining({
+      code: 'CLAIM_REMEDY_SCOPE_UNAVAILABLE',
+    }))
+    expect(isolated.repository.getSnapshot()).toEqual(before)
+  })
+
+  it('protects exact-shipment submissions after an earlier claim reserves that shipment', () => {
+    const isolated = new AppServices(new MemoryStorage(), incrementingClock())
+    isolated.auth.oneClick('customer')
+    const holder = isolated.claims.submit({
+      orderId: 'ord-failed',
+      kind: 'non_delivery',
+      shipmentId: 'shp-failed',
+      note: 'DEMO exact shipment entitlement holder',
+    }).data
+    approveClaim(isolated, holder.id)
+    isolated.claims.authorizeReplacement(
+      holder.id,
+      'Confirmed exact shipment entitlement reservation',
+    )
+    isolated.auth.oneClick('customer')
+    const before = structuredClone(isolated.repository.getSnapshot())
+
+    expect(() => isolated.claims.submit({
+      orderId: 'ord-failed',
+      kind: 'non_delivery',
+      shipmentId: 'shp-failed',
+      note: 'DEMO later exact shipment claim must not reuse the scope',
+    })).toThrow(expect.objectContaining({
+      code: 'IDEMPOTENCY_CONFLICT',
+    }))
+    expect(isolated.repository.getSnapshot()).toEqual(before)
+  })
+
+  it('protects value-floor submissions after an earlier claim reserves that box', () => {
+    const isolated = new AppServices(new MemoryStorage(), incrementingClock())
+    isolated.auth.oneClick('customer')
+    const holder = isolated.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'value_floor',
+      boxId: 'box-processing-01',
+      note: 'DEMO value-floor entitlement holder',
+    }).data
+    approveClaim(isolated, holder.id)
+    isolated.payments.refund(
+      'pay-processing',
+      holder.requiredSettlementSen,
+      'Confirmed value-floor entitlement reservation',
+      'req-value-floor-entitlement-holder',
+      holder.id,
+    )
+    isolated.auth.oneClick('customer')
+    const before = structuredClone(isolated.repository.getSnapshot())
+
+    expect(() => isolated.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'value_floor',
+      boxId: 'box-processing-01',
+      note: 'DEMO later value-floor claim must not reuse the scope',
+    })).toThrow(expect.objectContaining({
+      code: 'IDEMPOTENCY_CONFLICT',
+    }))
+    expect(isolated.repository.getSnapshot()).toEqual(before)
+  })
+
+  it('keeps an unresolved order-level scope on hold and blocks opening it', () => {
     let now = FIXED_NOW
     const scoped = new AppServices(new MemoryStorage(), () => now)
     scoped.repository.update((state) => {
@@ -1509,18 +3903,10 @@ describe('customer, payment, allocation and admin services', () => {
       note: 'DEMO sealed order-level overlap evidence',
     })
     now = '2026-07-28T05:00:00.000Z'
-    scoped.openBox('box-shipped-01')
-    const beforeExactRetry = structuredClone(scoped.repository.getSnapshot())
-    const exactRetry = scoped.claims.submit({
-      orderId: 'ord-shipped',
-      kind: 'non_delivery',
-      shipmentId: 'shp-shipped',
-      note: 'DEMO later exact scope overlaps the open claim',
-    })
-
-    expect(exactRetry).toMatchObject({ changed: false, data: { id: orderLevel.data.id } })
-    expect(exactRetry.data).not.toHaveProperty('shipmentCandidateIds')
-    expect(scoped.repository.getSnapshot()).toEqual(beforeExactRetry)
+    const beforeOpen = structuredClone(scoped.repository.getSnapshot())
+    expect(() => scoped.openBox('box-shipped-01')).toThrow(/financial hold/i)
+    expect(scoped.repository.getSnapshot()).toEqual(beforeOpen)
+    expect(scoped.repository.getSnapshot().claims[0].id).toBe(orderLevel.data.id)
     expect(scoped.repository.getSnapshot().claims).toHaveLength(1)
   })
 
@@ -1561,14 +3947,14 @@ describe('customer, payment, allocation and admin services', () => {
     services.claims.review(
       claim.id,
       'resolve',
-      'Support resolved fictional replacement path',
-      { outcome: 'replacement_authorized', reference: `DEMO-${claim.id.toUpperCase()}` },
+      'Support resolved a sound fictional no-remedy path',
+      { outcome: 'no_remedy', reference: `DEMO-${claim.id.toUpperCase()}` },
     )
     const snapshot = services.repository.getSnapshot()
     const resolved = snapshot.claims.find((entry) => entry.id === claim.id)!
     expect(resolved.status).toBe('resolved')
     expect(resolved).toMatchObject({
-      resolutionOutcome: 'replacement_authorized',
+      resolutionOutcome: 'no_remedy',
       resolutionReference: `DEMO-${claim.id.toUpperCase()}`,
     })
     expect(resolved.history.map((entry) => entry.status)).toEqual(['submitted', 'reviewing', 'approved', 'resolved'])
@@ -1605,17 +3991,32 @@ describe('customer, payment, allocation and admin services', () => {
       'resolve',
       'Replacement note is sufficiently descriptive',
       { outcome: 'replacement_authorized', reference: 'REAL-REF-001' },
-    )).toThrow(/DEMO-/i)
+    )).toThrow(expect.objectContaining({ code: 'TYPED_REMEDY_REQUIRED' }))
 
     services.payments.refund(
       'pay-delivered',
-      1000,
+      claim.requiredSettlementSen,
       'Confirmed audited refund for claim resolution',
       'req-claim-resolution-refund',
+      claim.id,
     )
     const refundEvent = services.repository.getSnapshot().payments
       .find((payment) => payment.id === 'pay-delivered')!
       .events.find((event) => event.requestId === 'req-claim-resolution-refund')!
+    const beforeWrongResolution = structuredClone(services.repository.getSnapshot())
+    expect(() => services.claims.review(
+      claim.id,
+      'resolve',
+      'Attempted mismatched refund resolution reference',
+      { outcome: 'refund_recorded', reference: 'evt-ord-delivered-success' },
+    )).toThrow(expect.objectContaining({ code: 'RESOLUTION_REFUND_LINK_MISMATCH' }))
+    expect(() => services.claims.review(
+      claim.id,
+      'resolve',
+      'Attempted replacement after linking an exact refund event',
+      { outcome: 'replacement_authorized', reference: `DEMO-${claim.id.toUpperCase()}` },
+    )).toThrow(expect.objectContaining({ code: 'RESOLUTION_REFUND_LINK_MISMATCH' }))
+    expect(services.repository.getSnapshot()).toEqual(beforeWrongResolution)
     const result = services.claims.review(
       claim.id,
       'resolve',
@@ -1623,15 +4024,708 @@ describe('customer, payment, allocation and admin services', () => {
       { outcome: 'refund_recorded', reference: refundEvent.id },
     )
     expect(result.data).toMatchObject({
+      linkedRefundEventId: refundEvent.id,
       status: 'resolved',
       resolutionOutcome: 'refund_recorded',
       resolutionReference: refundEvent.id,
     })
+    expect(refundEvent.refundIntent?.claimId).toBe(claim.id)
     expect(services.repository.getSnapshot().audits.find((audit) => audit.eventId === refundEvent.id)).toMatchObject({
       targetId: 'pay-delivered',
-      action: 'payment.partially_refunded',
+      action: 'payment.refunded',
     })
+    expect(services.repository.getSnapshot().audits.find((audit) =>
+      audit.eventId === refundEvent.id && audit.targetId === claim.id)).toMatchObject({
+        action: 'claim.refund_linked',
+        outcome: 'applied',
+      })
     expect(() => validateDemoState(services.repository.getSnapshot())).not.toThrow()
+  })
+
+  it('makes an exact linked-refund replay a no-op and treats claimId as part of identity', () => {
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const isolated = new AppServices(storage, () => FIXED_NOW)
+    isolated.auth.oneClick('customer')
+    const claim = isolated.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'damage',
+      shipmentId: 'shp-delivered',
+      note: 'DEMO linked refund replay evidence',
+    }).data
+    isolated.auth.oneClick('admin')
+    isolated.claims.review(claim.id, 'acknowledge', 'Acknowledged linked refund replay evidence')
+    isolated.claims.review(claim.id, 'approve', 'Approved linked refund replay evidence')
+    const first = isolated.payments.refund(
+      'pay-delivered',
+      claim.requiredSettlementSen,
+      'Confirmed exact claim-linked refund replay',
+      'req-linked-refund-replay',
+      claim.id,
+    )
+    const beforeReplay = structuredClone(isolated.repository.getSnapshot())
+    const writesBeforeReplay = storage.writes
+
+    const replay = isolated.payments.refund(
+      'pay-delivered',
+      claim.requiredSettlementSen,
+      'Confirmed exact claim-linked refund replay',
+      'req-linked-refund-replay',
+      claim.id,
+    )
+    expect(replay).toMatchObject({
+      changed: false,
+      payment: { id: first.payment.id },
+    })
+    expect(isolated.repository.getSnapshot()).toEqual(beforeReplay)
+    expect(storage.writes).toBe(writesBeforeReplay)
+
+    expect(() => isolated.payments.refund(
+      'pay-delivered',
+      claim.requiredSettlementSen,
+      'Confirmed exact claim-linked refund replay',
+      'req-linked-refund-replay',
+      `${claim.id}-changed`,
+    )).toThrow(expect.objectContaining({ code: 'IDEMPOTENCY_CONFLICT' }))
+    expect(isolated.repository.getSnapshot()).toEqual(beforeReplay)
+    expect(storage.writes).toBe(writesBeforeReplay)
+  })
+
+  it('keeps partial goodwill refunds unlinked and blocks them from resolving an approved claim', () => {
+    services.auth.oneClick('customer')
+    const claim = services.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'damage',
+      shipmentId: 'shp-delivered',
+      note: 'DEMO goodwill refund must not resolve this claim',
+    }).data
+    services.auth.oneClick('admin')
+    services.claims.review(claim.id, 'acknowledge', 'Acknowledged goodwill separation evidence')
+    services.claims.review(claim.id, 'approve', 'Approved goodwill separation evidence')
+    services.payments.refund(
+      'pay-delivered',
+      claim.requiredSettlementSen - 1,
+      'Confirmed unlinked goodwill refund',
+      'req-unlinked-goodwill-refund',
+    )
+    const event = services.repository.getSnapshot().payments
+      .find((payment) => payment.id === 'pay-delivered')!
+      .events.find((entry) => entry.requestId === 'req-unlinked-goodwill-refund')!
+    expect(event.refundIntent?.claimId).toBeUndefined()
+    expect(services.repository.getSnapshot().claims
+      .find((entry) => entry.id === claim.id)?.linkedRefundEventId).toBeUndefined()
+    const beforeResolution = structuredClone(services.repository.getSnapshot())
+
+    expect(() => services.claims.review(
+      claim.id,
+      'resolve',
+      'Attempted to resolve from unrelated goodwill refund',
+      { outcome: 'refund_recorded', reference: event.id },
+    )).toThrow(expect.objectContaining({ code: 'RESOLUTION_REFUND_LINK_MISMATCH' }))
+    expect(services.repository.getSnapshot()).toEqual(beforeResolution)
+  })
+
+  it('keeps dispute-origin refunds unlinked and valid', () => {
+    services.auth.oneClick('admin')
+    services.payments.dispute(
+      'pay-unopened',
+      'Confirmed dispute before unlinked dispute refund',
+      'evt-unlinked-dispute',
+    )
+    services.payments.resolveDispute(
+      'pay-unopened',
+      'refund',
+      'Confirmed dispute-origin full refund',
+      'evt-unlinked-dispute-refund',
+    )
+    const event = services.repository.getSnapshot().payments
+      .find((payment) => payment.id === 'pay-unopened')!
+      .events.find((entry) => entry.id === 'evt-unlinked-dispute-refund')!
+
+    expect(event.refundIntent).toMatchObject({
+      paymentId: 'pay-unopened',
+      reason: 'Confirmed dispute-origin full refund',
+    })
+    expect(event.refundIntent?.claimId).toBeUndefined()
+    expect(() => validateDemoState(services.repository.getSnapshot())).not.toThrow()
+  })
+
+  it.each(['submitted', 'reviewing', 'approved'] as const)(
+    'atomically blocks a generic full refund while a same-order claim is %s',
+    (status) => {
+      const isolated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+      isolated.auth.oneClick('customer')
+      const claim = isolated.claims.submit({
+        orderId: 'ord-delivered',
+        kind: 'damage',
+        shipmentId: 'shp-delivered',
+        note: `DEMO generic full refund ${status} blocker`,
+      }).data
+      isolated.auth.oneClick('admin')
+      if (status !== 'submitted') {
+        isolated.claims.review(
+          claim.id,
+          'acknowledge',
+          `Confirmed generic full refund ${status} review`,
+        )
+      }
+      if (status === 'approved') {
+        isolated.claims.review(
+          claim.id,
+          'approve',
+          'Confirmed generic full refund approved review',
+        )
+      }
+      const before = structuredClone(isolated.repository.getSnapshot())
+
+      expect(() => isolated.payments.refund(
+        'pay-delivered',
+        11_200,
+        `Attempted generic full refund with ${status} claim`,
+        `req-generic-full-${status}`,
+      )).toThrow(expect.objectContaining({
+        code: FULL_REFUND_REMEDY_CONFLICT_CODE,
+        message: expect.stringContaining(claim.id),
+      }))
+      expect(isolated.repository.getSnapshot()).toEqual(before)
+    },
+  )
+
+  it('atomically blocks generic full refunds for active RMA evidence', () => {
+    const isolated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    isolated.auth.oneClick('customer')
+    const claim = isolated.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'damage',
+      shipmentId: 'shp-delivered',
+      note: 'DEMO generic full refund RMA blocker',
+    }).data
+    approveClaim(isolated, claim.id)
+    isolated.claims.createRma(
+      claim.id,
+      'DEMO-RMA-FULL-REFUND-BLOCK',
+      'Confirmed generic full refund RMA blocker',
+    )
+    const before = structuredClone(isolated.repository.getSnapshot())
+
+    expect(() => isolated.payments.refund(
+      'pay-delivered',
+      11_200,
+      'Attempted generic full refund during RMA',
+      'req-generic-full-rma',
+    )).toThrow(expect.objectContaining({
+      code: FULL_REFUND_REMEDY_CONFLICT_CODE,
+      message: expect.stringContaining(claim.id),
+    }))
+    expect(isolated.repository.getSnapshot()).toEqual(before)
+  })
+
+  it('atomically blocks a generic full refund while a replacement is undelivered', () => {
+    const { services: isolated, claim } = physicalReplacementScenario('unfulfilled')
+    const before = structuredClone(isolated.repository.getSnapshot())
+
+    expect(() => isolated.payments.refund(
+      'pay-failed',
+      11_200,
+      'Attempted generic full refund with authorized replacement',
+      'req-generic-full-replacement-authorized',
+    )).toThrow(expect.objectContaining({
+      code: FULL_REFUND_REMEDY_CONFLICT_CODE,
+      message: expect.stringContaining(claim.id),
+    }))
+    expect(isolated.repository.getSnapshot()).toEqual(before)
+  })
+
+  it('allows an unlinked full refund after a replacement is delivered while preserving exact remedy evidence', () => {
+    const { services: isolated, claim, replacement } =
+      physicalReplacementScenario('delivered')
+    const before = structuredClone(isolated.repository.getSnapshot())
+    const claimBefore = structuredClone(before.claims.find((entry) =>
+      entry.id === claim.id)!)
+    const replacementBefore = structuredClone(before.shipments.find((entry) =>
+      entry.id === replacement.id)!)
+
+    const result = isolated.payments.refund(
+      'pay-failed',
+      11_200,
+      'Confirmed unlinked full refund after delivered replacement',
+      'req-generic-full-replacement-delivered',
+    )
+    const after = isolated.repository.getSnapshot()
+    const event = result.payment.events.find((entry) =>
+      entry.requestId === 'req-generic-full-replacement-delivered')!
+    const audit = after.audits.find((entry) => entry.eventId === event.id)!
+
+    expect(result.changed).toBe(true)
+    expect(result.payment).toMatchObject({
+      refundedSen: 11_200,
+      status: 'refunded',
+    })
+    expect(event.refundIntent).toMatchObject({
+      amountSen: 11_200,
+      paymentId: 'pay-failed',
+    })
+    expect(event.refundIntent?.claimId).toBeUndefined()
+    expect(after.claims.find((entry) => entry.id === claim.id)).toEqual(claimBefore)
+    expect(after.shipments.find((entry) => entry.id === replacement.id))
+      .toEqual(replacementBefore)
+    expect(audit.after).toMatchObject({
+      preservedCompletedClaimIds: [claim.id],
+      refundedSen: 11_200,
+      status: 'refunded',
+    })
+    expect(isolated.payments.refund(
+      'pay-failed',
+      11_200,
+      'Confirmed unlinked full refund after delivered replacement',
+      'req-generic-full-replacement-delivered',
+    )).toMatchObject({ changed: false })
+    expect(isolated.repository.getSnapshot()).toEqual(after)
+    expect(() => validateDemoState(after)).not.toThrow()
+  })
+
+  it('atomically blocks a generic full refund while a claim refund is linked but unresolved', () => {
+      const isolated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+      makeProcessingOrderSingleGroupedPhysicalShipment(isolated)
+      isolated.auth.oneClick('customer')
+      isolated.openBox('box-processing-02')
+      const claim = isolated.claims.submit({
+        orderId: 'ord-processing',
+        kind: 'value_floor',
+        boxId: 'box-processing-01',
+        note: 'DEMO generic full refund linked claim blocker',
+      }).data
+      approveClaim(isolated, claim.id)
+      isolated.payments.refund(
+        'pay-processing',
+        claim.requiredSettlementSen,
+        'Confirmed linked claim refund before generic full',
+        'req-claim-refund-linked',
+        claim.id,
+      )
+      const before = structuredClone(isolated.repository.getSnapshot())
+
+      expect(() => isolated.payments.refund(
+        'pay-processing',
+        10_600,
+        'Attempted generic full with linked claim refund',
+        'req-generic-full-refund-linked',
+      )).toThrow(expect.objectContaining({
+        code: FULL_REFUND_REMEDY_CONFLICT_CODE,
+        message: expect.stringContaining(claim.id),
+      }))
+      expect(isolated.repository.getSnapshot()).toEqual(before)
+  })
+
+  it('refunds only the unlinked remaining balance after an exact completed claim refund', () => {
+    const isolated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    makeProcessingOrderSingleGroupedPhysicalShipment(isolated)
+    isolated.auth.oneClick('customer')
+    isolated.openBox('box-processing-02')
+    const claim = isolated.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'value_floor',
+      boxId: 'box-processing-01',
+      note: 'DEMO completed claim refund before remaining payment refund',
+    }).data
+    approveClaim(isolated, claim.id)
+    isolated.payments.refund(
+      'pay-processing',
+      claim.requiredSettlementSen,
+      'Confirmed claim refund before remaining payment refund',
+      'req-claim-refund-completed',
+      claim.id,
+    )
+    const linkedEventId = isolated.repository.getSnapshot().claims
+      .find((entry) => entry.id === claim.id)!.linkedRefundEventId!
+    isolated.claims.review(
+      claim.id,
+      'resolve',
+      'Confirmed claim refund completion before remaining payment refund',
+      { outcome: 'refund_recorded', reference: linkedEventId },
+    )
+    const before = structuredClone(isolated.repository.getSnapshot())
+    const claimBefore = structuredClone(before.claims.find((entry) =>
+      entry.id === claim.id)!)
+
+    const result = isolated.payments.refund(
+      'pay-processing',
+      10_600,
+      'Confirmed remaining payment refund after completed claim remedy',
+      'req-generic-full-refund-completed',
+    )
+    const after = isolated.repository.getSnapshot()
+    const event = result.payment.events.find((entry) =>
+      entry.requestId === 'req-generic-full-refund-completed')!
+    const audit = after.audits.find((entry) => entry.eventId === event.id)!
+
+    expect(result.payment).toMatchObject({
+      refundedSen: 21_200,
+      status: 'refunded',
+    })
+    expect(event.refundIntent).toMatchObject({
+      amountSen: 10_600,
+      paymentId: 'pay-processing',
+    })
+    expect(event.refundIntent?.claimId).toBeUndefined()
+    expect(after.claims.find((entry) => entry.id === claim.id)).toEqual(claimBefore)
+    expect(audit.after).toMatchObject({
+      preservedCompletedClaimIds: [claim.id],
+      refundedSen: 21_200,
+      status: 'refunded',
+    })
+    expect(isolated.payments.refund(
+      'pay-processing',
+      10_600,
+      'Confirmed remaining payment refund after completed claim remedy',
+      'req-generic-full-refund-completed',
+    )).toMatchObject({ changed: false })
+    expect(isolated.repository.getSnapshot()).toEqual(after)
+    expect(() => validateDemoState(after)).not.toThrow()
+  })
+
+  it.each(['refund', 'replacement'] as const)(
+    'allows a customer-won dispute refund after a completed %s remedy without rewriting its evidence',
+    (completedKind) => {
+      const scenario = completedKind === 'replacement'
+        ? physicalReplacementScenario('delivered')
+        : undefined
+      const isolated = scenario?.services ??
+        new AppServices(new MemoryStorage(), () => FIXED_NOW)
+      let claim = scenario?.claim
+      const paymentId = scenario ? 'pay-failed' : 'pay-processing'
+
+      if (!claim) {
+        makeProcessingOrderSingleGroupedPhysicalShipment(isolated)
+        isolated.auth.oneClick('customer')
+        isolated.openBox('box-processing-02')
+        claim = isolated.claims.submit({
+          orderId: 'ord-processing',
+          kind: 'value_floor',
+          boxId: 'box-processing-01',
+          note: 'DEMO completed refund before customer-won dispute',
+        }).data
+        approveClaim(isolated, claim.id)
+        isolated.payments.refund(
+          paymentId,
+          claim.requiredSettlementSen,
+          'Confirmed completed claim refund before customer-won dispute',
+          'req-completed-refund-before-dispute',
+          claim.id,
+        )
+        const linkedEventId = isolated.repository.getSnapshot().claims
+          .find((entry) => entry.id === claim!.id)!.linkedRefundEventId!
+        isolated.claims.review(
+          claim.id,
+          'resolve',
+          'Confirmed completed refund evidence before customer-won dispute',
+          { outcome: 'refund_recorded', reference: linkedEventId },
+        )
+      }
+
+      isolated.auth.oneClick('admin')
+      isolated.payments.dispute(
+        paymentId,
+        `Confirmed dispute after completed ${completedKind} remedy`,
+        `evt-dispute-after-completed-${completedKind}`,
+      )
+      const before = structuredClone(isolated.repository.getSnapshot())
+      const paymentBefore = before.payments.find((entry) => entry.id === paymentId)!
+      const claimBefore = structuredClone(before.claims.find((entry) =>
+        entry.id === claim!.id)!)
+      const replacementBefore = scenario
+        ? structuredClone(before.shipments.find((entry) =>
+            entry.id === scenario.replacement.id)!)
+        : undefined
+      const remainingSen = paymentBefore.amountSen - paymentBefore.refundedSen
+
+      const result = isolated.payments.resolveDispute(
+        paymentId,
+        'refund',
+        `Confirmed customer-won refund after completed ${completedKind} remedy`,
+        `evt-dispute-refund-after-completed-${completedKind}`,
+      )
+      const after = isolated.repository.getSnapshot()
+      const event = result.payment.events.find((entry) =>
+        entry.id === `evt-dispute-refund-after-completed-${completedKind}`)!
+      const audit = after.audits.find((entry) => entry.eventId === event.id)!
+
+      expect(result).toMatchObject({
+        changed: true,
+        payment: {
+          refundedSen: paymentBefore.amountSen,
+          status: 'refunded',
+        },
+      })
+      expect(event.refundIntent).toMatchObject({
+        amountSen: remainingSen,
+        paymentId,
+      })
+      expect(event.refundIntent?.claimId).toBeUndefined()
+      expect(after.claims.find((entry) => entry.id === claim!.id))
+        .toEqual(claimBefore)
+      if (scenario) {
+        expect(after.shipments.find((entry) =>
+          entry.id === scenario.replacement.id)).toEqual(replacementBefore)
+      }
+      expect(audit.after).toMatchObject({
+        preservedCompletedClaimIds: [claim!.id],
+        status: 'refunded',
+      })
+      expect(isolated.payments.resolveDispute(
+        paymentId,
+        'refund',
+        `Confirmed customer-won refund after completed ${completedKind} remedy`,
+        `evt-dispute-refund-after-completed-${completedKind}`,
+      )).toMatchObject({ changed: false })
+      expect(isolated.repository.getSnapshot()).toEqual(after)
+      expect(() => validateDemoState(after)).not.toThrow()
+    },
+  )
+
+  it('atomically rejects a full remaining refund when completed and active claim histories are mixed', () => {
+    const isolated = new AppServices(new MemoryStorage(), incrementingClock())
+    makeProcessingOrderSingleGroupedPhysicalShipment(isolated)
+    isolated.auth.oneClick('customer')
+    isolated.openBox('box-processing-02')
+    const completed = isolated.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'value_floor',
+      boxId: 'box-processing-01',
+      note: 'DEMO completed disjoint scope before active blocker',
+    }).data
+    approveClaim(isolated, completed.id)
+    isolated.payments.refund(
+      'pay-processing',
+      completed.requiredSettlementSen,
+      'Confirmed completed disjoint claim refund',
+      'req-completed-disjoint-claim-refund',
+      completed.id,
+    )
+    const linkedEventId = isolated.repository.getSnapshot().claims
+      .find((entry) => entry.id === completed.id)!.linkedRefundEventId!
+    isolated.claims.review(
+      completed.id,
+      'resolve',
+      'Confirmed completed disjoint claim history',
+      { outcome: 'refund_recorded', reference: linkedEventId },
+    )
+    isolated.auth.oneClick('customer')
+    const active = isolated.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'value_floor',
+      boxId: 'box-processing-02',
+      note: 'DEMO active disjoint blocker after completed remedy',
+    }).data
+    isolated.auth.oneClick('admin')
+    const before = structuredClone(isolated.repository.getSnapshot())
+
+    expect(() => isolated.payments.refund(
+      'pay-processing',
+      10_600,
+      'Attempted remaining refund with an active mixed blocker',
+      'req-mixed-complete-active-full-refund',
+    )).toThrow(expect.objectContaining({
+      code: FULL_REFUND_REMEDY_CONFLICT_CODE,
+      message: expect.stringContaining(active.id),
+    }))
+    expect(isolated.repository.getSnapshot()).toEqual(before)
+  })
+
+  it.each(['rejected', 'no_remedy'] as const)(
+    'allows a generic full refund after a claim ends as %s without changing it',
+    (terminalClaimState) => {
+      const isolated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+      isolated.auth.oneClick('customer')
+      const claim = isolated.claims.submit({
+        orderId: 'ord-delivered',
+        kind: 'damage',
+        shipmentId: 'shp-delivered',
+        note: `DEMO generic full refund allowed ${terminalClaimState}`,
+      }).data
+      isolated.auth.oneClick('admin')
+      if (terminalClaimState === 'rejected') {
+        isolated.claims.review(
+          claim.id,
+          'reject',
+          'Confirmed rejected claim before generic full refund',
+        )
+      } else {
+        isolated.claims.review(
+          claim.id,
+          'acknowledge',
+          'Confirmed no-remedy acknowledgement before generic full refund',
+        )
+        isolated.claims.review(
+          claim.id,
+          'approve',
+          'Confirmed no-remedy approval before generic full refund',
+        )
+        isolated.claims.review(
+          claim.id,
+          'resolve',
+          'Confirmed no remedy before generic full refund completion',
+          { outcome: 'no_remedy', reference: 'DEMO-NO-REMEDY-FULL-REFUND' },
+        )
+      }
+      const claimBefore = structuredClone(
+        isolated.repository.getSnapshot().claims.find((entry) =>
+          entry.id === claim.id),
+      )
+
+      isolated.payments.refund(
+        'pay-delivered',
+        11_200,
+        `Confirmed generic full refund after ${terminalClaimState}`,
+        `req-generic-full-allowed-${terminalClaimState}`,
+      )
+
+      const snapshot = isolated.repository.getSnapshot()
+      expect(snapshot.payments.find((entry) => entry.id === 'pay-delivered'))
+        .toMatchObject({ status: 'refunded', refundedSen: 11_200 })
+      expect(snapshot.claims.find((entry) => entry.id === claim.id))
+        .toEqual(claimBefore)
+    },
+  )
+
+  it('blocks a disputed refund without touching the claim, then permits the merchant win', () => {
+    const isolated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    isolated.auth.oneClick('customer')
+    const claim = isolated.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'damage',
+      shipmentId: 'shp-delivered',
+      note: 'DEMO dispute refund full-payment blocker',
+    }).data
+    isolated.auth.oneClick('admin')
+    isolated.payments.dispute(
+      'pay-delivered',
+      'Confirmed dispute before guarded refund outcome',
+      'evt-dispute-full-refund-block',
+    )
+    const beforeRefund = structuredClone(isolated.repository.getSnapshot())
+
+    expect(() => isolated.payments.resolveDispute(
+      'pay-delivered',
+      'refund',
+      'Attempted disputed refund with open claim',
+      'evt-dispute-refund-blocked',
+    )).toThrow(expect.objectContaining({
+      code: FULL_REFUND_REMEDY_CONFLICT_CODE,
+      message: expect.stringContaining(claim.id),
+    }))
+    expect(isolated.repository.getSnapshot()).toEqual(beforeRefund)
+
+    isolated.payments.resolveDispute(
+      'pay-delivered',
+      'merchant_won',
+      'Confirmed merchant win preserves open claim',
+      'evt-dispute-merchant-win',
+    )
+    const afterWin = isolated.repository.getSnapshot()
+    expect(afterWin.payments.find((entry) => entry.id === 'pay-delivered')?.status)
+      .toBe('succeeded')
+    expect(afterWin.claims.find((entry) => entry.id === claim.id))
+      .toEqual(beforeRefund.claims.find((entry) => entry.id === claim.id))
+  })
+
+  it('blocks missing and cross-order claim links atomically', () => {
+    services.auth.oneClick('customer')
+    const claim = services.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'damage',
+      shipmentId: 'shp-delivered',
+      note: 'DEMO cross-order refund link evidence',
+    }).data
+    services.auth.oneClick('admin')
+    services.claims.review(claim.id, 'acknowledge', 'Acknowledged cross-order refund evidence')
+    services.claims.review(claim.id, 'approve', 'Approved cross-order refund evidence')
+    const before = structuredClone(services.repository.getSnapshot())
+
+    expect(() => services.payments.refund(
+      'pay-unopened',
+      1000,
+      'Attempted cross-order linked refund',
+      'req-cross-order-linked-refund',
+      claim.id,
+    )).toThrow(expect.objectContaining({ code: 'CLAIM_PAYMENT_MISMATCH' }))
+    expect(() => services.payments.refund(
+      'pay-delivered',
+      claim.requiredSettlementSen,
+      'Attempted missing claim-linked refund',
+      'req-missing-claim-linked-refund',
+      'clm-missing-refund-link',
+    )).toThrow(expect.objectContaining({ code: 'CLAIM_MISSING' }))
+    expect(services.repository.getSnapshot()).toEqual(before)
+  })
+
+  it.each(['submitted', 'reviewing', 'rejected', 'resolved'] as const)(
+    'blocks a %s claim from being linked to a refund without any partial write',
+    (status) => {
+      const isolated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+      isolated.auth.oneClick('customer')
+      const claim = isolated.claims.submit({
+        orderId: 'ord-delivered',
+        kind: 'damage',
+        shipmentId: 'shp-delivered',
+        note: `DEMO ${status} claim cannot create a refund link`,
+      }).data
+      isolated.auth.oneClick('admin')
+      if (status === 'reviewing') {
+        isolated.claims.review(claim.id, 'acknowledge', 'Acknowledged non-approved link evidence')
+      } else if (status === 'rejected') {
+        isolated.claims.review(claim.id, 'reject', 'Rejected non-approved link evidence')
+      } else if (status === 'resolved') {
+        isolated.claims.review(claim.id, 'acknowledge', 'Acknowledged resolved link evidence')
+        isolated.claims.review(claim.id, 'approve', 'Approved resolved link evidence')
+        isolated.claims.review(
+          claim.id,
+          'resolve',
+          'Resolved through a sufficiently descriptive no-remedy path',
+          { outcome: 'no_remedy', reference: `DEMO-${claim.id.toUpperCase()}` },
+        )
+      }
+      const before = structuredClone(isolated.repository.getSnapshot())
+
+      expect(() => isolated.payments.refund(
+        'pay-delivered',
+        1000,
+        `Attempted ${status} claim-linked refund`,
+        `req-${status}-claim-linked-refund`,
+        claim.id,
+      )).toThrow(expect.objectContaining({ code: 'CLAIM_NOT_APPROVED' }))
+      expect(isolated.repository.getSnapshot()).toEqual(before)
+    },
+  )
+
+  it('blocks a second refund event for the same approved claim atomically', () => {
+    services.auth.oneClick('customer')
+    const claim = services.claims.submit({
+      orderId: 'ord-delivered',
+      kind: 'damage',
+      shipmentId: 'shp-delivered',
+      note: 'DEMO one refund event per approved claim',
+    }).data
+    services.auth.oneClick('admin')
+    services.claims.review(claim.id, 'acknowledge', 'Acknowledged single linked event evidence')
+    services.claims.review(claim.id, 'approve', 'Approved single linked event evidence')
+    services.payments.refund(
+      'pay-delivered',
+      claim.requiredSettlementSen,
+      'Confirmed first claim-linked refund',
+      'req-first-claim-linked-refund',
+      claim.id,
+    )
+    const beforeSecond = structuredClone(services.repository.getSnapshot())
+
+    expect(() => services.payments.refund(
+      'pay-delivered',
+      claim.requiredSettlementSen,
+      'Attempted second claim-linked refund',
+      'req-second-claim-linked-refund',
+      claim.id,
+    )).toThrow(expect.objectContaining({ code: 'CLAIM_REFUND_ALREADY_LINKED' }))
+    expect(services.repository.getSnapshot()).toEqual(beforeSecond)
   })
 
   it('treats a refund request identity as global across payments', () => {
@@ -1820,8 +4914,8 @@ describe('customer, payment, allocation and admin services', () => {
     services.claims.review(
       resolved.id,
       'resolve',
-      'Confirmed resolved metric fictional replacement',
-      { outcome: 'replacement_authorized', reference: `DEMO-${resolved.id.toUpperCase()}` },
+      'Confirmed resolved metric fictional no-remedy path',
+      { outcome: 'no_remedy', reference: `DEMO-${resolved.id.toUpperCase()}` },
     )
     expect(services.admin.dashboard().openClaims).toBe(0)
     expect(() => services.admin.changeOrderStatus(
@@ -1846,7 +4940,7 @@ describe('customer, payment, allocation and admin services', () => {
       before: { carrier: 'Demo Bulky Freight' },
       after: { trackingNumber: 'DEMO-TRACK-9001' },
     })
-    expect(() => services.fulfilment.setTracking('shp-digital', 'Real Courier', 'REAL-1234', 'Unsafe tracking test')).toThrow(/clearly fictional/i)
+    expect(() => services.fulfilment.setTracking('shp-digital', 'Real Courier', 'REAL-1234', 'Unsafe tracking test')).toThrow(/digital fulfilment never uses editable/i)
     expect(() => services.fulfilment.setTracking('shp-shipped', 'Demo Express', 'DEMO-LOCKED-1', 'Locked tracking test')).toThrow(/lock after shipment/i)
   })
 
@@ -1862,6 +4956,11 @@ describe('customer, payment, allocation and admin services', () => {
     expect(snapshot.series.find((entry) => entry.status === 'draft')?.draftPrizes?.[0].name).toBe('Draft Maggi Demo')
     expect(snapshot.series.find((entry) => entry.status === 'draft')?.draftPrizes?.[0].shortName)
       .toBe(originalShortName)
+    const edited = snapshot.series.find((entry) => entry.status === 'draft')!.draftPrizes![0]
+    expect(edited.odds).toBe(exactOddsLabel(
+      edited.allocation,
+      snapshot.series.find((entry) => entry.status === 'draft')!.allocationTotal,
+    ))
     expect(() => services.admin.editDraftPrize('maggi', 'Bad floor', 9_999)).toThrow(/RM100 floor/i)
 
     for (const name of ['', '   ', '\n\t']) {
@@ -1931,6 +5030,29 @@ describe('customer, payment, allocation and admin services', () => {
     }
   })
 
+  it('returns an isolated mutable admin snapshot instead of the live frozen repository object', () => {
+    const storage = new CountingStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const isolated = new AppServices(storage, () => FIXED_NOW)
+    isolated.auth.oneClick('admin')
+    const live = isolated.repository.getSnapshot()
+    const storedBefore = storage.getItem(STORAGE_KEY)
+    const clone = isolated.admin.snapshot()
+
+    expect(clone).toEqual(live)
+    expect(clone).not.toBe(live)
+    expect(clone.orders[0]).not.toBe(live.orders[0])
+    clone.orders[0].snapshot.address.city = 'Changed only in admin export'
+    clone.audits[0].reason = 'Changed only in admin export'
+    clone.audits.splice(0, 1)
+
+    expect(isolated.repository.getSnapshot()).toBe(live)
+    expect(live.orders[0].snapshot.address.city).toBe('Kuala Lumpur')
+    expect(live.audits[0].reason).toBe('Loaded fictional public demo data')
+    expect(live.auditCount).toBe(live.audits.length)
+    expect(storage.getItem(STORAGE_KEY)).toBe(storedBefore)
+  })
+
   it('blocks lower staff from invoking another department service action', () => {
     const pendingOrder = checkout(services)
     const switchTo = (userId: string) => services.repository.update((state) => { state.sessionUserId = userId })
@@ -1972,6 +5094,877 @@ describe('customer, payment, allocation and admin services', () => {
       action: 'user.reactivated',
       targetId: 'usr-suspended',
     })
+  })
+
+  it('allows overlapping cross-kind complaint records before either holds a remedy entitlement', () => {
+    const { services: isolated, damage, valueFloor } = overlappingCrossKindClaims()
+    const snapshot = isolated.repository.getSnapshot()
+
+    expect(snapshot.claims.filter((claim) =>
+      [damage.id, valueFloor.id].includes(claim.id))).toHaveLength(2)
+    expect(damage.remedyBoxIds).toEqual(['box-delivered-01'])
+    expect(valueFloor.remedyBoxIds).toEqual(damage.remedyBoxIds)
+    expect([damage.remedyState, valueFloor.remedyState]).toEqual(['none', 'none'])
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+  })
+
+  it.each([
+    ['damage', 'value_floor'],
+    ['value_floor', 'damage'],
+  ] as const)(
+    'blocks a second overlapping cross-kind replacement and RMA when %s is authorized before %s',
+    (firstKind, secondKind) => {
+      const { services: isolated, damage, valueFloor } = overlappingCrossKindClaims()
+      const claims = { damage, value_floor: valueFloor }
+      approveClaim(isolated, claims[firstKind].id)
+      approveClaim(isolated, claims[secondKind].id)
+      completeRmaForReplacement(isolated, claims[firstKind].id, firstKind)
+      const replacement = isolated.claims.authorizeReplacement(
+        claims[firstKind].id,
+        `Confirmed ${firstKind} overlapping replacement authorization`,
+      ).data
+      const beforeConflict = structuredClone(isolated.repository.getSnapshot())
+
+      expect(() => isolated.claims.authorizeReplacement(
+        claims[secondKind].id,
+        `Attempted ${secondKind} overlapping replacement authorization`,
+      )).toThrow(expect.objectContaining({ code: 'REMEDY_SCOPE_CONFLICT' }))
+      expect(isolated.repository.getSnapshot()).toEqual(beforeConflict)
+      expect(() => isolated.claims.createRma(
+        claims[secondKind].id,
+        `DEMO-RMA-${rmaReferenceKind(secondKind)}-AFTER-REPLACEMENT`,
+        `Attempted ${secondKind} overlapping RMA after replacement`,
+      )).toThrow(expect.objectContaining({ code: 'REMEDY_SCOPE_CONFLICT' }))
+      expect(isolated.repository.getSnapshot()).toEqual(beforeConflict)
+      expect(beforeConflict.shipments.filter((shipment) =>
+        shipment.purpose === 'replacement')).toEqual([
+        expect.objectContaining({
+          id: replacement.id,
+          sourceClaimId: claims[firstKind].id,
+          boxIds: ['box-delivered-01'],
+        }),
+      ])
+    },
+  )
+
+  it.each([
+    ['damage', 'value_floor'],
+    ['value_floor', 'damage'],
+  ] as const)(
+    'lets the first %s RMA reserve overlapping scope and blocks the %s RMA, refund, and replacement',
+    (firstKind, secondKind) => {
+      const { services: isolated, damage, valueFloor } = overlappingCrossKindClaims()
+      const claims = { damage, value_floor: valueFloor }
+      approveClaim(isolated, claims[firstKind].id)
+      approveClaim(isolated, claims[secondKind].id)
+
+      expect(isolated.claims.createRma(
+        claims[firstKind].id,
+        `DEMO-RMA-${rmaReferenceKind(firstKind)}-FIRST`,
+        `Confirmed ${firstKind} overlapping RMA reservation`,
+      )).toMatchObject({
+        changed: true,
+        data: {
+          id: claims[firstKind].id,
+          remedyState: 'rma_created',
+        },
+      })
+
+      const expectConflictWithoutStateChange = (attempt: () => unknown) => {
+        const before = structuredClone(isolated.repository.getSnapshot())
+        expect(attempt).toThrow(
+          expect.objectContaining({ code: 'REMEDY_SCOPE_CONFLICT' }),
+        )
+        expect(isolated.repository.getSnapshot()).toEqual(before)
+      }
+
+      expectConflictWithoutStateChange(() => isolated.claims.createRma(
+        claims[secondKind].id,
+        `DEMO-RMA-${rmaReferenceKind(secondKind)}-SECOND`,
+        `Attempted ${secondKind} overlapping RMA reservation`,
+      ))
+      expectConflictWithoutStateChange(() => isolated.payments.refund(
+        'pay-delivered',
+        claims[secondKind].requiredSettlementSen,
+        `Attempted ${secondKind} refund after overlapping RMA`,
+        `req-${secondKind}-refund-after-overlapping-rma`,
+        claims[secondKind].id,
+      ))
+      expectConflictWithoutStateChange(() => isolated.claims.authorizeReplacement(
+        claims[secondKind].id,
+        `Attempted ${secondKind} replacement after overlapping RMA`,
+      ))
+    },
+  )
+
+  it('blocks an overlapping claim refund after another claim authorizes a replacement', () => {
+    const { services: isolated, damage, valueFloor } = overlappingCrossKindClaims()
+    approveClaim(isolated, damage.id)
+    approveClaim(isolated, valueFloor.id)
+    completeRmaForReplacement(isolated, damage.id, 'damage')
+    isolated.claims.authorizeReplacement(
+      damage.id,
+      'Confirmed damage replacement before overlapping claim refund',
+    )
+    const beforeConflict = structuredClone(isolated.repository.getSnapshot())
+
+    expect(() => isolated.payments.refund(
+      'pay-delivered',
+      valueFloor.requiredSettlementSen,
+      'Attempted overlapping value-floor claim refund',
+      'req-overlap-replacement-then-refund',
+      valueFloor.id,
+    )).toThrow(expect.objectContaining({ code: 'REMEDY_SCOPE_CONFLICT' }))
+    expect(isolated.repository.getSnapshot()).toEqual(beforeConflict)
+  })
+
+  it('blocks a claim-linked full refund when another same-order claim is uncoordinated', () => {
+    const { services: isolated, damage, valueFloor } = overlappingCrossKindClaims()
+    approveClaim(isolated, damage.id)
+    approveClaim(isolated, valueFloor.id)
+    const beforeConflict = structuredClone(isolated.repository.getSnapshot())
+
+    expect(() => isolated.payments.refund(
+      'pay-delivered',
+      damage.requiredSettlementSen,
+      'Confirmed damage claim refund before overlapping replacement',
+      'req-overlap-refund-then-replacement',
+      damage.id,
+    )).toThrow(expect.objectContaining({
+      code: FULL_REFUND_REMEDY_CONFLICT_CODE,
+      message: expect.stringContaining(valueFloor.id),
+    }))
+    expect(isolated.repository.getSnapshot()).toEqual(beforeConflict)
+  })
+
+  it('snapshots disjoint value-floor sibling scopes and resolves only the delivered replacement box', () => {
+    const isolated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    makeProcessingOrderSingleGroupedPhysicalShipment(isolated)
+    isolated.auth.oneClick('customer')
+    isolated.openBox('box-processing-02')
+    const first = isolated.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'value_floor',
+      boxId: 'box-processing-01',
+      note: 'DEMO first grouped sibling value-floor evidence',
+    }).data
+    const second = isolated.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'value_floor',
+      boxId: 'box-processing-02',
+      note: 'DEMO second grouped sibling value-floor evidence',
+    }).data
+
+    expect(first).toMatchObject({
+      remedyBoxIds: ['box-processing-01'],
+      requiredSettlementSen: 10_600,
+    })
+    expect(second).toMatchObject({
+      remedyBoxIds: ['box-processing-02'],
+      requiredSettlementSen: 10_600,
+    })
+    expect(first.requiredSettlementSen + second.requiredSettlementSen).toBe(21_200)
+
+    approveClaim(isolated, first.id)
+    approveClaim(isolated, second.id)
+    const firstReplacement = isolated.claims.authorizeReplacement(
+      first.id,
+      'Confirmed first disjoint sibling replacement',
+    ).data
+    const secondReplacement = isolated.claims.authorizeReplacement(
+      second.id,
+      'Confirmed second disjoint sibling replacement',
+    ).data
+    expect(firstReplacement.boxIds).toEqual(['box-processing-01'])
+    expect(secondReplacement.boxIds).toEqual(['box-processing-02'])
+    for (const next of ['picking', 'packed', 'label_created', 'shipped', 'delivered'] as const) {
+      isolated.fulfilment.advance(
+        firstReplacement.id,
+        next,
+        `Confirmed first sibling replacement ${next}`,
+      )
+    }
+
+    const snapshot = isolated.repository.getSnapshot()
+    expect(snapshot.shipments.find((entry) => entry.id === 'shp-processing')?.boxIds)
+      .toEqual(['box-processing-01', 'box-processing-02'])
+    expect(snapshot.boxes.find((entry) => entry.id === 'box-processing-01')?.status)
+      .toBe('fulfilled')
+    expect(snapshot.boxes.find((entry) => entry.id === 'box-processing-02')?.status)
+      .toBe('on_hold')
+    expect(snapshot.orders.find((entry) => entry.id === 'ord-processing')?.status)
+      .toBe('partially_fulfilled')
+    expect(snapshot.claims.find((entry) => entry.id === second.id)).toMatchObject({
+      status: 'approved',
+      remedyState: 'replacement_authorized',
+    })
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+  })
+
+  it('snapshots an exact grouped delivery claim as the full original shipment box scope', () => {
+    const isolated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    makeProcessingOrderSingleGroupedPhysicalShipment(isolated)
+    isolated.auth.oneClick('customer')
+    isolated.openBox('box-processing-02')
+    isolated.auth.oneClick('admin')
+    for (const next of ['packed', 'label_created', 'shipped', 'failed_delivery'] as const) {
+      isolated.fulfilment.advance(
+        'shp-processing',
+        next,
+        `Confirmed grouped delivery evidence ${next}`,
+      )
+    }
+    isolated.auth.oneClick('customer')
+    const claim = isolated.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'non_delivery',
+      shipmentId: 'shp-processing',
+      note: 'DEMO grouped delivery exact original scope evidence',
+    }).data
+
+    expect(claim.remedyBoxIds).toEqual([
+      'box-processing-01',
+      'box-processing-02',
+    ])
+    expect(claim.requiredSettlementSen).toBe(21_200)
+    approveClaim(isolated, claim.id)
+    const replacement = isolated.claims.authorizeReplacement(
+      claim.id,
+      'Confirmed grouped delivery exact replacement',
+    ).data
+    expect(replacement.boxIds).toEqual(claim.remedyBoxIds)
+    expect(replacement).toMatchObject({
+      kind: 'BULKY',
+      insured: false,
+      signatureRequired: false,
+      replacementForShipmentId: 'shp-processing',
+    })
+  })
+
+  it('preserves grouped original insurance and signature flags on a one-box value-floor replacement', () => {
+    const isolated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    makeProcessingOrderSingleGroupedPhysicalShipment(isolated)
+    isolated.repository.update((state) => {
+      const first = state.boxes.find((entry) => entry.id === 'box-processing-01')!
+      const second = state.boxes.find((entry) => entry.id === 'box-processing-02')!
+      const inventory = state.series[0].inventory
+      inventory.find((entry) => entry.prizeId === first.prizeId)!.assigned -= 1
+      inventory.find((entry) => entry.prizeId === second.prizeId)!.assigned -= 1
+      first.prizeId = 'airpods'
+      second.prizeId = 'air-fryer'
+      inventory.find((entry) => entry.prizeId === first.prizeId)!.assigned += 1
+      inventory.find((entry) => entry.prizeId === second.prizeId)!.assigned += 1
+      const original = state.shipments.find((entry) => entry.id === 'shp-processing')!
+      original.kind = 'PARCEL'
+      original.carrier = 'Demo Express'
+      original.insured = true
+      original.signatureRequired = true
+    })
+    isolated.auth.oneClick('customer')
+    isolated.openBox('box-processing-02')
+    const claim = isolated.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'value_floor',
+      boxId: 'box-processing-02',
+      note: 'DEMO one-box replacement preserves grouped original flags',
+    }).data
+    approveClaim(isolated, claim.id)
+
+    const replacement = isolated.claims.authorizeReplacement(
+      claim.id,
+      'Confirmed one-box grouped flag preservation',
+    ).data
+
+    expect(replacement).toMatchObject({
+      boxIds: ['box-processing-02'],
+      kind: 'PARCEL',
+      insured: true,
+      signatureRequired: true,
+      replacementForShipmentId: 'shp-processing',
+    })
+    expect(() => validateDemoState(isolated.repository.getSnapshot())).not.toThrow()
+  })
+
+  it('keeps ordinary partial refunds ledger-only and rejects under-settled claim links atomically', () => {
+    const isolated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    makeProcessingOrderSingleGroupedPhysicalShipment(isolated)
+    isolated.auth.oneClick('customer')
+    isolated.openBox('box-processing-02')
+    const claim = isolated.claims.submit({
+      orderId: 'ord-processing',
+      kind: 'value_floor',
+      boxId: 'box-processing-01',
+      note: 'DEMO exact settlement and ledger separation evidence',
+    }).data
+    approveClaim(isolated, claim.id)
+    isolated.payments.refund(
+      'pay-processing',
+      1000,
+      'Confirmed ordinary ledger-only partial refund',
+      'req-ledger-only-partial',
+    )
+    expect(isolated.repository.getSnapshot().claims.find((entry) => entry.id === claim.id))
+      .toMatchObject({ status: 'approved', remedyState: 'none' })
+
+    for (const amountSen of [1, 1000]) {
+      const before = structuredClone(isolated.repository.getSnapshot())
+      expect(() => isolated.payments.refund(
+        'pay-processing',
+        amountSen,
+        `Attempted under-settled claim link ${amountSen}`,
+        `req-under-settled-${amountSen}`,
+        claim.id,
+      )).toThrow(expect.objectContaining({ code: 'CLAIM_SETTLEMENT_MISMATCH' }))
+      expect(isolated.repository.getSnapshot()).toEqual(before)
+    }
+
+    isolated.payments.refund(
+      'pay-processing',
+      claim.requiredSettlementSen,
+      'Confirmed exact snapshotted claim settlement',
+      'req-exact-scope-settlement',
+      claim.id,
+    )
+    let snapshot = isolated.repository.getSnapshot()
+    const linked = snapshot.claims.find((entry) => entry.id === claim.id)!
+    expect(linked).toMatchObject({
+      status: 'approved',
+      remedyState: 'refund_linked',
+      acceptedSettlementSen: 10_600,
+      settlementPolicy: 'exact_scope',
+    })
+    expect(snapshot.payments.find((entry) => entry.id === 'pay-processing')).toMatchObject({
+      refundedSen: 11_600,
+      status: 'partially_refunded',
+    })
+    isolated.claims.review(
+      claim.id,
+      'resolve',
+      'Confirmed exact scoped settlement completion',
+      { outcome: 'refund_recorded', reference: linked.linkedRefundEventId! },
+    )
+    snapshot = isolated.repository.getSnapshot()
+    expect(snapshot.boxes.find((entry) => entry.id === 'box-processing-01')?.status)
+      .toBe('fulfilled')
+    expect(snapshot.boxes.find((entry) => entry.id === 'box-processing-02')?.status)
+      .toBe('opened')
+    expect(snapshot.orders.find((entry) => entry.id === 'ord-processing')?.status)
+      .toBe('partially_fulfilled')
+  })
+
+  it('coordinates two disjoint RM106 claim refunds to complete one RM212 payment', () => {
+    const isolated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+    makeProcessingOrderSingleGroupedPhysicalShipment(isolated)
+    isolated.auth.oneClick('customer')
+    isolated.openBox('box-processing-02')
+    const claims = [
+      isolated.claims.submit({
+        orderId: 'ord-processing',
+        kind: 'value_floor',
+        boxId: 'box-processing-01',
+        note: 'DEMO first disjoint coordinated refund claim',
+      }).data,
+      isolated.claims.submit({
+        orderId: 'ord-processing',
+        kind: 'value_floor',
+        boxId: 'box-processing-02',
+        note: 'DEMO second disjoint coordinated refund claim',
+      }).data,
+    ]
+    for (const claim of claims) approveClaim(isolated, claim.id)
+
+    for (const [index, claim] of claims.entries()) {
+      isolated.payments.refund(
+        'pay-processing',
+        10_600,
+        `Confirmed disjoint coordinated claim refund ${index + 1}`,
+        `req-disjoint-coordinated-refund-${index + 1}`,
+        claim.id,
+      )
+    }
+
+    const snapshot = isolated.repository.getSnapshot()
+    expect(snapshot.payments.find((entry) => entry.id === 'pay-processing'))
+      .toMatchObject({ status: 'refunded', refundedSen: 21_200 })
+    expect(claims.map((claim) =>
+      snapshot.claims.find((entry) => entry.id === claim.id))).toEqual([
+        expect.objectContaining({
+          remedyState: 'refund_linked',
+          acceptedSettlementSen: 10_600,
+          settlementPolicy: 'exact_scope',
+        }),
+        expect.objectContaining({
+          remedyState: 'refund_linked',
+          acceptedSettlementSen: 10_600,
+          settlementPolicy: 'exact_scope',
+        }),
+      ])
+    expect(() => validateDemoState(snapshot)).not.toThrow()
+  })
+
+  it.each(['lost', 'returned'] as const)(
+    'caps a terminal physical %s replacement fallback at its required or remaining amount',
+    (status) => {
+      const scenario = physicalReplacementScenario(status)
+      const { services: isolated, claim, replacement } = scenario
+      if (status === 'returned') {
+        isolated.payments.refund(
+          'pay-failed',
+          1000,
+          'Confirmed prior ordinary partial before returned fallback',
+          'req-returned-fallback-prior-partial',
+        )
+      }
+      const payment = isolated.repository.getSnapshot().payments
+        .find((entry) => entry.id === 'pay-failed')!
+      const remainingSen = payment.amountSen - payment.refundedSen
+      if (status === 'returned') expect(remainingSen).toBe(10_200)
+      const result = isolated.payments.refund(
+        payment.id,
+        remainingSen,
+        `Confirmed terminal physical ${status} replacement fallback`,
+        `req-physical-${status}-fallback`,
+        claim.id,
+      )
+      const snapshot = isolated.repository.getSnapshot()
+      const storedClaim = snapshot.claims.find((entry) => entry.id === claim.id)!
+
+      expect(result.changed).toBe(true)
+      expect(snapshot.shipments.find((entry) => entry.id === replacement.id)?.status)
+        .toBe(status)
+      expect(storedClaim).toMatchObject({
+        status: 'approved',
+        remedyState: 'refund_linked',
+        replacementShipmentId: replacement.id,
+        acceptedSettlementSen: remainingSen,
+        settlementPolicy: 'terminal_replacement_fallback',
+      })
+      expect(snapshot.payments.find((entry) => entry.id === payment.id))
+        .toMatchObject({ status: 'refunded', refundedSen: 11_200 })
+      expect(snapshot.shipments.find((entry) => entry.id === 'shp-failed')?.status)
+        .toBe('failed_delivery')
+      expect(() => validateDemoState(snapshot)).not.toThrow()
+    },
+  )
+
+  it('caps a two-box terminal digital fallback at RM106 with exact no-write replay', () => {
+    for (const amountSen of [10_599, 10_601]) {
+      const rejected = failedDigitalReplacementScenario()
+      const before = structuredClone(rejected.services.repository.getSnapshot())
+      expect(() => rejected.services.payments.refund(
+        'pay-processing',
+        amountSen,
+        `Attempted one-sen terminal digital mismatch ${amountSen}`,
+        `req-digital-fallback-mismatch-${amountSen}`,
+        rejected.claim.id,
+      )).toThrow(expect.objectContaining({ code: 'CLAIM_SETTLEMENT_MISMATCH' }))
+      expect(rejected.services.repository.getSnapshot()).toEqual(before)
+    }
+
+    const storage = new CountingStorage()
+    const scenario = failedDigitalReplacementScenario(storage)
+    const { services: isolated, claim, replacement } = scenario
+    const beforeRefund = isolated.repository.getSnapshot()
+    const payment = beforeRefund.payments.find((entry) => entry.id === 'pay-processing')!
+    expect(claim.requiredSettlementSen).toBe(10_600)
+    expect(payment.amountSen).toBe(21_200)
+
+    const first = isolated.payments.refund(
+      payment.id,
+      claim.requiredSettlementSen,
+      'Confirmed capped terminal digital replacement fallback',
+      'req-digital-fallback-exact',
+      claim.id,
+    )
+    const afterFirst = structuredClone(isolated.repository.getSnapshot())
+    const writesBeforeReplay = storage.writes
+    const replay = isolated.payments.refund(
+      payment.id,
+      claim.requiredSettlementSen,
+      'Confirmed capped terminal digital replacement fallback',
+      'req-digital-fallback-exact',
+      claim.id,
+    )
+    expect(replay).toMatchObject({ changed: false, payment: { id: first.payment.id } })
+    expect(isolated.repository.getSnapshot()).toEqual(afterFirst)
+    expect(storage.writes).toBe(writesBeforeReplay)
+    expect(afterFirst.payments.find((entry) => entry.id === payment.id)).toMatchObject({
+      refundedSen: 10_600,
+      status: 'partially_refunded',
+    })
+    expect(afterFirst.claims.find((entry) => entry.id === claim.id)).toMatchObject({
+      status: 'approved',
+      remedyState: 'refund_linked',
+      acceptedSettlementSen: 10_600,
+      settlementPolicy: 'terminal_replacement_fallback',
+      replacementShipmentId: replacement.id,
+    })
+    for (const [amountSen, reason, changedClaimId] of [
+      [10_599, 'Confirmed capped terminal digital replacement fallback', claim.id],
+      [10_600, 'Changed terminal digital replacement fallback reason', claim.id],
+      [10_600, 'Confirmed capped terminal digital replacement fallback', `${claim.id}-other`],
+    ] as const) {
+      expect(() => isolated.payments.refund(
+        payment.id,
+        amountSen,
+        reason,
+        'req-digital-fallback-exact',
+        changedClaimId,
+      )).toThrow(expect.objectContaining({ code: 'IDEMPOTENCY_CONFLICT' }))
+    }
+    const eventId = afterFirst.claims.find((entry) => entry.id === claim.id)!
+      .linkedRefundEventId!
+    isolated.claims.review(
+      claim.id,
+      'resolve',
+      'Confirmed terminal digital fallback audited completion',
+      { outcome: 'refund_recorded', reference: eventId },
+    )
+    expect(isolated.repository.getSnapshot().claims.find((entry) => entry.id === claim.id))
+      .toMatchObject({
+        status: 'resolved',
+        remedyState: 'refund_completed',
+        resolutionReference: eventId,
+      })
+  })
+
+  it.each([
+    'unfulfilled',
+    'picking',
+    'packed',
+    'label_created',
+    'shipped',
+    'failed_delivery',
+    'cancelled',
+    'delivered',
+  ] as const)(
+    'rejects replacement refund fallback from %s without changing stored evidence',
+    (status) => {
+      const scenario = physicalReplacementScenario(status)
+      const { services: isolated, claim } = scenario
+      const payment = isolated.repository.getSnapshot().payments
+        .find((entry) => entry.id === 'pay-failed')!
+      const before = structuredClone(isolated.repository.getSnapshot())
+      expect(() => isolated.payments.refund(
+        payment.id,
+        payment.amountSen - payment.refundedSen,
+        `Attempted invalid physical ${status} replacement fallback`,
+        `req-invalid-${status}-fallback`,
+        claim.id,
+      )).toThrow()
+      expect(isolated.repository.getSnapshot()).toEqual(before)
+    },
+  )
+
+  it('rolls back a terminal replacement fallback when storage persistence fails and retries safely', () => {
+    const storage = new FailNextWriteStorage()
+    storage.seed(STORAGE_KEY, JSON.stringify(createDemoState()))
+    const scenario = physicalReplacementScenario('lost', storage)
+    const { services: isolated, claim } = scenario
+    const payment = isolated.repository.getSnapshot().payments
+      .find((entry) => entry.id === 'pay-failed')!
+    const before = structuredClone(isolated.repository.getSnapshot())
+    const rawBefore = storage.getItem(STORAGE_KEY)
+    storage.failNextWrite = true
+
+    expect(() => isolated.payments.refund(
+      payment.id,
+      payment.amountSen,
+      'Confirmed storage rollback terminal fallback',
+      'req-terminal-fallback-storage',
+      claim.id,
+    )).toThrow(expect.objectContaining({ code: 'STORAGE_WRITE_FAILED' }))
+    expect(isolated.repository.getSnapshot()).toEqual(before)
+    expect(storage.getItem(STORAGE_KEY)).toBe(rawBefore)
+
+    expect(isolated.payments.refund(
+      payment.id,
+      payment.amountSen,
+      'Confirmed storage rollback terminal fallback',
+      'req-terminal-fallback-storage',
+      claim.id,
+    ).changed).toBe(true)
+  })
+
+  it.each(['unfulfilled', 'issued'] as const)(
+    'cancels and safely requeues disputed unsent digital work from %s',
+    (status) => {
+      const isolated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+      isolated.auth.oneClick('admin')
+      if (status === 'issued') {
+        isolated.fulfilment.advance(
+          'shp-digital',
+          'issued',
+          'Confirmed disputed digital issue before stop',
+        )
+      }
+      isolated.payments.dispute(
+        'pay-processing',
+        `Confirmed disputed digital ${status} stop`,
+        `evt-digital-${status}-stop`,
+      )
+      let snapshot = isolated.repository.getSnapshot()
+      const stopped = snapshot.shipments.find((entry) => entry.id === 'shp-digital')!
+      expect(stopped.status).toBe('cancelled')
+      expect(stopped.timeline.at(-1)).toMatchObject({
+        status: 'cancelled',
+        financialHold: 'disputed',
+      })
+      expect(snapshot.shipments.some((entry) =>
+        entry.orderId === 'ord-processing' &&
+        (
+          (entry.kind === 'DIGITAL' && ['unfulfilled', 'issued'].includes(entry.status)) ||
+          (entry.kind !== 'DIGITAL' &&
+            ['unfulfilled', 'picking', 'packed', 'label_created'].includes(entry.status))
+        ))).toBe(false)
+
+      isolated.payments.resolveDispute(
+        'pay-processing',
+        'merchant_won',
+        `Confirmed disputed digital ${status} resume`,
+        `evt-digital-${status}-resume`,
+      )
+      snapshot = isolated.repository.getSnapshot()
+      expect(snapshot.shipments.find((entry) => entry.id === 'shp-digital')?.status)
+        .toBe('unfulfilled')
+      expect(() => validateDemoState(snapshot)).not.toThrow()
+    },
+  )
+
+  it.each([
+    ['unfulfilled', 'cancelled'],
+    ['issued', 'cancelled'],
+    ['sent', 'sent'],
+    ['delivered', 'delivered'],
+    ['failed', 'failed'],
+  ] as const)(
+    'keeps permanent refund digital evidence auditable from %s as %s',
+    (starting, expected) => {
+      const isolated = new AppServices(new MemoryStorage(), () => FIXED_NOW)
+      isolated.auth.oneClick('admin')
+      const path = starting === 'unfulfilled'
+        ? []
+        : starting === 'issued'
+          ? ['issued'] as const
+          : starting === 'sent'
+            ? ['issued', 'sent'] as const
+            : starting === 'delivered'
+              ? ['issued', 'sent', 'delivered'] as const
+              : ['issued', 'sent', 'failed'] as const
+      for (const next of path) {
+        isolated.fulfilment.advance(
+          'shp-digital',
+          next,
+          `Confirmed permanent refund digital ${next}`,
+        )
+      }
+      isolated.payments.refund(
+        'pay-processing',
+        21_200,
+        `Confirmed permanent refund from digital ${starting}`,
+        `req-permanent-digital-${starting}`,
+      )
+      const snapshot = isolated.repository.getSnapshot()
+      expect(snapshot.shipments.find((entry) => entry.id === 'shp-digital')?.status)
+        .toBe(expected)
+      expect(snapshot.orders.find((entry) => entry.id === 'ord-processing')?.status)
+        .toBe('refunded')
+      if (expected === 'cancelled') {
+        const before = structuredClone(snapshot)
+        expect(() => isolated.fulfilment.advance(
+          'shp-digital',
+          'unfulfilled',
+          'Attempted independent worker restart after permanent refund',
+        )).toThrow(expect.objectContaining({ code: 'FINANCIAL_HOLD' }))
+        expect(isolated.repository.getSnapshot()).toEqual(before)
+      }
+      expect(() => validateDemoState(snapshot)).not.toThrow()
+    },
+  )
+
+  it.each(['lost', 'returned'] as const)(
+    'accepts late physical original delivery only after its authorized replacement is terminal %s',
+    (terminalStatus) => {
+      const { services: isolated, claim, replacement } =
+        lateOriginalScenario(terminalStatus)
+      const before = isolated.repository.getSnapshot()
+      const claimBefore = structuredClone(before.claims.find((entry) =>
+        entry.id === claim.id))
+      const replacementBefore = structuredClone(before.shipments.find((entry) =>
+        entry.id === replacement.id))
+      const paymentsBefore = structuredClone(before.payments)
+      const original = before.shipments.find((entry) =>
+        entry.id === 'shp-shipped')!
+
+      expect(shipmentDeliveryActionEligibility(before, original))
+        .toMatchObject({ eligible: true })
+      expect(isActionableInTransitShipment(before, original)).toBe(true)
+
+      expect(isolated.fulfilment.advance(
+        'shp-shipped',
+        'delivered',
+        `Confirmed late original after terminal ${terminalStatus} replacement`,
+      )).toMatchObject({
+        id: 'shp-shipped',
+        purpose: 'original',
+        status: 'delivered',
+      })
+      const after = isolated.repository.getSnapshot()
+      expect(after.claims.find((entry) => entry.id === claim.id)).toEqual(claimBefore)
+      expect(after.shipments.find((entry) => entry.id === replacement.id))
+        .toEqual(replacementBefore)
+      expect(after.payments).toEqual(paymentsBefore)
+      expect(after.shipments.filter((entry) =>
+        entry.boxIds.includes('box-shipped-01') &&
+        entry.status === 'delivered')).toHaveLength(1)
+      expect(() => validateDemoState(after)).not.toThrow()
+    },
+  )
+
+  it('keeps a financial hold unchanged when terminal reissue evidence permits late original delivery', () => {
+    const { services: isolated, claim } = lateOriginalScenario('lost')
+    isolated.payments.dispute(
+      'pay-shipped',
+      'Confirmed financial hold before late original delivery',
+      'evt-late-original-financial-hold',
+    )
+    const before = isolated.repository.getSnapshot()
+    const claimBefore = structuredClone(before.claims.find((entry) =>
+      entry.id === claim.id))
+
+    isolated.fulfilment.advance(
+      'shp-shipped',
+      'delivered',
+      'Confirmed late original carrier evidence under financial hold',
+    )
+    const after = isolated.repository.getSnapshot()
+    expect(after.orders.find((entry) => entry.id === 'ord-shipped')?.status)
+      .toBe('disputed')
+    expect(after.payments.find((entry) => entry.id === 'pay-shipped')?.status)
+      .toBe('disputed')
+    expect(after.claims.find((entry) => entry.id === claim.id)).toEqual(claimBefore)
+    expect(after.audits.at(-1)).toMatchObject({
+      action: 'shipment.transitioned',
+      targetId: 'shp-shipped',
+      after: {
+        financialHoldPreserved: true,
+        orderStatus: 'disputed',
+        status: 'delivered',
+      },
+    })
+    expect(() => validateDemoState(after)).not.toThrow()
+  })
+
+  it.each(['shipped', 'delivered'] as const)(
+    'blocks late original delivery while its authorized replacement is %s',
+    (replacementStatus) => {
+      const { services: isolated } =
+        lateOriginalScenario(replacementStatus)
+      const before = structuredClone(isolated.repository.getSnapshot())
+
+      expect(() => isolated.fulfilment.advance(
+        'shp-shipped',
+        'delivered',
+        `Attempted late original with ${replacementStatus} replacement`,
+      )).toThrow(expect.objectContaining({
+        code: 'DELIVERY_ENTITLEMENT_RESERVED',
+      }))
+      expect(isolated.repository.getSnapshot()).toEqual(before)
+    },
+  )
+
+  it('keeps a physical original reserved after an authorized replacement is cancelled', () => {
+    const { services: isolated } = lateOriginalScenario('cancelled')
+    const state = isolated.repository.getSnapshot()
+    const original = state.shipments.find((entry) =>
+      entry.id === 'shp-shipped')!
+    const eligibility = shipmentDeliveryActionEligibility(state, original)
+
+    expect(eligibility).toMatchObject({
+      eligible: false,
+      code: 'DELIVERY_ENTITLEMENT_RESERVED',
+    })
+    expect(isActionableInTransitShipment(state, original)).toBe(false)
+    expect(() => isolated.fulfilment.advance(
+      original.id,
+      'delivered',
+      'Attempted original delivery after cancelled replacement',
+    )).toThrow(expect.objectContaining({
+      code: eligibility.code,
+      message: eligibility.reason,
+    }))
+  })
+
+  it('keeps a digital original reserved after an authorized reissue fails and returns the helper rejection exactly', () => {
+    const { services: isolated, replacement } = digitalReissueScenario()
+    isolated.fulfilment.advance(
+      replacement.id,
+      'failed',
+      'Confirmed failed authorized digital reissue',
+    )
+    const state = isolated.repository.getSnapshot()
+    const original = state.shipments.find((entry) =>
+      entry.id === 'shp-digital')!
+    const eligibility = shipmentDeliveryActionEligibility(state, original)
+
+    expect(eligibility).toMatchObject({
+      eligible: false,
+      code: 'DELIVERY_ENTITLEMENT_RESERVED',
+    })
+    expect(isActionableInTransitShipment(state, original)).toBe(false)
+    expect(() => isolated.fulfilment.advance(
+      original.id,
+      'delivered',
+      'Attempted digital original after failed authorized reissue',
+    )).toThrow(expect.objectContaining({
+      code: eligibility.code,
+      message: eligibility.reason,
+    }))
+    expect(isolated.repository.getSnapshot()).toBe(state)
+  })
+
+  it('delivers the authorized digital reissue and blocks the original from consuming the same entitlement', () => {
+    const { services: isolated, replacement } = digitalReissueScenario()
+    isolated.fulfilment.advance(
+      replacement.id,
+      'delivered',
+      'Confirmed replacement-first entitlement winner',
+    )
+    const before = structuredClone(isolated.repository.getSnapshot())
+
+    expect(() => isolated.fulfilment.advance(
+      'shp-digital',
+      'delivered',
+      'Attempted original duplicate entitlement delivery',
+    )).toThrow(expect.objectContaining({ code: 'DELIVERY_ENTITLEMENT_RESERVED' }))
+    expect(isolated.repository.getSnapshot()).toEqual(before)
+    expect(before.shipments.find((entry) => entry.id === replacement.id)?.status)
+      .toBe('delivered')
+    expect(before.shipments.find((entry) => entry.id === 'shp-digital')?.status)
+      .toBe('sent')
+  })
+
+  it('fails early when an original digital delivery tries to outrun its authorized reissue', () => {
+    const { services: isolated, replacement } = digitalReissueScenario()
+    const before = structuredClone(isolated.repository.getSnapshot())
+
+    expect(() => isolated.fulfilment.advance(
+      'shp-digital',
+      'delivered',
+      'Attempted original-first delivery after reissue authorization',
+    )).toThrow(expect.objectContaining({ code: 'DELIVERY_ENTITLEMENT_RESERVED' }))
+    expect(isolated.repository.getSnapshot()).toEqual(before)
+
+    isolated.fulfilment.advance(
+      replacement.id,
+      'delivered',
+      'Confirmed authorized reissue delivery',
+    )
+    const after = isolated.repository.getSnapshot()
+    expect(after.shipments.filter((entry) =>
+      entry.boxIds.includes('box-processing-02') &&
+      entry.status === 'delivered')).toHaveLength(1)
+    expect(() => validateDemoState(after)).not.toThrow()
   })
 
   it('uses all exact prize values and allocation names', () => {

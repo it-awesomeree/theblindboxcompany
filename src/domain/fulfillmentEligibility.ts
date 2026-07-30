@@ -1,4 +1,4 @@
-import { canTransitionShipment } from './guards'
+import { canTransitionShipmentForKind } from './guards'
 import type { OrderStatus, Shipment, ShipmentStatus } from './types'
 
 const FINANCIAL_HOLD_STATUSES: readonly OrderStatus[] = [
@@ -17,7 +17,7 @@ const TRACKING_EDITABLE_STATUSES: readonly ShipmentStatus[] = [
 const FINANCIAL_HOLD_CARRIER_EDGES: Partial<
   Record<ShipmentStatus, readonly ShipmentStatus[]>
 > = {
-  failed_delivery: ['shipped'],
+  failed_delivery: ['lost', 'returned'],
   shipped: ['delivered', 'failed_delivery', 'lost', 'returned'],
   delivered: ['returned'],
 }
@@ -38,6 +38,7 @@ export function shipmentStatusActionEligibility(
     const carrierEvidenceAllowed =
       ['refunded', 'disputed'].includes(orderStatus) &&
       shipment.kind !== 'DIGITAL' &&
+      shipment.purpose === 'original' &&
       Boolean(FINANCIAL_HOLD_CARRIER_EDGES[shipment.status]?.includes(next))
     return carrierEvidenceAllowed
       ? {
@@ -47,11 +48,11 @@ export function shipmentStatusActionEligibility(
         }
       : {
           eligible: false,
-          reason: `Financial hold: the ${orderStatus} order can only record a graph-legal physical carrier evidence step for an already-shipped delivery; tracking, restarts, fulfilment progress, and financial state remain locked.`,
+          reason: `Financial hold: the ${orderStatus} order can only record a graph-legal physical carrier evidence step for an original shipment already in carrier transit; replacement shipments, tracking, restarts, fulfilment progress, and financial state remain locked until the hold is explicitly cleared.`,
           code: 'FINANCIAL_HOLD',
         }
   }
-  return canTransitionShipment(shipment.status, next)
+  return canTransitionShipmentForKind(shipment.kind, shipment.status, next)
     ? {
         eligible: true,
         reason: 'This shipment transition is graph-legal.',
@@ -68,6 +69,13 @@ export function shipmentTrackingActionEligibility(
   orderStatus: OrderStatus,
   shipment: Shipment,
 ): FulfillmentActionEligibility {
+  if (shipment.kind === 'DIGITAL') {
+    return {
+      eligible: false,
+      reason: 'Digital fulfilment never uses editable carrier tracking.',
+      code: 'DIGITAL_TRACKING_FORBIDDEN',
+    }
+  }
   if (FINANCIAL_HOLD_STATUSES.includes(orderStatus)) {
     return {
       eligible: false,

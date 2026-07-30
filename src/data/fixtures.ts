@@ -5,7 +5,9 @@ import {
   POLICY_ACKNOWLEDGEMENT,
   PRIZES,
   SCHEMA_VERSION,
+  SERIES_ALLOCATION_TOTAL,
   SERIES_ID,
+  VALUE_FLOOR_SEN,
 } from '../domain/constants'
 import type {
   Address,
@@ -135,6 +137,7 @@ const order = (
       seriesId: SERIES_ID,
       quantity,
       unitPriceSen: BOX_PRICE_SEN,
+      valueFloorSen: VALUE_FLOOR_SEN,
       shippingMethod: 'standard',
       address: DEMO_ADDRESS,
       oddsVersion: 'series-001-v1',
@@ -221,7 +224,10 @@ const shipment = (
     packed: ['unfulfilled', 'picking', 'packed'],
     label_created: ['unfulfilled', 'picking', 'packed', 'label_created'],
     shipped: ['unfulfilled', 'picking', 'packed', 'label_created', 'shipped'],
+    issued: ['unfulfilled', 'issued'],
+    sent: ['unfulfilled', 'issued', 'sent'],
     delivered: ['unfulfilled', 'picking', 'packed', 'label_created', 'shipped', 'delivered'],
+    failed: ['unfulfilled', 'issued', 'sent', 'failed'],
     failed_delivery: ['unfulfilled', 'picking', 'packed', 'label_created', 'shipped', 'failed_delivery'],
     lost: ['unfulfilled', 'picking', 'packed', 'label_created', 'shipped', 'lost'],
     returned: ['unfulfilled', 'picking', 'packed', 'label_created', 'shipped', 'returned'],
@@ -232,9 +238,10 @@ const shipment = (
     orderId,
     boxIds,
     kind,
+    purpose: 'original',
     status,
     carrier,
-    trackingNumber: `DEMO-${id.slice(2).toUpperCase()}`,
+    trackingNumber: `DEMO-${id.slice(4).toUpperCase()}`,
     insured: id === 'shp-shipped',
     signatureRequired: id === 'shp-shipped',
     createdAt: at(day, 2),
@@ -266,7 +273,7 @@ const series: PrizeSeries[] = [{
   id: SERIES_ID,
   name: 'Series 001',
   status: 'published',
-  allocationTotal: 10_000,
+  allocationTotal: SERIES_ALLOCATION_TOTAL,
   reservedBoxes: 0,
   oddsVersion: 'series-001-v1',
   policyVersion: 'floor-policy-v1',
@@ -276,8 +283,9 @@ const series: PrizeSeries[] = [{
   publishedAt: at(10),
 }]
 
-const audits: AuditEntry[] = [{
+const seedAuditInputs: Array<Omit<AuditEntry, 'sequence' | 'previousId'>> = [{
   id: 'audit-seed-001',
+  outcome: 'applied',
   actorId: 'system',
   actorRole: 'super_admin',
   action: 'demo.seed',
@@ -286,14 +294,70 @@ const audits: AuditEntry[] = [{
   reason: 'Loaded fictional public demo data',
   at: at(27),
   requestId: 'req-seed-001',
-  after: { orders: orders.length, boxes: boxes.length },
+  after: { boxes: boxes.length, orders: orders.length },
 }]
+
+for (const entry of shipments) {
+  entry.timeline.slice(1).forEach((timeline, index) => {
+    const previous = entry.timeline[index]
+    const orderStatus = orders.find((order) => order.id === entry.orderId)!.status
+    seedAuditInputs.push({
+      id: `audit-seed-${entry.id}-${index + 1}`,
+      outcome: 'applied',
+      actorId: 'system',
+      actorRole: 'super_admin',
+      action: 'shipment.transitioned',
+      targetType: 'shipment',
+      targetId: entry.id,
+      reason: timeline.label,
+      at: timeline.at,
+      before: { status: previous.status },
+      after: {
+        financialHoldPreserved: ['cancelled', 'refunded', 'disputed']
+          .includes(orderStatus),
+        orderStatus,
+        status: timeline.status,
+      },
+      requestId: `req-seed-${entry.id}-${index + 1}`,
+    })
+  })
+}
+
+const refundedOrder = orders.find((entry) => entry.id === 'ord-refunded')!
+seedAuditInputs.push({
+  id: 'audit-seed-payment-refunded',
+  outcome: 'applied',
+  actorId: 'system',
+  actorRole: 'super_admin',
+  action: 'payment.refunded',
+  targetType: 'payment',
+  targetId: refundedOrder.paymentIds[0],
+  reason: 'Seeded fictional full refund record',
+  at: refundedOrder.updatedAt,
+  before: { refundedSen: 0, status: 'succeeded' },
+  after: {
+    allocationsReturned: 0,
+    amountSen: refundedOrder.snapshot.totals.totalSen,
+    refundedSen: refundedOrder.snapshot.totals.totalSen,
+    status: 'refunded',
+  },
+  requestId: `req-${refundedOrder.id}-refund`,
+  eventId: `evt-${refundedOrder.id}-refund`,
+})
+
+const audits: AuditEntry[] = seedAuditInputs.map((audit, index) => ({
+  ...audit,
+  sequence: index + 1,
+  ...(index > 0 ? { previousId: seedAuditInputs[index - 1].id } : {}),
+}))
 
 export function createDemoState(): DemoState {
   return structuredClone({
     schemaVersion: SCHEMA_VERSION,
     revision: 1,
     nextSequence: 1000,
+    auditCount: audits.length,
+    auditHeadId: audits.at(-1)!.id,
     sessionUserId: null,
     users,
     series,

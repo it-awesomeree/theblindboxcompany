@@ -3,13 +3,22 @@ import {
   makeId,
   transitionBox,
   transitionOrder,
-  transitionShipment,
+  transitionShipmentForKind,
 } from '../domain/guards'
 import type { DemoState, Order, OrderStatus, Role, ShipmentStatus } from '../domain/types'
-import { deriveOrderStatusFromShipments } from '../domain/orderStatus'
+import {
+  refreshOrderFulfillment,
+  resolveOrderFulfillment,
+} from '../domain/orderFulfillment'
 import { AuditService } from './AuditService'
 
-const UNSHIPPED: ShipmentStatus[] = ['unfulfilled', 'picking', 'packed', 'label_created']
+const PHYSICAL_UNSHIPPED: ShipmentStatus[] = [
+  'unfulfilled',
+  'picking',
+  'packed',
+  'label_created',
+]
+const DIGITAL_UNSENT: ShipmentStatus[] = ['unfulfilled', 'issued']
 
 interface FinancialActor {
   id: string
@@ -28,6 +37,7 @@ export class FinancialSafetyService {
     requestId: string,
     actor: FinancialActor,
   ) {
+    const stoppedShipmentIds: string[] = []
     const before = {
       orderStatus: order.status,
       shipments: state.shipments
@@ -35,8 +45,15 @@ export class FinancialSafetyService {
         .map((shipment) => ({ id: shipment.id, status: shipment.status })),
     }
     for (const shipment of state.shipments.filter((entry) => entry.orderId === order.id)) {
-      if (!UNSHIPPED.includes(shipment.status)) continue
-      shipment.status = transitionShipment(shipment.status, 'cancelled')
+      const stoppable = shipment.kind === 'DIGITAL'
+        ? DIGITAL_UNSENT.includes(shipment.status)
+        : PHYSICAL_UNSHIPPED.includes(shipment.status)
+      if (!stoppable) continue
+      shipment.status = transitionShipmentForKind(
+        shipment.kind,
+        shipment.status,
+        'cancelled',
+      )
       shipment.timeline.push({
         id: makeId('stl', `${shipment.id}:financial-stop:${requestId}`),
         status: 'cancelled',
@@ -44,6 +61,7 @@ export class FinancialSafetyService {
         at,
         financialHold: status,
       })
+      stoppedShipmentIds.push(shipment.id)
     }
     for (const boxId of order.boxIds) {
       const box = state.boxes.find((entry) => entry.id === boxId)
@@ -71,9 +89,8 @@ export class FinancialSafetyService {
       before,
       after: {
         orderStatus: order.status,
-        stoppedShipmentIds: state.shipments
-          .filter((shipment) => shipment.orderId === order.id && shipment.status === 'cancelled')
-          .map((shipment) => shipment.id),
+        stoppedShipmentIds: stoppedShipmentIds.sort((left, right) =>
+          left.localeCompare(right)),
         heldBoxIds: state.boxes
           .filter((box) => order.boxIds.includes(box.id) && box.status === 'on_hold')
           .map((box) => box.id),
@@ -89,49 +106,33 @@ export class FinancialSafetyService {
     requestId: string,
     actor: FinancialActor,
   ) {
+    const resumedShipmentIds: string[] = []
     assert(order.status === 'disputed', 'Only a disputed order can resume.', 'ORDER_NOT_DISPUTED')
-    const resumedShipmentIds = new Set<string>()
     for (const shipment of state.shipments.filter((entry) =>
       entry.orderId === order.id &&
       entry.status === 'cancelled' &&
       entry.timeline.at(-1)?.financialHold === 'disputed',
     )) {
-      shipment.status = transitionShipment(shipment.status, 'unfulfilled')
+      shipment.status = transitionShipmentForKind(
+        shipment.kind,
+        shipment.status,
+        'unfulfilled',
+      )
       shipment.timeline.push({
         id: makeId('stl', `${shipment.id}:dispute-resolved:${requestId}`),
         status: 'unfulfilled',
         label: reason,
         at,
       })
-      resumedShipmentIds.add(shipment.id)
-    }
-    const related = state.shipments.filter((entry) => entry.orderId === order.id)
-    for (const boxId of order.boxIds) {
-      const box = state.boxes.find((entry) => entry.id === boxId)
-      if (!box || box.revealedAt || box.status !== 'on_hold') continue
-      const shipment = related.find((entry) => entry.id === box.shipmentId)
-      if (shipment && ['failed_delivery', 'lost', 'returned'].includes(shipment.status)) continue
-      if (shipment?.status === 'cancelled' && !resumedShipmentIds.has(shipment.id)) continue
-      const target = shipment?.status === 'delivered'
-        ? 'fulfilled'
-        : shipment?.status === 'shipped'
-          ? 'fulfillment_pending'
-          : 'paid_unopened'
-      box.status = transitionBox(box.status, target)
+      resumedShipmentIds.push(shipment.id)
     }
     const previous = order.timeline.at(-1)?.financialHoldPreviousStatus
-    const derived = deriveOrderStatusFromShipments(related.map((shipment) => shipment.status))
-    const restored: OrderStatus = previous === 'closed' && derived === 'fulfilled'
+    const resolution = resolveOrderFulfillment(state, order)
+    const restored: OrderStatus = previous === 'closed' && resolution.status === 'fulfilled'
       ? 'closed'
-      : derived
+      : resolution.status
     order.status = transitionOrder(order.status, restored)
-    order.updatedAt = at
-    order.timeline.push({
-      id: makeId('tl', `${order.id}:dispute-resolved:${requestId}`),
-      status: restored,
-      label: reason,
-      at,
-    })
+    refreshOrderFulfillment(state, order, at, reason)
     this.audit.append(state, {
       actorId: actor.id,
       actorRole: actor.role,
@@ -142,7 +143,11 @@ export class FinancialSafetyService {
       at,
       requestId,
       before: { status: 'disputed' },
-      after: { status: restored },
+      after: {
+        resumedShipmentIds: resumedShipmentIds.sort((left, right) =>
+          left.localeCompare(right)),
+        status: restored,
+      },
     })
   }
 }

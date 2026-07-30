@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process'
-import { readFileSync } from 'node:fs'
+import { lstatSync, readFileSync, readdirSync } from 'node:fs'
+import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 export const SECRET_PATTERNS = [
@@ -66,13 +67,66 @@ export function scanPublishableFiles(files, readFile = readFileSync) {
   return { findings, scanned }
 }
 
+export function collectDistFiles(distDirectory = 'dist') {
+  const root = lstatSync(distDirectory)
+  if (root.isSymbolicLink() || !root.isDirectory()) {
+    throw new Error(`${distDirectory}: dist path must be a real directory`)
+  }
+
+  const files = []
+  function collect(directory) {
+    const entries = readdirSync(directory, { withFileTypes: true })
+      .sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0)
+
+    for (const entry of entries) {
+      const path = join(directory, entry.name)
+      const details = lstatSync(path)
+      if (details.isSymbolicLink()) throw new Error(`${path}: symbolic links are not allowed in dist`)
+      if (details.isDirectory()) collect(path)
+      else if (details.isFile()) files.push(path)
+      else throw new Error(`${path}: unsupported entry type in dist`)
+    }
+  }
+
+  collect(distDirectory)
+  return files.sort((left, right) => left < right ? -1 : left > right ? 1 : 0)
+}
+
+export function scanDistDirectory(distDirectory = 'dist') {
+  return scanPublishableFiles(collectDistFiles(distDirectory))
+}
+
 function main() {
-  const { findings, scanned } = scanPublishableFiles(publishableFiles())
+  if (process.argv.length === 2) {
+    const { findings, scanned } = scanPublishableFiles(publishableFiles())
+    if (findings.length) {
+      process.stderr.write(`Accidental-secrets check failed:\n${findings.join('\n')}\n`)
+      process.exit(1)
+    }
+    process.stdout.write(`Accidental-secrets check passed (${scanned} publishable text files scanned, including legacy and lockfile).\n`)
+    return
+  }
+
+  if (process.argv.length !== 3 || process.argv[2] !== '--dist') {
+    process.stderr.write('Usage: node scripts/check-secrets.mjs [--dist]\n')
+    process.exit(1)
+  }
+
+  let result
+  try {
+    result = scanDistDirectory()
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    process.stderr.write(`Accidental-secrets check failed:\n${message}\n`)
+    process.exit(1)
+  }
+
+  const { findings, scanned } = result
   if (findings.length) {
     process.stderr.write(`Accidental-secrets check failed:\n${findings.join('\n')}\n`)
     process.exit(1)
   }
-  process.stdout.write(`Accidental-secrets check passed (${scanned} publishable text files scanned, including legacy and lockfile).\n`)
+  process.stdout.write(`Accidental-secrets check passed (${scanned} dist text files scanned).\n`)
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main()

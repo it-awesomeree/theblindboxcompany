@@ -44,14 +44,23 @@ export type ShipmentStatus =
   | 'packed'
   | 'label_created'
   | 'shipped'
+  | 'issued'
+  | 'sent'
   | 'delivered'
+  | 'failed'
   | 'failed_delivery'
   | 'lost'
   | 'returned'
   | 'cancelled'
 export type FulfilmentKind = 'PARCEL' | 'BULKY' | 'DIGITAL' | 'SELF_COLLECT'
+export type ShipmentPurpose = 'original' | 'replacement'
 export type ShippingMethod = 'standard' | 'priority' | 'self_collect'
 export type PaymentMethod = 'FPX' | 'DUITNOW' | 'CARD' | 'GRABPAY' | 'TNG'
+export type PaymentEventRoute = 'generic' | 'dispute' | 'dispute_resolution'
+export type IgnoredPaymentEventOutcome =
+  | 'other_payment_captured'
+  | 'other_payment_active'
+  | 'out_of_order'
 
 export interface User {
   id: string
@@ -123,6 +132,7 @@ export interface OrderSnapshot {
   seriesId: string
   quantity: number
   unitPriceSen: number
+  valueFloorSen: number
   shippingMethod: ShippingMethod
   address: Address
   oddsVersion: string
@@ -162,10 +172,16 @@ export interface PaymentEvent {
   createdAt: string
   processedAt: string
   ignoredReason?: string
+  ignoredOutcome?: IgnoredPaymentEventOutcome
+  ignoredPriorStatus?: PaymentStatus
+  ignoredRelatedPaymentId?: string
+  ignoredRoute?: PaymentEventRoute
+  ignoredInputReason?: string
   refundIntent?: {
     paymentId: string
     amountSen: number
     reason: string
+    claimId?: string
   }
 }
 
@@ -210,6 +226,10 @@ export interface Shipment {
   orderId: string
   boxIds: string[]
   kind: FulfilmentKind
+  purpose: ShipmentPurpose
+  sourceClaimId?: string
+  replacementForShipmentId?: string
+  legacyRecordedBoxIds?: string[]
   status: ShipmentStatus
   carrier: string
   trackingNumber: string
@@ -226,6 +246,43 @@ export type ClaimResolutionOutcome =
   | 'return_rma_created'
   | 'refund_recorded'
   | 'no_remedy'
+export type RmaStatus = 'created' | 'received' | 'inspected'
+export type ClaimRemedyState =
+  | 'none'
+  | 'refund_linked'
+  | 'refund_completed'
+  | 'rma_created'
+  | 'rma_received'
+  | 'rma_inspected'
+  | 'replacement_authorized'
+  | 'replacement_delivered'
+  | 'no_remedy'
+export type ClaimSettlementPolicy =
+  | 'exact_scope'
+  | 'terminal_replacement_fallback'
+
+export interface ClaimRmaEvidence {
+  reference: string
+  status: RmaStatus
+  createdAt: string
+  createdReason: string
+  receivedAt?: string
+  receivedReason?: string
+  inspectedAt?: string
+  inspectedReason?: string
+}
+
+export interface ReplacementAuthorizationEvidence {
+  at: string
+  reason: string
+}
+
+export interface LegacyDirectPostDeliveryReplacementEvidence {
+  originalShipmentId: string
+  originalStatusAtMigration: Extract<ShipmentStatus, 'delivered' | 'returned'>
+  replacementShipmentId: string
+  replacementStatusAtMigration: ShipmentStatus
+}
 
 export interface ClaimHistoryEntry {
   id: string
@@ -248,16 +305,31 @@ export interface Claim {
   shipmentCandidateEvidenceAt?: Record<string, string>
   boxId?: string
   status: ClaimStatus
+  remedyState: ClaimRemedyState
+  remedyBoxIds: string[]
+  requiredSettlementSen: number
+  acceptedSettlementSen?: number
+  settlementPolicy?: ClaimSettlementPolicy
+  rma?: ClaimRmaEvidence
+  replacementShipmentId?: string
+  replacementAuthorization?: ReplacementAuthorizationEvidence
+  legacyDirectPostDeliveryReplacement?: LegacyDirectPostDeliveryReplacementEvidence
+  legacyTypedResolution?: true
   createdAt: string
   updatedAt: string
   resolutionNote?: string
   resolutionOutcome?: ClaimResolutionOutcome
   resolutionReference?: string
+  linkedRefundEventId?: string
+  legacyUnderSettledRefund?: true
   history: ClaimHistoryEntry[]
 }
 
 export interface AuditEntry {
   id: string
+  sequence: number
+  previousId?: string
+  outcome: 'applied' | 'ignored'
   actorId: string
   actorRole: Role
   action: string
@@ -265,16 +337,18 @@ export interface AuditEntry {
   targetId: string
   reason: string
   at: string
-  before?: unknown
-  after?: unknown
+  before?: import('./auditEvidence').AuditEvidence
+  after?: import('./auditEvidence').AuditEvidence
   requestId: string
   eventId?: string
 }
 
 export interface DemoState {
-  schemaVersion: 5
+  schemaVersion: 9
   revision: number
   nextSequence: number
+  auditCount: number
+  auditHeadId: string
   sessionUserId: string | null
   users: User[]
   series: PrizeSeries[]

@@ -19,9 +19,10 @@
     "e2e:dist": "PLAYWRIGHT_BROWSER=chromium PLAYWRIGHT_EXISTING_DIST=1 playwright test",
     "check:secrets": "node scripts/check-secrets.mjs",
     "secrets:check": "node scripts/check-secrets.mjs",
+    "secrets:check:dist": "node scripts/check-secrets.mjs --dist",
     "secrets:test": "node scripts/check-secrets.selftest.mjs",
-    "audit:release": "npm audit --audit-level=high && npm audit --omit=dev --audit-level=high",
-    "verify": "npm run secrets:test && npm run secrets:check && npm run audit:release && npm run lint && npm run typecheck && npm run test && npm run build",
+    "audit:release": "npm audit --audit-level=moderate && npm audit --omit=dev --audit-level=moderate",
+    "verify": "npm run secrets:test && npm run secrets:check && npm run audit:release && npm run lint && npm run typecheck && npm run test && npm run build && npm run secrets:check:dist",
     "verify:all": "npm run verify && npm run e2e"
   },
   "dependencies": {

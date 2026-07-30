@@ -7,12 +7,15 @@ import {
   PAYMENT_TRANSITIONS,
   POLICY_ACKNOWLEDGEMENT,
   SCHEMA_VERSION,
+  SERIES_ALLOCATION_TOTAL,
   SERIES_ID,
   SHIPPING_FEES,
   SHIPMENT_TRANSITIONS,
 } from '../domain/constants'
+import { validateCanonicalAuditEvidence } from '../domain/auditEvidence'
 import {
   assert,
+  canTransitionShipmentForKind,
   CHECKOUT_REQUEST_ID_PATTERN,
   isClearlyFictionalCarrier,
   isValidDemoTracking,
@@ -22,20 +25,76 @@ import {
   validateDemoUserName,
 } from '../domain/guards'
 import {
-  shipmentClaimEligibility,
+  historicalShipmentStatusAtAudit,
+  shipmentClaimEligibilityAtAudit,
   valueFloorClaimEligibility,
 } from '../domain/claimEligibility'
+import {
+  compareAuditMoments,
+  sameInstant,
+} from '../domain/auditSequence'
 import {
   canWidenClaimEvidence,
   CLAIM_EVIDENCE_WIDENING_NOTE,
   isOpenClaimStatus,
 } from '../domain/claimStatus'
-import { deriveOrderStatusFromShipments } from '../domain/orderStatus'
+import {
+  expectedBoxStatusForScope,
+  resolveOrderFulfillment,
+} from '../domain/orderFulfillment'
+import {
+  availableClaimShipmentIdsAt,
+  assertFullPaymentRefundCompatible,
+  assertNoRemedyScopeConflict,
+  claimHoldsRemedyEntitlementAtMoment,
+  claimHoldsRemedyEntitlement,
+  claimHasPreservedLegacyUnderSettledHistory,
+  expectedClaimRemedySnapshot,
+  isTerminalReplacementRefundFallback,
+  orderBoxSettlementAllocations,
+  matchingAcceptedProtectedPaymentEventAudit,
+  matchingAppliedUnlinkedRefundAudit,
+  matchingClaimSubmissionAudit,
+  matchingClaimWideningAuditsAt,
+  terminalReplacementFallbackAmount,
+} from '../domain/remedyPolicy'
 import { isValidPrizeDefinition } from '../domain/prizeValidation'
+import {
+  acceptedDisputeResolutionShapeIsValid,
+  immediatePriorAcceptedPaymentStatus,
+} from '../domain/paymentEligibility'
+import {
+  IGNORED_PAYMENT_EVENT_ACTION,
+  LEGACY_IGNORED_EVENT_MIGRATION_ACTION,
+  matchingCurrentIgnoredPaymentEventAudit,
+  matchingLegacyIgnoredPaymentEventMigrationAudit,
+  matchingLegacyIgnoredPaymentEventSourceAudit,
+} from '../domain/paymentEventEvidence'
+import {
+  claimRefundLinkedHistoryNote,
+  matchingAppliedClaimRefundLinkAudit,
+  matchingAppliedPaymentRefundAudit,
+} from '../domain/refundLink'
+import {
+  isGrandfatheredDirectPostDeliveryReplacement,
+  LEGACY_DIRECT_REPLACEMENT_MIGRATION_ACTION,
+  matchingLegacyDirectReplacementMigrationAudit,
+} from '../domain/migrationEvidence'
+import {
+  matchingReplacementAuthorizationAudit,
+  matchingReplacementDeliveryAudit,
+  matchingShipmentTransitionAudit,
+  matchingRmaAudit,
+  matchingRmaReceivedAudit,
+  RMA_CREATED_ACTION,
+  RMA_INSPECTED_ACTION,
+} from '../domain/remedyEvidence'
+import { lateOriginalDeliveryEligibility } from '../domain/shipmentPolicy'
 import type {
   Box,
   BoxStatus,
   ClaimKind,
+  ClaimRemedyState,
   ClaimResolutionOutcome,
   ClaimStatus,
   DemoState,
@@ -45,9 +104,11 @@ import type {
   PaymentMethod,
   PaymentStatus,
   Role,
+  RmaStatus,
   SeriesStatus,
   ShippingMethod,
   ShipmentStatus,
+  ShipmentPurpose,
 } from '../domain/types'
 
 const ROLES: Role[] = ['customer', ...ADMIN_ROLES]
@@ -65,6 +126,39 @@ const CLAIM_RESOLUTION_OUTCOMES = new Set<ClaimResolutionOutcome>([
   'return_rma_created',
   'refund_recorded',
   'no_remedy',
+])
+const CLAIM_REMEDY_STATES = new Set<ClaimRemedyState>([
+  'none',
+  'refund_linked',
+  'refund_completed',
+  'rma_created',
+  'rma_received',
+  'rma_inspected',
+  'replacement_authorized',
+  'replacement_delivered',
+  'no_remedy',
+])
+const RMA_STATUSES = new Set<RmaStatus>(['created', 'received', 'inspected'])
+const SHIPMENT_PURPOSES = new Set<ShipmentPurpose>(['original', 'replacement'])
+const PHYSICAL_SHIPMENT_STATUSES = new Set<ShipmentStatus>([
+  'unfulfilled',
+  'picking',
+  'packed',
+  'label_created',
+  'shipped',
+  'delivered',
+  'failed_delivery',
+  'lost',
+  'returned',
+  'cancelled',
+])
+const DIGITAL_SHIPMENT_STATUSES = new Set<ShipmentStatus>([
+  'unfulfilled',
+  'issued',
+  'sent',
+  'delivered',
+  'failed',
+  'cancelled',
 ])
 const SERIES_STATUSES = new Set<SeriesStatus>(['draft', 'published'])
 const FULFILMENT_KINDS = new Set<FulfilmentKind>(['PARCEL', 'BULKY', 'DIGITAL', 'SELF_COLLECT'])
@@ -85,6 +179,7 @@ const CLAIM_TRANSITIONS: Record<ClaimStatus, ClaimStatus[]> = {
   rejected: [],
   resolved: [],
 }
+const AUDIT_OUTCOMES = new Set(['applied', 'ignored'])
 
 function integer(value: unknown, minimum = 0) {
   return Number.isInteger(value) && Number(value) >= minimum
@@ -96,6 +191,15 @@ function record(value: unknown): value is Record<string, unknown> {
 
 function nonEmptyString(value: unknown) {
   return typeof value === 'string' && value.trim().length > 0
+}
+
+function normalizedText(value: unknown, maximum: number) {
+  return (
+    typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= maximum &&
+    sanitizeText(value, maximum) === value
+  )
 }
 
 function validIso(value: unknown) {
@@ -174,19 +278,35 @@ function everyOrderBoxRevealedAt(state: DemoState, orderId: string, at: string) 
   )
 }
 
-function eligibleClaimShipmentIds(
-  state: DemoState,
-  orderId: string,
-  kind: Extract<ClaimKind, 'damage' | 'non_delivery'>,
-  at: string,
-) {
-  return state.shipments
-    .filter((shipment) =>
-      shipment.orderId === orderId &&
-      shipmentClaimEligibility(shipment, kind, at).eligible,
-    )
-    .map((shipment) => shipment.id)
-    .sort((left, right) => left.localeCompare(right))
+function matchingLegacyTypedResolutionAudit(state: DemoState, claim: DemoState['claims'][number]) {
+  const history = claim.history.at(-1)
+  if (
+    !history ||
+    history.status !== 'resolved' ||
+    !claim.resolutionOutcome ||
+    !claim.resolutionReference ||
+    !claim.resolutionNote
+  ) {
+    return undefined
+  }
+  return state.audits.find((audit) =>
+    audit.outcome === 'applied' &&
+    ['support', 'admin', 'super_admin'].includes(audit.actorRole) &&
+    audit.action === 'claim.resolve' &&
+    audit.targetType === 'claim' &&
+    audit.targetId === claim.id &&
+    audit.reason === claim.resolutionNote &&
+    audit.at === history.at &&
+    audit.actorId === history.actorId &&
+    audit.actorRole === history.actorRole &&
+    JSON.stringify(audit.before) === JSON.stringify({ status: 'approved' }) &&
+    JSON.stringify(audit.after) === JSON.stringify({
+      refundCreated: false,
+      resolutionOutcome: claim.resolutionOutcome,
+      resolutionReference: claim.resolutionReference,
+      status: 'resolved',
+    }),
+  )
 }
 
 function validateOrderFulfilment(state: DemoState, orderId: string) {
@@ -194,7 +314,10 @@ function validateOrderFulfilment(state: DemoState, orderId: string) {
   const shipments = state.shipments.filter((entry) => entry.orderId === order.id)
   if (FINANCIAL_STOP.has(order.status)) {
     assert(
-      shipments.every((shipment) => !UNSHIPPED.has(shipment.status)),
+      shipments.every((shipment) =>
+        shipment.kind === 'DIGITAL'
+          ? !['unfulfilled', 'issued'].includes(shipment.status)
+          : !UNSHIPPED.has(shipment.status)),
       'A financially stopped order cannot retain eligible unshipped fulfilment.',
     )
     return
@@ -204,14 +327,18 @@ function validateOrderFulfilment(state: DemoState, orderId: string) {
     return
   }
   assert(shipments.length > 0, 'A paid order must have coherent fulfilment records.')
-  const derived = deriveOrderStatusFromShipments(shipments.map((shipment) => shipment.status))
+  const resolution = resolveOrderFulfillment(state, order)
+  assert(resolution.scopes.length > 0, 'A paid order must have original fulfilment scopes.')
   if (order.status === 'closed') {
-    assert(derived === 'fulfilled', 'A closed order requires every shipment to be delivered.')
+    assert(
+      resolution.status === 'fulfilled',
+      'A closed order requires every original scope to have completed delivery or remedy.',
+    )
     return
   }
   assert(
-    order.status === derived,
-    `Order ${order.id} status must be ${derived} for its shipment progress.`,
+    order.status === resolution.status,
+    `Order ${order.id} status must be ${resolution.status} for its original scope and remedy progress.`,
   )
 }
 
@@ -222,17 +349,31 @@ function validateBoxShipment(state: DemoState, box: Box) {
   }
   assert(box.shipmentId, 'Every allocated box needs a documented fulfilment record.')
   const shipment = state.shipments.find((entry) => entry.id === box.shipmentId)
-  assert(shipment && shipment.boxIds.includes(box.id), 'Box shipment reference is inconsistent.')
+  assert(
+    shipment &&
+      shipment.purpose === 'original' &&
+      shipment.boxIds.includes(box.id),
+    'Box shipment reference must preserve its original shipment provenance.',
+  )
   const order = state.orders.find((entry) => entry.id === box.orderId)!
   if (FINANCIAL_STOP.has(order.status)) {
     if (!box.revealedAt) assert(box.status === 'on_hold', 'An unopened allocated box must stay on financial hold.')
     return
   }
-  if (shipment.status === 'shipped') assert(box.status === 'fulfillment_pending', 'A shipped box must be in fulfilment.')
-  if (shipment.status === 'delivered') assert(box.status === 'fulfilled', 'A delivered box must be fulfilled.')
-  if (['failed_delivery', 'lost', 'returned', 'cancelled'].includes(shipment.status)) {
-    assert(box.status === 'on_hold', 'A shipment exception must put its box on hold.')
-  }
+  const resolution = resolveOrderFulfillment(state, order)
+  const scope = resolution.scopes.find((entry) =>
+    entry.originalShipmentId === shipment.id && entry.boxIds.includes(box.id))
+  assert(scope, 'Box original fulfilment scope is missing.')
+  const expected = expectedBoxStatusForScope(
+    state,
+    scope,
+    box.status,
+    Boolean(box.revealedAt),
+  )
+  assert(
+    box.status === expected,
+    `Box ${box.id} status must be ${expected} for its original scope and remedy progress.`,
+  )
 }
 
 export function validateDemoState(value: unknown): asserts value is DemoState {
@@ -254,6 +395,16 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
   unique(state.shipments.map((entry) => entry.id), 'Shipment')
   unique(state.claims.map((entry) => entry.id), 'Claim')
   unique(state.audits.map((entry) => entry.id), 'Audit')
+  assert(state.audits.length > 0, 'Audit history must not be empty.')
+  assert(
+    integer(state.auditCount, 1) && state.auditCount === state.audits.length,
+    'Audit count must exactly match audit history.',
+  )
+  assert(
+    normalizedText(state.auditHeadId, 120) &&
+      state.auditHeadId === state.audits.at(-1)?.id,
+    'Audit head must reference the latest audit entry.',
+  )
   assert(state.payments.every((entry) => Array.isArray(entry.events)), 'Payment events must be collections.')
   assert(state.orders.every((entry) => Array.isArray(entry.timeline)), 'Order timelines must be collections.')
   assert(state.shipments.every((entry) => Array.isArray(entry.timeline)), 'Shipment timelines must be collections.')
@@ -280,7 +431,7 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
   assert(
     publishedSeries.length === 1 &&
       publishedSeries[0].id === SERIES_ID &&
-      publishedSeries[0].allocationTotal === 10_000,
+      publishedSeries[0].allocationTotal === SERIES_ALLOCATION_TOTAL,
     'Published Series 001 must contain exactly 10,000 boxes.',
   )
   for (const series of state.series) {
@@ -292,7 +443,8 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
       assert(Array.isArray(series.publishedPrizes) && series.publishedPrizes.length > 0, 'Published series snapshot is required.')
       unique(series.publishedPrizes.map((prize) => prize.id), 'Published prize')
       assert(
-        series.publishedPrizes.every(isValidPrizeDefinition),
+        series.publishedPrizes.every((prize) =>
+          isValidPrizeDefinition(prize, series.allocationTotal)),
         'Published prize definitions are invalid.',
       )
       assert(
@@ -321,7 +473,8 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
       )
       unique(series.draftPrizes.map((prize) => prize.id), 'Draft prize')
       assert(
-        series.draftPrizes.every(isValidPrizeDefinition),
+        series.draftPrizes.every((prize) =>
+          isValidPrizeDefinition(prize, series.allocationTotal)),
         'Draft prize definitions are invalid.',
       )
       assert(
@@ -381,6 +534,11 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
       'Order quantity is invalid.',
     )
     assert(
+      Number.isSafeInteger(order.snapshot.valueFloorSen) &&
+        order.snapshot.valueFloorSen > 0,
+      'Order value-floor snapshot must be a positive bounded safe integer-sen amount.',
+    )
+    assert(
       [order.snapshot.unitPriceSen, order.snapshot.totals.itemSubtotalSen, order.snapshot.totals.shippingSen, order.snapshot.totals.totalSen]
         .every((amount) => integer(amount)),
       'Order money must use integer sen.',
@@ -401,6 +559,13 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
       order.snapshot.totals.totalSen ===
         BOX_PRICE_SEN * order.snapshot.quantity + SHIPPING_FEES[order.snapshot.shippingMethod],
       'Order total must match the immutable item subtotal and shipping schedule.',
+    )
+    const allocations = orderBoxSettlementAllocations(order)
+    assert(
+      allocations.every((allocation) => integer(allocation.amountSen, 1)) &&
+        allocations.reduce((sum, allocation) => sum + allocation.amountSen, 0) ===
+          order.snapshot.totals.totalSen,
+      'Canonical per-box settlement allocations must exactly cover the order total.',
     )
     assert(Array.isArray(order.paymentIds) && Array.isArray(order.boxIds) && Array.isArray(order.claimIds), 'Order links must be collections.')
     assert(Array.isArray(order.timeline), 'Order timeline must be a collection.')
@@ -437,6 +602,7 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
     validateOrderFulfilment(state, order.id)
   }
 
+  const refundLinkedClaimIds: string[] = []
   for (const payment of state.payments) {
     assert(PAYMENT_STATUSES.has(payment.status), 'Payment status is invalid.')
     assert(PAYMENT_METHODS.has(payment.method as PaymentMethod), 'Payment method is invalid.')
@@ -458,11 +624,74 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
         validIso(event.processedAt)),
       'Payment event is invalid.',
     )
-    for (const event of payment.events) {
+    for (const [eventIndex, event] of payment.events.entries()) {
       assert(timestamp(event.createdAt) >= timestamp(payment.createdAt), 'Payment event cannot precede payment creation.')
       assert(timestamp(event.processedAt) >= timestamp(event.createdAt), 'Payment processing cannot precede event creation.')
+      assert(
+        event.ignoredReason === undefined || event.refundIntent === undefined,
+        'Ignored payment events can never carry a refund intent.',
+      )
+      if (event.ignoredReason !== undefined) {
+        assert(
+          matchingCurrentIgnoredPaymentEventAudit(state, payment, event) ||
+            matchingLegacyIgnoredPaymentEventMigrationAudit(
+              state,
+              payment,
+              event,
+            ),
+          'Ignored payment events require exact immutable current or non-replayable migrated evidence.',
+        )
+      } else {
+        assert(
+          event.ignoredOutcome === undefined &&
+            event.ignoredPriorStatus === undefined &&
+            event.ignoredRelatedPaymentId === undefined &&
+            event.ignoredRoute === undefined &&
+            event.ignoredInputReason === undefined,
+          'Accepted payment events cannot carry ignored-event evidence.',
+        )
+      }
+      const priorAcceptedStatus = immediatePriorAcceptedPaymentStatus(
+        payment,
+        eventIndex,
+      )
+      if (
+        event.ignoredReason === undefined &&
+        priorAcceptedStatus === 'disputed'
+      ) {
+        assert(
+          acceptedDisputeResolutionShapeIsValid(
+            state,
+            payment,
+            eventIndex,
+          ),
+          'Accepted dispute resolution history has an invalid customer-won or merchant-won shape.',
+        )
+      }
+      if (
+        event.ignoredReason === undefined &&
+        event.source === 'admin_reconcile' &&
+        (
+          event.type === 'disputed' ||
+          priorAcceptedStatus === 'disputed'
+        )
+      ) {
+        assert(
+          matchingAcceptedProtectedPaymentEventAudit(
+            state,
+            payment,
+            event,
+          ),
+          'Accepted protected finance events require one exact immutable payment audit.',
+        )
+      }
       if (event.refundIntent !== undefined) {
         assert(record(event.refundIntent), 'Refund intent must be a structured record.')
+        const hasClaimId = Object.prototype.hasOwnProperty.call(
+          event.refundIntent,
+          'claimId',
+        )
+        const claimId = event.refundIntent.claimId
         assert(
           ['partially_refunded', 'refunded'].includes(event.type) &&
             event.source === 'admin_reconcile' &&
@@ -475,11 +704,90 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
             sanitizeText(event.refundIntent.reason, 240) === event.refundIntent.reason,
           'Refund intent is invalid.',
         )
+        assert(
+          !hasClaimId ||
+            (
+              normalizedText(claimId, 120) &&
+              claimId === event.refundIntent.claimId
+            ),
+          'Refund intent claim link is invalid.',
+        )
+        if (claimId !== undefined) {
+          const claim = state.claims.find((entry) => entry.id === claimId)
+          assert(
+            claim &&
+              claim.orderId === payment.orderId &&
+              claim.userId === payment.userId &&
+              claim.linkedRefundEventId === event.id,
+            'Linked refund event must point to one same-order claim with a matching reverse link.',
+          )
+          assert(
+            event.ignoredReason === undefined &&
+              ['approved', 'resolved'].includes(claim.status) &&
+              (
+                claim.status !== 'resolved' ||
+                (
+                  claim.resolutionOutcome === 'refund_recorded' &&
+                  claim.resolutionReference === event.id
+                )
+              ),
+            'Linked refund event must be accepted and belong to an approved or refund-resolved claim.',
+          )
+          assert(
+            timestamp(event.createdAt) >= timestamp(claim.createdAt) &&
+              timestamp(event.processedAt) >= timestamp(claim.createdAt) &&
+              timestamp(claim.updatedAt) >= timestamp(event.processedAt),
+            'Linked refund event cannot precede its claim or end after the claim update.',
+          )
+          const paymentAudit = matchingAppliedPaymentRefundAudit(
+            state,
+            payment,
+            event,
+            claim,
+          )
+          const claimAudit = matchingAppliedClaimRefundLinkAudit(
+            state,
+            payment,
+            event,
+            claim,
+          )
+          assert(
+            paymentAudit,
+            'Linked refund event requires matching applied payment refund audit evidence.',
+          )
+          assert(
+            claimAudit &&
+              claimAudit.actorId === paymentAudit.actorId &&
+              claimAudit.actorRole === paymentAudit.actorRole &&
+              claim.history.some((entry) =>
+                entry.status === 'approved' &&
+                entry.note === claimRefundLinkedHistoryNote(event.id) &&
+                entry.actorId === claimAudit.actorId &&
+                entry.actorRole === claimAudit.actorRole &&
+                entry.at === event.processedAt),
+            'Linked refund event requires matching claim audit and immutable history evidence.',
+          )
+          refundLinkedClaimIds.push(claimId)
+        } else {
+          assert(
+            matchingAppliedUnlinkedRefundAudit(
+              state,
+              payment,
+              event,
+            ),
+            'Unlinked refund intent requires one exact generic or dispute-origin payment audit.',
+          )
+        }
       }
     }
     chronological(payment.events.map((event) => event.processedAt), `Payment ${payment.id} events`)
     const recordedRefundTotal = payment.events.reduce(
-      (sum, event) => sum + (event.refundIntent?.amountSen ?? 0),
+      (sum, event) =>
+        sum + (
+          event.ignoredReason
+            ? 0
+            : (event.refundIntent?.amountSen ?? 0)
+        ),
       0,
     )
     assert(
@@ -511,6 +819,55 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
       assert(payment.refundedSen === 0, 'A non-refund payment status must have a zero refunded amount.')
     }
   }
+  const ignoredActionAudits = state.audits.filter((audit) =>
+    audit.action === IGNORED_PAYMENT_EVENT_ACTION)
+  const evidencedIgnoredActionAudits = state.payments.flatMap((payment) =>
+    payment.events.flatMap((event) => {
+      const current = matchingCurrentIgnoredPaymentEventAudit(
+        state,
+        payment,
+        event,
+      )
+      const legacy = matchingLegacyIgnoredPaymentEventSourceAudit(
+        state,
+        payment,
+        event,
+      )
+      return [
+        ...(current ? [current] : []),
+        ...(legacy ? [legacy] : []),
+      ]
+    }))
+  assert(
+    ignoredActionAudits.length === evidencedIgnoredActionAudits.length &&
+      ignoredActionAudits.every((audit) =>
+        evidencedIgnoredActionAudits.some((evidence) =>
+          evidence.id === audit.id)),
+    'Every ignored payment-event audit must bind exactly one current or migrated ignored event with no orphan audit.',
+  )
+  const legacyIgnoredMigrationAudits = state.audits.filter((audit) =>
+    audit.action === LEGACY_IGNORED_EVENT_MIGRATION_ACTION)
+  const legacyIgnoredEvents = state.payments.flatMap((payment) =>
+    payment.events.flatMap((event) =>
+      matchingLegacyIgnoredPaymentEventMigrationAudit(
+        state,
+        payment,
+        event,
+      )
+        ? [{ event, payment }]
+        : []))
+  assert(
+    legacyIgnoredMigrationAudits.length === legacyIgnoredEvents.length &&
+      legacyIgnoredMigrationAudits.every((audit) =>
+        legacyIgnoredEvents.some(({ event, payment }) =>
+          matchingLegacyIgnoredPaymentEventMigrationAudit(
+            state,
+            payment,
+            event,
+          )?.id === audit.id)),
+    'Every legacy ignored-event migration audit must bind one non-replayable ignored event with no orphan audit.',
+  )
+  unique(refundLinkedClaimIds, 'Refund-linked claim')
   unique(
     state.payments.flatMap((payment) => payment.events.map((event) => event.requestId)),
     'Payment event request',
@@ -592,14 +949,188 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
 
   unique(state.boxes.map((box) => box.manifestId), 'Box manifest')
   unique(state.shipments.map((shipment) => shipment.trackingNumber), 'Shipment tracking')
+  const replacementClaimIds: string[] = []
   for (const shipment of state.shipments) {
-    assert(SHIPMENT_STATUSES.has(shipment.status) && FULFILMENT_KINDS.has(shipment.kind), 'Shipment status or kind is invalid.')
+    assert(
+      SHIPMENT_STATUSES.has(shipment.status) &&
+        FULFILMENT_KINDS.has(shipment.kind) &&
+        SHIPMENT_PURPOSES.has(shipment.purpose),
+      'Shipment status, kind, or purpose is invalid.',
+    )
     const order = state.orders.find((entry) => entry.id === shipment.orderId)
     assert(order, 'Shipment order reference is invalid.')
     assert(Array.isArray(shipment.boxIds) && Array.isArray(shipment.timeline), 'Shipment links and timeline must be collections.')
     unique(shipment.boxIds, `Shipment ${shipment.id} box`)
     assert(shipment.boxIds.length > 0, 'Shipment must contain a box.')
-    assert(shipment.boxIds.every((id) => state.boxes.some((box) => box.id === id && box.shipmentId === shipment.id && box.orderId === order.id)), 'Shipment box reference is invalid.')
+    assert(
+      shipment.boxIds.every((id) => state.boxes.some((box) =>
+        box.id === id && box.orderId === order.id)),
+      'Shipment box reference is invalid.',
+    )
+    if (shipment.purpose === 'original') {
+      assert(
+        shipment.sourceClaimId === undefined &&
+          shipment.replacementForShipmentId === undefined &&
+          shipment.legacyRecordedBoxIds === undefined,
+        'Original shipments cannot carry replacement provenance.',
+      )
+      assert(
+        shipment.boxIds.every((id) => state.boxes.some((box) =>
+          box.id === id && box.shipmentId === shipment.id)),
+        'Original shipment must own each box provenance link.',
+      )
+    } else {
+      assert(
+        normalizedText(shipment.sourceClaimId, 120) &&
+          normalizedText(shipment.replacementForShipmentId, 120),
+        'Replacement shipment requires claim and original reverse links.',
+      )
+      const original = state.shipments.find((entry) =>
+        entry.id === shipment.replacementForShipmentId)
+      const claim = state.claims.find((entry) => entry.id === shipment.sourceClaimId)
+      assert(
+        original &&
+          original.purpose === 'original' &&
+          original.orderId === shipment.orderId &&
+          claim &&
+          claim.orderId === shipment.orderId &&
+          claim.userId === order.userId &&
+          claim.replacementShipmentId === shipment.id,
+        'Replacement shipment reverse links must match one same-order original and claim.',
+      )
+      assert(
+        JSON.stringify(shipment.boxIds) === JSON.stringify(claim.remedyBoxIds) &&
+          shipment.boxIds.every((boxId) => original.boxIds.includes(boxId)) &&
+          shipment.kind === original.kind &&
+          shipment.insured === original.insured &&
+          shipment.signatureRequired === original.signatureRequired,
+        'Replacement shipment must preserve the exact claim remedy scope and original kind and flags.',
+      )
+      if (shipment.legacyRecordedBoxIds !== undefined) {
+        assert(
+          Array.isArray(shipment.legacyRecordedBoxIds) &&
+            JSON.stringify(shipment.legacyRecordedBoxIds) ===
+              JSON.stringify(original.boxIds) &&
+            JSON.stringify(shipment.legacyRecordedBoxIds) !==
+              JSON.stringify(shipment.boxIds) &&
+            shipment.boxIds.every((boxId) =>
+              shipment.legacyRecordedBoxIds!.includes(boxId)),
+          'Migrated replacement scope evidence must preserve the exact broader legacy original scope.',
+        )
+      }
+      assert(
+        shipment.boxIds.every((id) => state.boxes.some((box) =>
+          box.id === id && box.shipmentId === original.id)),
+        'Replacement boxes must retain their original box shipment provenance.',
+      )
+      assert(
+        timestamp(shipment.createdAt) >= timestamp(original.createdAt) &&
+          timestamp(shipment.createdAt) >= timestamp(claim.createdAt),
+        'Replacement shipment cannot precede its original or claim.',
+      )
+      const approvedAt = claim.history.find((entry) => entry.status === 'approved')?.at
+      assert(
+        approvedAt && timestamp(shipment.createdAt) >= timestamp(approvedAt),
+        'Replacement shipment cannot precede claim approval.',
+      )
+      const authorizationAudit = matchingReplacementAuthorizationAudit(
+        state,
+        claim,
+        original,
+        shipment,
+      )
+      assert(
+        claim.replacementAuthorization?.at === shipment.createdAt &&
+          authorizationAudit &&
+          claim.history.some((entry) =>
+            entry.status === 'approved' &&
+            entry.at === shipment.createdAt &&
+            entry.note === claim.replacementAuthorization?.reason &&
+            entry.actorId === authorizationAudit.actorId &&
+            entry.actorRole === authorizationAudit.actorRole),
+        'Replacement authorization requires matching immutable claim history and audit evidence.',
+      )
+      const originalDelivered = original.timeline.some((entry) =>
+        entry.status === 'delivered')
+      const originalDeliveredBeforeAuthorization = original.timeline
+        .map((entry, index) => ({
+          entry,
+          audit: index > 0
+            ? matchingShipmentTransitionAudit(state, original, index)
+            : undefined,
+        }))
+        .some(({ entry, audit }) =>
+          entry.status === 'delivered' &&
+          audit &&
+          compareAuditMoments(audit, authorizationAudit!) <= 0)
+      if (originalDeliveredBeforeAuthorization) {
+        const grandfatheredDirect =
+          isGrandfatheredDirectPostDeliveryReplacement(
+            state,
+            claim,
+            original,
+            shipment,
+          )
+        assert(
+          (
+            claim.rma?.status === 'inspected' &&
+            claim.remedyState !== 'none' &&
+            original.status === 'returned' &&
+            original.timeline.some((entry) =>
+              entry.status === 'returned' &&
+              timestamp(entry.at) <= timestamp(shipment.createdAt))
+          ) ||
+            grandfatheredDirect,
+          'A post-delivery replacement authorization requires a completed RMA return and a returned original before authorization.',
+        )
+      } else if (originalDelivered) {
+        const lateDelivery = original.timeline
+          .map((entry, index) => ({
+            entry,
+            audit: index > 0
+              ? matchingShipmentTransitionAudit(state, original, index)
+              : undefined,
+          }))
+          .find(({ entry }) => entry.status === 'delivered')
+        assert(
+          lateDelivery?.audit &&
+            compareAuditMoments(
+              lateDelivery.audit,
+              authorizationAudit!,
+            ) > 0 &&
+            lateOriginalDeliveryEligibility(state, original).eligible,
+          'A late original delivery is valid only after authorization when every overlapping physical reissue is terminally lost or returned.',
+        )
+      }
+      if (shipment.status === 'delivered') {
+        const deliveryAudit = matchingReplacementDeliveryAudit(state, claim, shipment)
+        const deliveryHistory = claim.history.at(-1)
+        assert(
+          claim.status === 'resolved' &&
+            claim.remedyState === 'replacement_delivered' &&
+            claim.resolutionOutcome === 'replacement_authorized' &&
+            claim.resolutionReference === shipment.id &&
+            deliveryAudit &&
+            deliveryHistory?.actorId === deliveryAudit.actorId &&
+            deliveryHistory.actorRole === deliveryAudit.actorRole,
+          'Delivered replacement requires exact resolved claim history and audit evidence.',
+        )
+      } else if (['refund_linked', 'refund_completed'].includes(claim.remedyState)) {
+        assert(
+          isTerminalReplacementRefundFallback(shipment),
+          'A replacement retained by a refund-linked claim must be terminal digital failed or physical lost or returned.',
+        )
+      } else {
+        assert(
+          claim.status === 'approved' &&
+            claim.remedyState === 'replacement_authorized' &&
+            claim.resolutionOutcome === undefined &&
+            claim.resolutionReference === undefined,
+          'Undelivered replacement must keep its claim approved and incomplete.',
+        )
+      }
+      replacementClaimIds.push(claim.id)
+    }
     const linkedPrizes = shipment.boxIds.map((boxId) => {
       const box = state.boxes.find((entry) => entry.id === boxId)!
       const series = state.series.find((entry) => entry.id === box.seriesId)
@@ -615,13 +1146,31 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
         )),
       'Shipment kind must match its linked prizes and order shipping method.',
     )
-    assert(
-      shipment.insured === linkedPrizes.some((prize) => prize!.insured) &&
-        shipment.signatureRequired === linkedPrizes.some((prize) => prize!.signatureRequired),
-      'Shipment insurance and signature flags must match linked prize requirements.',
-    )
+    if (shipment.purpose === 'original') {
+      assert(
+        shipment.insured === linkedPrizes.some((prize) => prize!.insured) &&
+          shipment.signatureRequired === linkedPrizes.some((prize) => prize!.signatureRequired),
+        'Original shipment insurance and signature flags must match linked prize requirements.',
+      )
+    }
     assert(isClearlyFictionalCarrier(shipment.carrier), 'Shipment carrier must remain clearly fictional.')
     assert(isValidDemoTracking(shipment.trackingNumber), 'Shipment tracking must remain a valid DEMO- code.')
+    if (shipment.kind === 'DIGITAL') {
+      assert(
+        shipment.timeline.every((entry) => DIGITAL_SHIPMENT_STATUSES.has(entry.status)),
+        'Digital shipment history can only use unfulfilled, issued, sent, delivered, failed, or cancelled.',
+      )
+      assert(
+        shipment.carrier === 'Digital Vault' &&
+          shipment.trackingNumber === `DEMO-${shipment.id.slice(4).toUpperCase()}`,
+        'Digital carrier and tracking must remain at their immutable generated values.',
+      )
+    } else {
+      assert(
+        shipment.timeline.every((entry) => PHYSICAL_SHIPMENT_STATUSES.has(entry.status)),
+        'Physical shipment history cannot use digital issued, sent, or failed statuses.',
+      )
+    }
     assert(validIso(shipment.createdAt), 'Shipment time is invalid.')
     assert(shipment.timeline.length > 0 && shipment.timeline[0].status === 'unfulfilled' && shipment.timeline.at(-1)?.status === shipment.status, 'Shipment timeline is incomplete.')
     assert(
@@ -644,14 +1193,111 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
       .map(capturedAt)
       .find(Boolean)
     assert(captureTime && timestamp(shipment.createdAt) >= timestamp(captureTime), 'Shipment cannot precede captured payment.')
-    changedStatusesAreLegal(shipment.timeline.map((entry) => entry.status), SHIPMENT_TRANSITIONS, `Shipment ${shipment.id}`)
+    for (let index = 1; index < shipment.timeline.length; index += 1) {
+      const before = shipment.timeline[index - 1].status
+      const after = shipment.timeline[index].status
+      if (before !== after) {
+        assert(
+          canTransitionShipmentForKind(shipment.kind, before, after),
+          `Shipment ${shipment.id} timeline has an illegal ${before} to ${after} jump.`,
+        )
+      }
+      assert(
+        matchingShipmentTransitionAudit(state, shipment, index),
+        'Shipment progress requires one matching applied transition audit evidence record.',
+      )
+    }
+    const firstNonDelivery = shipment.timeline.findIndex((entry) =>
+      ['failed', 'failed_delivery', 'lost', 'returned'].includes(entry.status))
+    if (shipment.purpose === 'original' && firstNonDelivery >= 0) {
+      assert(
+        !shipment.timeline
+          .slice(firstNonDelivery + 1)
+          .some((entry) => entry.status === 'delivered'),
+        'An original shipment exception cannot be rewritten to successful delivery.',
+      )
+    }
+  }
+  unique(replacementClaimIds, 'Replacement claim')
+  unique(
+    state.shipments
+      .filter((shipment) => shipment.status === 'delivered')
+      .flatMap((shipment) => shipment.boxIds),
+    'Effective delivered shipment box',
+  )
+  for (const order of state.orders) {
+    const allocatedBoxIds = order.boxIds.filter((boxId) =>
+      state.boxes.some((box) => box.id === boxId && box.prizeId))
+    if (allocatedBoxIds.length === 0) continue
+    const originalBoxIds = state.shipments
+      .filter((shipment) =>
+        shipment.orderId === order.id && shipment.purpose === 'original')
+      .flatMap((shipment) => shipment.boxIds)
+    unique(originalBoxIds, `Order ${order.id} original shipment box`)
+    assert(
+      JSON.stringify([...originalBoxIds].sort()) ===
+        JSON.stringify([...allocatedBoxIds].sort()),
+      'Original shipment scopes must cover each paid order box exactly once; replacements add no scopes.',
+    )
   }
 
   unique(state.claims.map((claim) => claim.requestId), 'Claim request')
+  const wideningActionAudits = state.audits.filter((audit) =>
+    audit.action === 'claim.order_level_evidence_widened')
+  assert(
+    wideningActionAudits.every((audit) =>
+      audit.targetType === 'claim' &&
+      state.claims.some((claim) => claim.id === audit.targetId)),
+    'Every widening action audit must target one existing claim.',
+  )
+  const claimLinkedRefundEventIds: string[] = []
+  const refundResolutionReferences: string[] = []
   for (const claim of state.claims) {
-    assert(CLAIM_KINDS.has(claim.kind) && CLAIM_STATUSES.has(claim.status), 'Claim kind or status is invalid.')
+    assert(
+      CLAIM_KINDS.has(claim.kind) &&
+        CLAIM_STATUSES.has(claim.status) &&
+        CLAIM_REMEDY_STATES.has(claim.remedyState),
+      'Claim kind, status, or remedy state is invalid.',
+    )
+    assert(
+      claim.legacyTypedResolution === undefined || claim.legacyTypedResolution === true,
+      'Legacy typed-resolution marker is invalid.',
+    )
+    assert(
+      claim.legacyUnderSettledRefund === undefined ||
+        claim.legacyUnderSettledRefund === true,
+      'Legacy under-settled refund marker is invalid.',
+    )
+    assert(
+      !(claim.legacyTypedResolution && claim.legacyUnderSettledRefund),
+      'A claim cannot use two different legacy outcome markers.',
+    )
+    assert(
+      claim.legacyDirectPostDeliveryReplacement === undefined ||
+        (
+          record(claim.legacyDirectPostDeliveryReplacement) &&
+          claim.legacyTypedResolution === undefined &&
+          claim.legacyUnderSettledRefund === undefined
+        ),
+      'Legacy direct post-delivery replacement evidence is invalid or conflicts with another legacy marker.',
+    )
     const order = state.orders.find((entry) => entry.id === claim.orderId)
     assert(order?.userId === claim.userId && order.claimIds.includes(claim.id), 'Claim order reference is invalid.')
+    const submissionAudit = matchingClaimSubmissionAudit(state, claim)
+    assert(
+      submissionAudit,
+      'Claim submission requires one exact customer audit at its immutable evidence boundary.',
+    )
+    assert(Array.isArray(claim.remedyBoxIds), 'Claim remedy box scope must be a collection.')
+    unique(claim.remedyBoxIds, `Claim ${claim.id} remedy box`)
+    const expectedRemedy = expectedClaimRemedySnapshot(state, claim)
+    assert(
+      JSON.stringify(claim.remedyBoxIds) ===
+        JSON.stringify(expectedRemedy.remedyBoxIds) &&
+        claim.requiredSettlementSen === expectedRemedy.requiredSettlementSen &&
+        integer(claim.requiredSettlementSen, 1),
+      'Claim remedy scope and required settlement must exactly match its immutable order and evidence snapshot.',
+    )
     assert(customerClaimNoteIsSafe(claim.note), 'Customer claim note must be fictional and include DEMO without email or phone data.')
     assert(validIso(claim.createdAt) && validIso(claim.updatedAt), 'Claim time is invalid.')
     assert(timestamp(claim.createdAt) >= timestamp(order.createdAt), 'Claim cannot precede its order.')
@@ -676,13 +1322,309 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
     )
     assert(timestamp(claim.history.at(-1)!.at) <= timestamp(claim.updatedAt), 'Claim history cannot end after its updated time.')
     changedStatusesAreLegal(claim.history.map((entry) => entry.status), CLAIM_TRANSITIONS, `Claim ${claim.id}`)
+    if (claim.rma !== undefined) {
+      assert(record(claim.rma), 'Claim RMA evidence must be a structured record.')
+      const rmaOriginalId =
+        claim.shipmentId ??
+        (claim.shipmentCandidateIds?.length === 1
+          ? claim.shipmentCandidateIds[0]
+          : undefined) ??
+        (claim.boxId
+          ? state.boxes.find((box) =>
+              box.id === claim.boxId && box.orderId === claim.orderId)?.shipmentId
+          : undefined)
+      const rmaOriginal = state.shipments.find((shipment) =>
+        shipment.id === rmaOriginalId &&
+        shipment.orderId === claim.orderId &&
+        shipment.purpose === 'original')
+      assert(
+        rmaOriginal &&
+          rmaOriginal.kind !== 'DIGITAL' &&
+          historicalShipmentStatusAtAudit(
+            state,
+            rmaOriginal,
+            submissionAudit,
+          ) === 'delivered',
+        'RMA evidence requires a physical original delivered by claim creation.',
+      )
+      assert(
+        /^DEMO-[A-Z0-9][A-Z0-9-]{2,96}$/.test(claim.rma.reference) &&
+          RMA_STATUSES.has(claim.rma.status) &&
+          validIso(claim.rma.createdAt) &&
+          normalizedText(claim.rma.createdReason, 500),
+        'Claim RMA creation evidence is invalid.',
+      )
+      const approvedAt = claim.history.find((entry) => entry.status === 'approved')?.at
+      assert(
+        approvedAt &&
+          timestamp(claim.rma.createdAt) >= timestamp(approvedAt) &&
+          timestamp(claim.rma.createdAt) <= timestamp(claim.updatedAt),
+        'RMA creation cannot precede approval or end after the claim update.',
+      )
+      const createdAudit = matchingRmaAudit(
+        state,
+        claim,
+        RMA_CREATED_ACTION,
+        claim.rma.createdAt,
+        claim.rma.createdReason,
+        'none',
+        null,
+        'rma_created',
+        'created',
+      )
+      assert(
+        createdAudit &&
+          claim.history.some((entry) =>
+            entry.status === 'approved' &&
+            entry.at === claim.rma!.createdAt &&
+            entry.note === claim.rma!.createdReason &&
+            entry.actorId === createdAudit.actorId &&
+            entry.actorRole === createdAudit.actorRole),
+        'RMA creation requires matching immutable same-status history and audit evidence.',
+      )
+      if (claim.rma.status === 'created') {
+        assert(
+          claim.rma.receivedAt === undefined &&
+            claim.rma.receivedReason === undefined &&
+            claim.rma.inspectedAt === undefined &&
+            claim.rma.inspectedReason === undefined,
+          'Created RMA evidence cannot contain receipt or inspection fields.',
+        )
+      } else {
+        assert(
+          validIso(claim.rma.receivedAt) &&
+            normalizedText(claim.rma.receivedReason, 500) &&
+            timestamp(claim.rma.receivedAt!) >= timestamp(claim.rma.createdAt) &&
+            timestamp(claim.rma.receivedAt!) <= timestamp(claim.updatedAt),
+          'RMA receipt evidence or chronology is invalid.',
+        )
+        const receivedAudit = matchingRmaReceivedAudit(
+          state,
+          claim,
+          rmaOriginal,
+        )
+        const originalStatusBeforeReceipt = record(receivedAudit?.before)
+          ? receivedAudit.before.originalShipmentStatus
+          : undefined
+        const returnedBeforeOrAtReceipt = rmaOriginal.timeline.some((entry) =>
+          entry.status === 'returned' &&
+          timestamp(entry.at) <= timestamp(claim.rma!.receivedAt!))
+        const atomicReceiptReturn = rmaOriginal.timeline.some((entry, index) =>
+          index > 0 &&
+          entry.status === 'returned' &&
+          entry.at === claim.rma!.receivedAt &&
+          entry.label === claim.rma!.receivedReason &&
+          rmaOriginal.timeline[index - 1].status === 'delivered')
+        assert(
+          receivedAudit &&
+            rmaOriginal.status === 'returned' &&
+            returnedBeforeOrAtReceipt &&
+            (
+              originalStatusBeforeReceipt === 'returned' ||
+              (
+                originalStatusBeforeReceipt === 'delivered' &&
+                atomicReceiptReturn
+              )
+            ) &&
+            claim.history.some((entry) =>
+              entry.status === 'approved' &&
+              entry.at === claim.rma!.receivedAt &&
+              entry.note === claim.rma!.receivedReason &&
+              entry.actorId === receivedAudit.actorId &&
+              entry.actorRole === receivedAudit.actorRole),
+          'RMA receipt requires a returned linked original plus matching immutable timeline, history, and audit evidence.',
+        )
+        if (claim.rma.status === 'received') {
+          assert(
+            claim.rma.inspectedAt === undefined &&
+              claim.rma.inspectedReason === undefined,
+            'Received RMA evidence cannot contain inspection fields.',
+          )
+        } else {
+          assert(
+            validIso(claim.rma.inspectedAt) &&
+              normalizedText(claim.rma.inspectedReason, 500) &&
+              timestamp(claim.rma.inspectedAt!) >= timestamp(claim.rma.receivedAt!) &&
+              timestamp(claim.rma.inspectedAt!) <= timestamp(claim.updatedAt),
+            'RMA inspection evidence or chronology is invalid.',
+          )
+          const inspectedAudit = matchingRmaAudit(
+            state,
+            claim,
+            RMA_INSPECTED_ACTION,
+            claim.rma.inspectedAt!,
+            claim.rma.inspectedReason!,
+            'rma_received',
+            'received',
+            'rma_inspected',
+            'inspected',
+          )
+          assert(
+            inspectedAudit &&
+              claim.history.some((entry) =>
+                entry.status === 'approved' &&
+                entry.at === claim.rma!.inspectedAt &&
+                entry.note === claim.rma!.inspectedReason &&
+                entry.actorId === inspectedAudit.actorId &&
+                entry.actorRole === inspectedAudit.actorRole),
+            'RMA inspection requires matching immutable same-status history and audit evidence.',
+          )
+        }
+      }
+    } else {
+      assert(
+        !['rma_created', 'rma_received', 'rma_inspected'].includes(claim.remedyState),
+        'RMA remedy state requires ordered RMA evidence.',
+      )
+    }
+    const hasLinkedRefundEventId = Object.prototype.hasOwnProperty.call(
+      claim,
+      'linkedRefundEventId',
+    )
+    assert(
+      !hasLinkedRefundEventId || normalizedText(claim.linkedRefundEventId, 120),
+      'Claim reverse refund link is invalid.',
+    )
+    if (claim.linkedRefundEventId !== undefined) {
+      const eventMatches = state.payments.flatMap((payment) =>
+        payment.events
+          .filter((event) => event.id === claim.linkedRefundEventId)
+          .map((event) => ({ event, payment })),
+      )
+      assert(
+        eventMatches.length === 1,
+        'Claim reverse refund link must point to exactly one payment event.',
+      )
+      const { event, payment } = eventMatches[0]
+      const eventIndex = payment.events.findIndex((entry) => entry.id === event.id)
+      const priorRefundedSen = payment.events
+        .slice(0, eventIndex)
+        .reduce(
+          (sum, prior) =>
+            sum + (
+              prior.ignoredReason
+                ? 0
+                : (prior.refundIntent?.amountSen ?? 0)
+            ),
+          0,
+        )
+      assert(
+        payment.orderId === claim.orderId &&
+          payment.userId === claim.userId &&
+          event.refundIntent?.claimId === claim.id &&
+          event.refundIntent.paymentId === payment.id &&
+          event.source === 'admin_reconcile' &&
+          ['partially_refunded', 'refunded'].includes(event.type) &&
+          event.ignoredReason === undefined,
+        'Claim reverse refund link must point to its accepted same-order refund event.',
+      )
+      assert(
+        integer(claim.acceptedSettlementSen, 1) &&
+          claim.acceptedSettlementSen === event.refundIntent!.amountSen,
+        'Claim accepted settlement must exactly preserve its linked refund amount.',
+      )
+      const replacement = claim.replacementShipmentId
+        ? state.shipments.find((shipment) =>
+            shipment.id === claim.replacementShipmentId &&
+            shipment.sourceClaimId === claim.id &&
+            shipment.purpose === 'replacement')
+        : undefined
+      if (claim.legacyUnderSettledRefund) {
+        assert(
+          claim.settlementPolicy === undefined &&
+            replacement === undefined &&
+            claim.acceptedSettlementSen < claim.requiredSettlementSen,
+          'Legacy under-settled refund evidence must remain explicitly marked, strictly under-settled, and non-replacement.',
+        )
+        assert(
+          claimHasPreservedLegacyUnderSettledHistory(state, claim),
+          'Legacy under-settled history must preserve its exact linked refund and final resolution audits.',
+        )
+      } else if (claim.settlementPolicy === 'exact_scope') {
+        assert(
+          replacement === undefined &&
+            claim.acceptedSettlementSen === claim.requiredSettlementSen,
+          'Exact-scope settlement must equal the claim requirement and cannot retain a replacement.',
+        )
+      } else {
+        assert(
+          claim.settlementPolicy === 'terminal_replacement_fallback' &&
+            isTerminalReplacementRefundFallback(replacement) &&
+            claim.acceptedSettlementSen === terminalReplacementFallbackAmount(
+              claim.requiredSettlementSen,
+              payment.amountSen - priorRefundedSen,
+            ),
+          'Terminal replacement fallback must retain only eligible terminal replacement evidence and use the capped claim settlement amount.',
+        )
+      }
+      assert(
+        timestamp(event.createdAt) >= timestamp(claim.createdAt) &&
+          timestamp(event.processedAt) >= timestamp(claim.createdAt) &&
+          timestamp(claim.updatedAt) >= timestamp(event.processedAt),
+        'Claim-linked refund event cannot precede the claim or end after its update.',
+      )
+      assert(
+        claim.status === 'approved' ||
+          (
+            claim.status === 'resolved' &&
+            claim.resolutionOutcome === 'refund_recorded' &&
+            claim.resolutionReference === event.id
+          ),
+        'A refund-linked claim must remain approved or resolve with that exact refund event.',
+      )
+      assert(
+        claim.remedyState === (
+          claim.status === 'resolved' ? 'refund_completed' : 'refund_linked'
+        ),
+        'Claim refund remedy state must match its approved or completed linked refund.',
+      )
+      assert(
+        matchingAppliedPaymentRefundAudit(state, payment, event, claim) &&
+          matchingAppliedClaimRefundLinkAudit(state, payment, event, claim),
+        'Claim reverse refund link requires matching applied payment and claim audit evidence.',
+      )
+      claimLinkedRefundEventIds.push(claim.linkedRefundEventId)
+    } else {
+      assert(
+        !['refund_linked', 'refund_completed'].includes(claim.remedyState) &&
+          claim.acceptedSettlementSen === undefined &&
+          claim.settlementPolicy === undefined &&
+          claim.legacyUnderSettledRefund === undefined,
+        'Refund remedy state requires the exact bidirectional refund event link.',
+      )
+    }
     const hasBoxLink = claim.boxId !== undefined
     const hasExactShipmentLink = claim.shipmentId !== undefined
     const hasOrderLevelCandidates = claim.shipmentCandidateIds !== undefined
+    const claimWideningActionAudits = wideningActionAudits
+      .filter((audit) => audit.targetId === claim.id)
+      .sort(compareAuditMoments)
+    const canonicalWideningAudits = claimWideningActionAudits
+      .filter((audit) =>
+        audit.outcome === 'applied' &&
+        audit.actorId === claim.userId &&
+        audit.actorRole === 'customer' &&
+        audit.targetType === 'claim' &&
+        audit.reason === CLAIM_EVIDENCE_WIDENING_NOTE)
+    assert(
+      canonicalWideningAudits.length === claimWideningActionAudits.length,
+      'Every widening action audit must have the canonical customer actor, target, outcome, and reason.',
+    )
+    const wideningHistoryRows = claim.history
+      .map((entry, index) => ({ entry, index }))
+      .filter(({ entry }) =>
+        entry.note === CLAIM_EVIDENCE_WIDENING_NOTE)
     assert(
       Number(hasBoxLink) + Number(hasExactShipmentLink) + Number(hasOrderLevelCandidates) === 1,
       'Claim evidence must use exactly one box, exact shipment, or order-level candidate set.',
     )
+    if (!hasOrderLevelCandidates) {
+      assert(
+        canonicalWideningAudits.length === 0 &&
+          wideningHistoryRows.length === 0,
+        'Only an order-level claim can retain widening audits or history rows.',
+      )
+    }
     if (claim.kind === 'value_floor') {
       assert(hasBoxLink && !hasExactShipmentLink && !hasOrderLevelCandidates, 'Value-floor claim link is invalid.')
       assert(
@@ -695,6 +1637,18 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
         valueFloorClaimEligibility(box, claim.createdAt).eligible,
         'Value-floor claim requires an assigned box revealed by claim creation.',
       )
+      assert(
+        !state.claims.some((holder) =>
+          holder.id !== claim.id &&
+          holder.orderId === claim.orderId &&
+          holder.remedyBoxIds.includes(box.id) &&
+          claimHoldsRemedyEntitlementAtMoment(
+            state,
+            holder,
+            submissionAudit,
+          )),
+        'Value-floor claim evidence was already consumed before claim creation.',
+      )
     } else if (hasExactShipmentLink) {
       assert(!hasBoxLink && !hasOrderLevelCandidates, 'Exact shipment claim link is invalid.')
       assert(
@@ -705,13 +1659,31 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
         everyOrderBoxRevealedAt(state, claim.orderId, claim.createdAt),
         'Exact shipment claims require every order box to be revealed by claim creation.',
       )
-      const shipment = state.shipments.find((entry) => entry.id === claim.shipmentId && entry.orderId === claim.orderId)
+      const shipment = state.shipments.find((entry) =>
+        entry.id === claim.shipmentId &&
+        entry.orderId === claim.orderId &&
+        entry.purpose === 'original')
       assert(shipment, 'Claim shipment reference is invalid.')
       assert(
-        shipmentClaimEligibility(shipment, claim.kind, claim.createdAt).eligible,
+        shipmentClaimEligibilityAtAudit(
+          state,
+          shipment,
+          claim.kind,
+          submissionAudit,
+        ).eligible,
         claim.kind === 'damage'
           ? 'Damage claim requires physical delivery by claim creation.'
           : 'Non-delivery claim requires eligible evidence at claim creation.',
+      )
+      assert(
+        availableClaimShipmentIdsAt(
+          state,
+          claim.orderId,
+          claim.kind,
+          submissionAudit,
+          claim.id,
+        ).includes(shipment.id),
+        'Exact shipment claim evidence was already consumed before claim creation.',
       )
     } else {
       const deliveryKind = claim.kind as Extract<ClaimKind, 'damage' | 'non_delivery'>
@@ -726,20 +1698,44 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
       assert(claim.shipmentCandidateIds.length > 0, 'Order-level shipment candidates cannot be empty.')
       unique(claim.shipmentCandidateIds, `Claim ${claim.id} shipment candidate`)
       const canonicalCandidates = [...claim.shipmentCandidateIds].sort((left, right) => left.localeCompare(right))
+      const priorNeutralClaimIds = state.claims
+        .filter((candidate) =>
+          candidate.id !== claim.id &&
+          candidate.orderId === claim.orderId &&
+          candidate.kind === claim.kind &&
+          candidate.shipmentCandidateIds !== undefined)
+        .filter((candidate) => {
+          const candidateSubmission = matchingClaimSubmissionAudit(
+            state,
+            candidate,
+          )
+          return Boolean(
+            candidateSubmission &&
+            compareAuditMoments(candidateSubmission, submissionAudit) < 0,
+          )
+        })
+        .map((candidate) => candidate.id)
       assert(
         JSON.stringify(claim.shipmentCandidateIds) === JSON.stringify(canonicalCandidates),
         'Order-level shipment candidates must use canonical order.',
       )
       if (claim.shipmentCandidateEvidenceAt === undefined) {
         assert(
+          canonicalWideningAudits.length === 0 &&
+            wideningHistoryRows.length === 0,
+          'Order-level evidence without widening snapshots cannot retain widening audits or history rows.',
+        )
+        assert(
           JSON.stringify(claim.shipmentCandidateIds) ===
-            JSON.stringify(eligibleClaimShipmentIds(
+            JSON.stringify(availableClaimShipmentIdsAt(
               state,
               claim.orderId,
               deliveryKind,
-              claim.createdAt,
+              submissionAudit,
+              claim.id,
+              priorNeutralClaimIds,
             )),
-          'Order-level shipment candidates must canonically include every eligible physical shipment.',
+          'Order-level shipment candidates must canonically include every available eligible original shipment.',
         )
       } else {
         assert(
@@ -752,7 +1748,8 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
           JSON.stringify(evidenceKeys) === JSON.stringify(canonicalCandidates),
           'Order-level shipment candidate evidence must exactly match its candidates.',
         )
-        const evidenceTimes = [...new Set(canonicalCandidates.map((shipmentId) => {
+        const candidateBoundaries = new Map<string, DemoState['audits'][number]>()
+        for (const shipmentId of canonicalCandidates) {
           const evidenceAt = claim.shipmentCandidateEvidenceAt![shipmentId]
           assert(validIso(evidenceAt), 'Order-level shipment candidate evidence time is invalid.')
           assert(
@@ -760,85 +1757,235 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
               timestamp(evidenceAt) <= timestamp(claim.updatedAt),
             'Order-level shipment candidate evidence time is outside the claim history.',
           )
-          const shipment = state.shipments.find((entry) =>
-            entry.id === shipmentId && entry.orderId === claim.orderId)
+          const submissionCandidateIds =
+            record(submissionAudit.after) &&
+            Array.isArray(submissionAudit.after.shipmentCandidateIds)
+              ? submissionAudit.after.shipmentCandidateIds
+              : []
+          const boundary = submissionCandidateIds.includes(shipmentId)
+            ? submissionAudit
+            : (() => {
+                const matches = matchingClaimWideningAuditsAt(
+                  state,
+                  claim,
+                  evidenceAt,
+                ).filter((audit) =>
+                  record(audit.before) &&
+                  record(audit.after) &&
+                  Array.isArray(audit.before.shipmentCandidateIds) &&
+                  Array.isArray(audit.after.shipmentCandidateIds) &&
+                  !audit.before.shipmentCandidateIds.includes(shipmentId) &&
+                  audit.after.shipmentCandidateIds.includes(shipmentId) &&
+                  record(audit.after.shipmentCandidateEvidenceAt) &&
+                  sameInstant(
+                    String(audit.after.shipmentCandidateEvidenceAt[shipmentId]),
+                    evidenceAt,
+                  ))
+                assert(
+                  matches.length === 1,
+                  'Each widened candidate requires one exact customer audit boundary.',
+                )
+                return matches[0]
+              })()
+          candidateBoundaries.set(shipmentId, boundary)
           assert(
-            shipment && shipmentClaimEligibility(shipment, deliveryKind, evidenceAt).eligible,
-            'Every order-level shipment candidate must belong to the order and be eligible at its evidence time.',
+            availableClaimShipmentIdsAt(
+              state,
+              claim.orderId,
+              deliveryKind,
+              boundary,
+              claim.id,
+              priorNeutralClaimIds,
+            ).includes(shipmentId),
+            'Every order-level shipment candidate must belong to the order, be eligible, and remain unconsumed at its evidence time.',
           )
-          return evidenceAt
-        }))].sort((left, right) => left.localeCompare(right))
+        }
         const initialCandidates = canonicalCandidates.filter((shipmentId) =>
-          claim.shipmentCandidateEvidenceAt![shipmentId] === claim.createdAt)
+          candidateBoundaries.get(shipmentId)?.id === submissionAudit.id)
         assert(
           initialCandidates.length > 0 &&
             JSON.stringify(initialCandidates) ===
-              JSON.stringify(eligibleClaimShipmentIds(
+              JSON.stringify(availableClaimShipmentIdsAt(
                 state,
                 claim.orderId,
                 deliveryKind,
-                claim.createdAt,
+                submissionAudit,
+                claim.id,
+                priorNeutralClaimIds,
               )),
           'Mapped order-level evidence must preserve the exact nonempty candidate set from claim creation.',
         )
-        const accumulatedCandidates = new Set<string>()
-        for (const evidenceAt of evidenceTimes) {
-          eligibleClaimShipmentIds(state, claim.orderId, deliveryKind, evidenceAt)
-            .forEach((shipmentId) => accumulatedCandidates.add(shipmentId))
-          if (evidenceAt === claim.createdAt) continue
-          const beforeCandidateIds = canonicalCandidates.filter((shipmentId) =>
-            timestamp(claim.shipmentCandidateEvidenceAt![shipmentId]) < timestamp(evidenceAt))
-          const afterCandidateIds = canonicalCandidates.filter((shipmentId) =>
-            timestamp(claim.shipmentCandidateEvidenceAt![shipmentId]) <= timestamp(evidenceAt))
-          const widenedAt = state.audits.some((audit) => {
-            const before = audit.before
-            const after = audit.after
-            if (
-              audit.action !== 'claim.order_level_evidence_widened' ||
-              audit.targetType !== 'claim' ||
-              audit.targetId !== claim.id ||
-              audit.actorId !== claim.userId ||
-              audit.actorRole !== 'customer' ||
-              audit.at !== evidenceAt ||
-              audit.reason !== CLAIM_EVIDENCE_WIDENING_NOTE ||
-              !record(before) ||
-              !record(after) ||
-              !Array.isArray(before.shipmentCandidateIds) ||
-              !Array.isArray(after.shipmentCandidateIds)
-            ) return false
-            return (
-              JSON.stringify(before.shipmentCandidateIds) ===
-                JSON.stringify(beforeCandidateIds) &&
-              JSON.stringify(after.shipmentCandidateIds) ===
-                JSON.stringify(afterCandidateIds)
-            )
-          })
+        let accumulatedCandidates = [...initialCandidates]
+        const wideningAudits = [...new Map(
+          [...candidateBoundaries.values()]
+            .filter((audit) => audit.id !== submissionAudit.id)
+            .map((audit) => [audit.id, audit]),
+        ).values()].sort(compareAuditMoments)
+        assert(
+          JSON.stringify(canonicalWideningAudits.map((audit) => audit.id)) ===
+            JSON.stringify(wideningAudits.map((audit) => audit.id)) &&
+            wideningHistoryRows.length === wideningAudits.length,
+          'Canonical widening audits and unchanged-status customer history rows must form one exact pair per candidate boundary.',
+        )
+        for (const [index, audit] of wideningAudits.entries()) {
+          const history = wideningHistoryRows[index]
           assert(
-            widenedAt,
-            'Widened order-level shipment candidate evidence requires a matching customer audit.',
-          )
-          const wideningHistoryIndex = claim.history.findIndex((entry, index) =>
-            index > 0 &&
-            entry.at === evidenceAt &&
-            entry.actorId === claim.userId &&
-            entry.actorRole === 'customer' &&
-            entry.note === CLAIM_EVIDENCE_WIDENING_NOTE &&
-            canWidenClaimEvidence(entry.status) &&
-            claim.history[index - 1].status === entry.status)
-          assert(
-            wideningHistoryIndex > 0,
-            'Widened order-level shipment candidate evidence requires matching unchanged-status customer history.',
+            history &&
+              history.index > 0 &&
+              history.entry.actorId === audit.actorId &&
+              history.entry.actorRole === audit.actorRole &&
+              sameInstant(history.entry.at, audit.at) &&
+              canWidenClaimEvidence(history.entry.status) &&
+              claim.history[history.index - 1].status ===
+                history.entry.status,
+            'Each widening audit requires one distinct same-actor, same-time unchanged-status customer history row.',
           )
         }
+        for (const audit of wideningAudits) {
+          const before = audit.before
+          const after = audit.after
+          assert(
+            record(before) &&
+              record(after) &&
+              Array.isArray(before.shipmentCandidateIds) &&
+              Array.isArray(after.shipmentCandidateIds),
+            'Widened order-level evidence audit must contain structured before and after candidate sets.',
+          )
+          const availableAtBoundary = availableClaimShipmentIdsAt(
+            state,
+            claim.orderId,
+            deliveryKind,
+            audit,
+            claim.id,
+            priorNeutralClaimIds,
+          )
+          const expectedAfter = [...new Set([
+            ...accumulatedCandidates,
+            ...availableAtBoundary,
+          ])].sort((left, right) => left.localeCompare(right))
+          const expectedEvidenceAt = Object.fromEntries(expectedAfter.map(
+            (shipmentId) => [
+              shipmentId,
+              claim.shipmentCandidateEvidenceAt![shipmentId],
+            ],
+          ))
+          assert(
+            JSON.stringify(before.shipmentCandidateIds) ===
+              JSON.stringify(accumulatedCandidates) &&
+              JSON.stringify(after) === JSON.stringify({
+                refundCreated: false,
+                shipmentCandidateEvidenceAt: expectedEvidenceAt,
+                shipmentCandidateIds: expectedAfter,
+              }),
+            'Widened evidence audit must exactly add every newly available candidate at its audit sequence.',
+          )
+          accumulatedCandidates = expectedAfter
+        }
         assert(
-          JSON.stringify([...accumulatedCandidates].sort((left, right) => left.localeCompare(right))) ===
+          JSON.stringify(accumulatedCandidates) ===
             JSON.stringify(canonicalCandidates),
           'Order-level shipment candidates must preserve the canonical union of eligible evidence snapshots.',
         )
       }
     }
-    if (claim.shipmentId) assert(state.shipments.some((shipment) => shipment.id === claim.shipmentId && shipment.orderId === claim.orderId), 'Claim shipment reference is invalid.')
+    if (claim.shipmentId) {
+      assert(
+        state.shipments.some((shipment) =>
+          shipment.id === claim.shipmentId &&
+          shipment.orderId === claim.orderId &&
+          shipment.purpose === 'original'),
+        'Claim shipment reference must use an original shipment.',
+      )
+    }
     if (claim.boxId) assert(state.boxes.some((box) => box.id === claim.boxId && box.orderId === claim.orderId && box.ownerId === claim.userId), 'Claim box reference is invalid.')
+    if (claim.replacementShipmentId !== undefined) {
+      assert(
+        normalizedText(claim.replacementShipmentId, 120) &&
+          record(claim.replacementAuthorization) &&
+          validIso(claim.replacementAuthorization.at) &&
+          normalizedText(claim.replacementAuthorization.reason, 500),
+        'Claim replacement reverse link and authorization evidence are invalid.',
+      )
+      const replacements = state.shipments.filter((shipment) =>
+        shipment.id === claim.replacementShipmentId &&
+        shipment.purpose === 'replacement' &&
+        shipment.sourceClaimId === claim.id)
+      assert(
+        replacements.length === 1,
+        'Claim replacement reverse link must point to exactly one replacement shipment.',
+      )
+      assert(
+        !claim.rma || claim.rma.status === 'inspected',
+        'A selected RMA path must be inspected before replacement authorization.',
+      )
+      if (claim.legacyDirectPostDeliveryReplacement !== undefined) {
+        const original = state.shipments.find((shipment) =>
+          shipment.id === replacements[0].replacementForShipmentId &&
+          shipment.purpose === 'original')
+        assert(
+          original &&
+            claim.rma === undefined &&
+            matchingLegacyDirectReplacementMigrationAudit(
+              state,
+              claim,
+              original,
+              replacements[0],
+            ),
+          'Legacy direct post-delivery replacement marker requires its exact immutable migration evidence.',
+        )
+      }
+      if (['refund_linked', 'refund_completed'].includes(claim.remedyState)) {
+        assert(
+          claim.linkedRefundEventId !== undefined &&
+            isTerminalReplacementRefundFallback(replacements[0]),
+          'Refund-linked replacement evidence must retain only an eligible terminal fallback.',
+        )
+      } else {
+        assert(
+          claim.remedyState === (
+            claim.status === 'resolved'
+              ? 'replacement_delivered'
+              : 'replacement_authorized'
+          ),
+          'Claim replacement remedy state must match its delivery completion.',
+        )
+      }
+    } else {
+      assert(
+        claim.replacementAuthorization === undefined &&
+          claim.legacyDirectPostDeliveryReplacement === undefined &&
+          !['replacement_authorized', 'replacement_delivered'].includes(claim.remedyState),
+        'Replacement remedy state and authorization require the exact reverse shipment link.',
+      )
+    }
+    if (
+      claim.rma &&
+      claim.replacementShipmentId === undefined &&
+      claim.status !== 'resolved' &&
+      ['rma_created', 'rma_received', 'rma_inspected'].includes(claim.remedyState)
+    ) {
+      const expectedRmaState: ClaimRemedyState =
+        claim.rma.status === 'created'
+          ? 'rma_created'
+          : claim.rma.status === 'received'
+            ? 'rma_received'
+            : 'rma_inspected'
+      assert(
+        claim.remedyState === expectedRmaState,
+        'Claim RMA remedy state must match its latest ordered evidence.',
+      )
+    }
+    if (
+      claim.rma === undefined &&
+      claim.linkedRefundEventId === undefined &&
+      claim.replacementShipmentId === undefined &&
+      claim.status !== 'resolved'
+    ) {
+      assert(
+        claim.remedyState === 'none',
+        'A claim without remedy evidence must remain in the none remedy state.',
+      )
+    }
     if (claim.status === 'resolved') {
       assert(
         CLAIM_RESOLUTION_OUTCOMES.has(claim.resolutionOutcome as ClaimResolutionOutcome) &&
@@ -847,49 +1994,145 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
         'Resolved claims require structured outcome, reference, and note evidence.',
       )
       if (claim.resolutionOutcome === 'refund_recorded') {
+        assert(
+          claim.legacyTypedResolution === undefined,
+          'Refund resolutions cannot use the legacy typed-resolution marker.',
+        )
+        assert(
+          claim.linkedRefundEventId !== undefined &&
+            claim.resolutionReference === claim.linkedRefundEventId,
+          'Refund-recorded resolution must equal the claim reverse refund link.',
+        )
+        refundResolutionReferences.push(claim.resolutionReference)
         const payment = state.payments.find((entry) =>
           entry.orderId === claim.orderId &&
+          entry.userId === claim.userId &&
           entry.events.some((event) =>
             event.id === claim.resolutionReference &&
             !event.ignoredReason &&
-            Boolean(event.refundIntent) &&
+            event.refundIntent?.claimId === claim.id &&
             ['partially_refunded', 'refunded'].includes(event.type),
           ),
         )
+        const event = payment?.events.find((entry) =>
+          entry.id === claim.resolutionReference)
         assert(
           payment &&
-            state.audits.some((audit) =>
-              audit.targetType === 'payment' &&
-              audit.targetId === payment.id &&
-              audit.eventId === claim.resolutionReference &&
-              ['payment.partially_refunded', 'payment.refunded'].includes(audit.action),
-            ),
-          'Refund-recorded resolution must reference an audited refund event on the claim order.',
+            event &&
+            matchingAppliedPaymentRefundAudit(state, payment, event, claim),
+          'Refund-recorded resolution must reference its linked audited refund event.',
         )
-      } else {
+      } else if (claim.resolutionOutcome === 'replacement_authorized') {
+        const replacement = state.shipments.find((shipment) =>
+          shipment.id === claim.replacementShipmentId &&
+          shipment.purpose === 'replacement' &&
+          shipment.sourceClaimId === claim.id &&
+          shipment.status === 'delivered')
+        if (claim.legacyTypedResolution) {
+          assert(
+            claim.remedyState === 'none' &&
+              claim.replacementShipmentId === undefined &&
+              /^DEMO-[A-Z0-9][A-Z0-9-]{2,96}$/.test(claim.resolutionReference!) &&
+              claim.resolutionNote!.length >= 16 &&
+              matchingLegacyTypedResolutionAudit(state, claim),
+            'Migrated version 6 replacement completion requires its exact immutable legacy history and audit.',
+          )
+        } else {
+          assert(
+            replacement &&
+              claim.remedyState === 'replacement_delivered' &&
+              claim.resolutionReference === replacement.id &&
+              matchingReplacementDeliveryAudit(state, claim, replacement),
+            'Replacement resolution requires its exact delivered shipment, reverse link, history, and audit.',
+          )
+        }
+      } else if (claim.resolutionOutcome === 'no_remedy') {
+        assert(
+          claim.legacyTypedResolution === undefined,
+          'No-remedy resolutions cannot use the legacy typed-resolution marker.',
+        )
+        assert(
+          claim.linkedRefundEventId === undefined,
+          'Non-refund claim resolutions cannot carry a refund event link.',
+        )
         assert(
           /^DEMO-[A-Z0-9][A-Z0-9-]{2,96}$/.test(claim.resolutionReference!) &&
             claim.resolutionNote!.length >= 16,
           'Non-refund resolutions require a descriptive note and fictional DEMO- reference.',
         )
+        assert(
+          claim.remedyState === 'no_remedy' &&
+            claim.replacementShipmentId === undefined &&
+            claim.rma === undefined,
+          'No-remedy resolution cannot bypass a selected RMA refund or replacement outcome.',
+        )
+      } else {
+        assert(
+          claim.legacyTypedResolution === true &&
+            claim.resolutionOutcome === 'return_rma_created' &&
+            claim.remedyState === 'none' &&
+            claim.rma === undefined &&
+            claim.replacementShipmentId === undefined &&
+            /^DEMO-[A-Z0-9][A-Z0-9-]{2,96}$/.test(claim.resolutionReference!) &&
+            claim.resolutionNote!.length >= 16 &&
+            matchingLegacyTypedResolutionAudit(state, claim),
+          'RMA creation is an incomplete typed step; only exact immutable version 6 history may remain grandfathered.',
+        )
       }
     } else {
       assert(
-        claim.resolutionOutcome === undefined && claim.resolutionReference === undefined,
+        claim.resolutionOutcome === undefined &&
+          claim.resolutionReference === undefined &&
+          claim.legacyTypedResolution === undefined,
         'Only resolved claims may store structured resolution evidence.',
       )
     }
   }
+  for (const claim of state.claims) {
+    if (claimHoldsRemedyEntitlement(state, claim)) {
+      assertNoRemedyScopeConflict(state, claim)
+    }
+  }
+  unique(
+    state.claims.flatMap((claim) => claim.rma ? [claim.rma.reference] : []),
+    'RMA reference',
+  )
+  unique(claimLinkedRefundEventIds, 'Claim-linked refund event')
+  unique(refundResolutionReferences, 'Refund resolution reference')
+  const directMigrationAudits = state.audits.filter((audit) =>
+    audit.action === LEGACY_DIRECT_REPLACEMENT_MIGRATION_ACTION)
+  const markedDirectClaims = state.claims.filter((claim) =>
+    claim.legacyDirectPostDeliveryReplacement !== undefined)
+  assert(
+    directMigrationAudits.length === markedDirectClaims.length &&
+      directMigrationAudits.every((audit) =>
+        markedDirectClaims.some((claim) => {
+          const replacement = state.shipments.find((shipment) =>
+            shipment.id === claim.replacementShipmentId &&
+            shipment.purpose === 'replacement')
+          const original = replacement
+            ? state.shipments.find((shipment) =>
+                shipment.id === replacement.replacementForShipmentId &&
+                shipment.purpose === 'original')
+            : undefined
+          return Boolean(
+            original &&
+              replacement &&
+              matchingLegacyDirectReplacementMigrationAudit(
+                state,
+                claim,
+                original,
+                replacement,
+              )?.id === audit.id,
+          )
+        })),
+    'Every legacy direct replacement migration audit must bind one marked claim and no orphan marker or audit may remain.',
+  )
   const openClaims = state.claims.filter((claim) => isOpenClaimStatus(claim.status))
   unique(
-    openClaims.map((claim) => {
-      const scope = claim.kind === 'value_floor'
-        ? `box:${claim.boxId}`
-        : claim.shipmentCandidateIds
-          ? 'order-level'
-          : `shipment:${claim.shipmentId}`
-      return `${claim.orderId}:${claim.kind}:${scope}`
-    }),
+    openClaims
+      .filter((claim) => claim.kind === 'value_floor')
+      .map((claim) => `${claim.orderId}:${claim.kind}:box:${claim.boxId}`),
     'Open claim',
   )
   for (let leftIndex = 0; leftIndex < openClaims.length; leftIndex += 1) {
@@ -905,10 +2148,59 @@ export function validateDemoState(value: unknown): asserts value is DemoState {
       )
     }
   }
+  for (const payment of state.payments) {
+    if (
+      payment.status !== 'refunded' ||
+      payment.refundedSen !== payment.amountSen
+    ) {
+      continue
+    }
+    const completingEvent = [...payment.events].reverse().find((event) =>
+      event.type === 'refunded' &&
+      event.ignoredReason === undefined &&
+      event.refundIntent?.paymentId === payment.id)
+    assert(
+      completingEvent,
+      `Fully refunded payment ${payment.id} requires one accepted completing refund event.`,
+    )
+    assertFullPaymentRefundCompatible(
+      state,
+      payment,
+      completingEvent.refundIntent?.claimId,
+    )
+  }
 
-  for (const audit of state.audits) {
+  for (const [index, audit] of state.audits.entries()) {
+    const expectedSequence = index + 1
+    assert(
+      audit.sequence === expectedSequence,
+      'Audit sequence must be contiguous and begin at one.',
+    )
+    assert(
+      expectedSequence === 1
+        ? audit.previousId === undefined
+        : audit.previousId === state.audits[index - 1].id,
+      'Audit previous link must reference the immediately preceding entry.',
+    )
+    assert(AUDIT_OUTCOMES.has(audit.outcome), 'Audit outcome is invalid.')
+    assert(
+      normalizedText(audit.id, 120) &&
+        normalizedText(audit.actorId, 120) &&
+        normalizedText(audit.action, 120) &&
+        normalizedText(audit.targetType, 80) &&
+        normalizedText(audit.targetId, 120) &&
+        normalizedText(audit.reason, 500) &&
+        normalizedText(audit.requestId, 120) &&
+        (audit.eventId === undefined || normalizedText(audit.eventId, 120)),
+      'Audit text fields must be nonempty, bounded, and normalized.',
+    )
     assert(ROLES.includes(audit.actorRole) && validIso(audit.at), 'Audit actor or time is invalid.')
-    assert(typeof audit.requestId === 'string' && audit.requestId.length > 0, 'Audit request identity is invalid.')
+    if (Object.prototype.hasOwnProperty.call(audit, 'before')) {
+      validateCanonicalAuditEvidence(audit.before, `Audit ${audit.id} before evidence`)
+    }
+    if (Object.prototype.hasOwnProperty.call(audit, 'after')) {
+      validateCanonicalAuditEvidence(audit.after, `Audit ${audit.id} after evidence`)
+    }
   }
 }
 

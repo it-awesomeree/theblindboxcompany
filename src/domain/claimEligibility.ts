@@ -1,4 +1,12 @@
-import type { Box, ClaimKind, Shipment, ShipmentStatus } from './types'
+import { auditAtOrBefore, type AuditMoment } from './auditSequence'
+import { matchingShipmentTransitionAudit } from './remedyEvidence'
+import type {
+  Box,
+  ClaimKind,
+  DemoState,
+  Shipment,
+  ShipmentStatus,
+} from './types'
 
 export const SHIPPED_OVERDUE_MS = 3 * 24 * 60 * 60 * 1000
 
@@ -17,11 +25,36 @@ export function historicalShipmentStatus(shipment: Shipment, at: string): Shipme
     .at(-1)?.status
 }
 
+export function historicalShipmentEntriesAtAudit(
+  state: DemoState,
+  shipment: Shipment,
+  boundary: AuditMoment,
+) {
+  const initial = shipment.timeline[0]
+  if (!initial || time(initial.at) > time(boundary.at)) return []
+  return shipment.timeline.filter((entry, index) => {
+    if (index === 0) return true
+    const audit = matchingShipmentTransitionAudit(state, shipment, index)
+    return Boolean(audit && auditAtOrBefore(audit, boundary))
+  })
+}
+
+export function historicalShipmentStatusAtAudit(
+  state: DemoState,
+  shipment: Shipment,
+  boundary: AuditMoment,
+): ShipmentStatus | undefined {
+  return historicalShipmentEntriesAtAudit(state, shipment, boundary).at(-1)?.status
+}
+
 export function shipmentClaimEligibility(
   shipment: Shipment,
   kind: Extract<ClaimKind, 'damage' | 'non_delivery'>,
   at: string,
 ): ClaimEligibility {
+  if (shipment.purpose !== 'original') {
+    return { eligible: false, reason: 'Claims must use the immutable original fulfilment record.' }
+  }
   const events = shipment.timeline.filter((entry) => time(entry.at) <= time(at))
   const status = historicalShipmentStatus(shipment, at)
 
@@ -35,7 +68,20 @@ export function shipmentClaimEligibility(
   }
 
   if (shipment.kind === 'DIGITAL') {
-    return { eligible: false, reason: 'A digital fulfilment cannot have physical non-delivery.' }
+    if (status === 'failed') {
+      return { eligible: true, reason: 'This digital delivery record contains failed delivery evidence.' }
+    }
+    if (status !== 'sent') {
+      return {
+        eligible: false,
+        reason: 'Digital non-delivery requires a failed or sent delivery record.',
+      }
+    }
+    const sentAt = events.filter((entry) => entry.status === 'sent').at(-1)?.at
+    if (!sentAt || !Number.isFinite(time(at)) || time(at) - time(sentAt) < SHIPPED_OVERDUE_MS) {
+      return { eligible: false, reason: 'A sent digital delivery must be at least three demo days overdue.' }
+    }
+    return { eligible: true, reason: 'This sent digital delivery is at least three demo days overdue.' }
   }
   if (events.some((entry) => entry.status === 'delivered')) {
     return {
@@ -62,9 +108,115 @@ export function shipmentClaimEligibility(
   return { eligible: true, reason: 'This shipped delivery record is at least three demo days overdue.' }
 }
 
+export function shipmentClaimEligibilityAtAudit(
+  state: DemoState,
+  shipment: Shipment,
+  kind: Extract<ClaimKind, 'damage' | 'non_delivery'>,
+  boundary: AuditMoment,
+): ClaimEligibility {
+  if (shipment.purpose !== 'original') {
+    return {
+      eligible: false,
+      reason: 'Claims must use the immutable original fulfilment record.',
+    }
+  }
+  const events = historicalShipmentEntriesAtAudit(state, shipment, boundary)
+  const status = events.at(-1)?.status
+
+  if (kind === 'damage') {
+    if (shipment.kind === 'DIGITAL') {
+      return {
+        eligible: false,
+        reason: 'A digital fulfilment cannot have physical damage.',
+      }
+    }
+    return status === 'delivered'
+      ? {
+          eligible: true,
+          reason: 'This physical delivery can be used for a damage claim.',
+        }
+      : {
+          eligible: false,
+          reason: 'Damage claims require a delivered shipment.',
+        }
+  }
+
+  if (shipment.kind === 'DIGITAL') {
+    if (status === 'failed') {
+      return {
+        eligible: true,
+        reason: 'This digital delivery record contains failed delivery evidence.',
+      }
+    }
+    if (status !== 'sent') {
+      return {
+        eligible: false,
+        reason: 'Digital non-delivery requires a failed or sent delivery record.',
+      }
+    }
+    const sentAt = events.filter((entry) => entry.status === 'sent').at(-1)?.at
+    if (
+      !sentAt ||
+      !Number.isFinite(time(boundary.at)) ||
+      time(boundary.at) - time(sentAt) < SHIPPED_OVERDUE_MS
+    ) {
+      return {
+        eligible: false,
+        reason: 'A sent digital delivery must be at least three demo days overdue.',
+      }
+    }
+    return {
+      eligible: true,
+      reason: 'This sent digital delivery is at least three demo days overdue.',
+    }
+  }
+
+  if (events.some((entry) => entry.status === 'delivered')) {
+    return {
+      eligible: false,
+      reason: 'A customer return after delivery is not non-delivery evidence.',
+    }
+  }
+  if (!status || !['shipped', 'failed_delivery', 'lost', 'returned'].includes(status)) {
+    return {
+      eligible: false,
+      reason: 'Non-delivery claims require a shipped, failed-delivery, lost, or returned shipment.',
+    }
+  }
+  const hasExceptionEvidence = events.some((entry) =>
+    ['failed_delivery', 'lost', 'returned'].includes(entry.status))
+  if (status !== 'shipped' || hasExceptionEvidence) {
+    return {
+      eligible: true,
+      reason: 'This delivery record contains non-delivery evidence.',
+    }
+  }
+  const shippedAt = events.filter((entry) => entry.status === 'shipped').at(-1)?.at
+  if (
+    !shippedAt ||
+    !Number.isFinite(time(boundary.at)) ||
+    time(boundary.at) - time(shippedAt) < SHIPPED_OVERDUE_MS
+  ) {
+    return {
+      eligible: false,
+      reason: 'A shipped parcel must be at least three demo days overdue.',
+    }
+  }
+  return {
+    eligible: true,
+    reason: 'This shipped delivery is at least three demo days overdue.',
+  }
+}
+
 export function valueFloorClaimEligibility(box: Box | undefined, at: string): ClaimEligibility {
   if (!box?.revealedAt || !box.prizeId || time(box.revealedAt) > time(at)) {
-    return { eligible: false, reason: 'Value-floor claims require a revealed box.' }
+    return {
+      eligible: false,
+      reason: 'Review of a suspected value-floor issue requires a revealed box.',
+    }
   }
-  return { eligible: true, reason: 'This revealed box can be used for a value-floor claim.' }
+  return {
+    eligible: true,
+    reason: 'This revealed box is eligible for review of a suspected value-floor issue.',
+  }
 }

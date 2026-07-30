@@ -1,5 +1,9 @@
-import { MockRepository, type StorageLike } from '../data/MockRepository'
-import { assert, assertRole, DomainError, getSessionUser, makeId } from '../domain/guards'
+import {
+  MockRepository,
+  type MockRepositoryOptions,
+  type StorageLike,
+} from '../data/MockRepository'
+import { assert, assertRole, getSessionUser, makeId } from '../domain/guards'
 import { AuditService } from './AuditService'
 import { AdminService } from './AdminService'
 import { FulfillmentService } from './FulfillmentService'
@@ -24,8 +28,12 @@ export class AppServices {
   readonly admin: AdminService
   readonly claims: ClaimService
 
-  constructor(storage?: StorageLike, private readonly now: () => string = () => new Date().toISOString()) {
-    this.repository = new MockRepository(storage)
+  constructor(
+    storage?: StorageLike,
+    private readonly now: () => string = () => new Date().toISOString(),
+    repositoryOptions: MockRepositoryOptions = {},
+  ) {
+    this.repository = new MockRepository(storage, repositoryOptions)
     this.audit = new AuditService()
     this.reservations = new ReservationService(this.audit)
     this.financialSafety = new FinancialSafetyService(this.audit)
@@ -37,16 +45,6 @@ export class AppServices {
     this.claims = new ClaimService(this.repository, this.audit, now)
     this.admin = new AdminService(this.repository, this.audit, this.reservations, this.financialSafety, now)
     this.openBox = this.openBox.bind(this)
-    try {
-      this.orders.expireReservations()
-    } catch (caught) {
-      if (!(caught instanceof DomainError) || caught.code !== 'STORAGE_WRITE_FAILED') throw caught
-      const cleanupNotice =
-        'Automatic cleanup was not saved. Nothing changed, and it is safe to retry or refresh.'
-      this.repository.recoveryNotice = [this.repository.recoveryNotice, cleanupNotice]
-        .filter(Boolean)
-        .join(' ')
-    }
   }
 
   openBox(boxId: string) {

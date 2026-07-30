@@ -1,5 +1,10 @@
-import { ADMIN_SECTION_PERMISSIONS, type AdminSection } from '../domain/constants'
+import {
+  ADMIN_SECTION_PERMISSIONS,
+  VALUE_FLOOR_SEN,
+  type AdminSection,
+} from '../domain/constants'
 import { isOpenClaimStatus } from '../domain/claimStatus'
+import { exactOddsLabel } from '../domain/odds'
 import {
   assert,
   assertAdmin,
@@ -11,6 +16,7 @@ import {
 } from '../domain/guards'
 import { publishedPrizesFor } from '../domain/selectors'
 import { isValidPrizeDefinition } from '../domain/prizeValidation'
+import { resolveOrderFulfillment } from '../domain/orderFulfillment'
 import type { DemoState, OrderStatus } from '../domain/types'
 import type { MockRepository } from '../data/MockRepository'
 import { AuditService } from './AuditService'
@@ -46,7 +52,9 @@ export class AdminService {
         .reduce((sum, payment) => sum + payment.amountSen, 0),
       openOrders: state.orders.filter((order) => !['closed', 'cancelled', 'refunded'].includes(order.status)).length,
       paymentExceptions: state.payments.filter((payment) => ['failed', 'expired', 'disputed'].includes(payment.status)).length,
-      fulfilmentExceptions: state.shipments.filter((shipment) => ['failed_delivery', 'lost', 'returned'].includes(shipment.status)).length,
+      fulfilmentExceptions: state.shipments.filter((shipment) =>
+        ['failed', 'failed_delivery', 'lost', 'returned'].includes(shipment.status),
+      ).length,
       assigned,
       remaining: (published?.allocationTotal ?? 0) - assigned - (published?.reservedBoxes ?? 0),
       reserved: published?.reservedBoxes ?? 0,
@@ -134,15 +142,26 @@ export class AdminService {
         'Payment and shipment services own this transition; a manual order change would create inconsistent records.',
         'SERVICE_OWNED_TRANSITION',
       )
-      const relatedShipments = state.shipments.filter((shipment) => shipment.orderId === order.id)
       const openClaims = state.claims.some((claim) =>
         claim.orderId === order.id && isOpenClaimStatus(claim.status),
       )
-      assert(relatedShipments.length > 0 && relatedShipments.every((shipment) => shipment.status === 'delivered'), 'All shipments must be delivered before closing.', 'FULFILMENT_INCOMPLETE')
+      const resolution = resolveOrderFulfillment(state, order)
+      assert(
+        resolution.scopes.length > 0 && resolution.status === 'fulfilled',
+        'Every original delivery scope needs completed delivery or an exact linked remedy before closing.',
+        'FULFILMENT_INCOMPLETE',
+      )
       assert(!openClaims, 'Resolve or reject open claims before closing.', 'CLAIM_OPEN')
       order.status = transitionOrder(order.status, status)
       order.updatedAt = now
-      order.timeline.push({ id: makeId('tl', `${order.id}:${status}:${now}`), status, label: cleanReason, at: now })
+      const transitionSeed =
+        `${order.id}:${status}:${now}:${order.timeline.length}`
+      order.timeline.push({
+        id: makeId('tl', transitionSeed),
+        status,
+        label: cleanReason,
+        at: now,
+      })
       this.audit.append(state, {
         actorId: actor.id,
         actorRole: actor.role,
@@ -151,7 +170,7 @@ export class AdminService {
         targetId: order.id,
         reason: cleanReason,
         at: now,
-        requestId: makeId('req', `${order.id}:${status}:${now}`),
+        requestId: makeId('req', transitionSeed),
         before: { status: before },
         after: { status },
       })
@@ -205,13 +224,22 @@ export class AdminService {
       assert(draft?.draftPrizes, 'Create a draft copy before editing.', 'DRAFT_MISSING')
       const prize = draft.draftPrizes.find((entry) => entry.id === prizeId)
       assert(prize, 'Draft prize was not found.', 'PRIZE_MISSING')
-      assert(Number.isInteger(valueSen) && valueSen >= 10_000, 'Every draft prize must keep the RM100 floor.', 'FLOOR_VIOLATION')
+      assert(
+        Number.isInteger(valueSen) && valueSen >= VALUE_FLOOR_SEN,
+        'Every draft prize must keep the RM100 floor.',
+        'FLOOR_VIOLATION',
+      )
       const cleanName = sanitizeText(name, 120)
       assert(cleanName.length > 0, 'Draft prize name cannot be blank.', 'INVALID_PRIZE_NAME')
       const before = structuredClone(prize)
       prize.name = cleanName
       prize.valueSen = valueSen
-      assert(isValidPrizeDefinition(prize), 'Draft prize definition is invalid.', 'INVALID_PRIZE_DEFINITION')
+      prize.odds = exactOddsLabel(prize.allocation, draft.allocationTotal)
+      assert(
+        isValidPrizeDefinition(prize, draft.allocationTotal),
+        'Draft prize definition is invalid.',
+        'INVALID_PRIZE_DEFINITION',
+      )
       const now = this.now()
       this.audit.append(state, {
         actorId: actor.id,
@@ -238,6 +266,6 @@ export class AdminService {
   snapshot(): DemoState {
     const actor = getSessionUser(this.repository.getSnapshot())
     assertRole(actor, ['admin', 'super_admin'], 'read the complete admin state')
-    return this.repository.getSnapshot()
+    return structuredClone(this.repository.getSnapshot())
   }
 }
